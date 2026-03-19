@@ -1,0 +1,50 @@
+{
+  // Eric500 产品 - IDE 工作区配置
+  // 通过符号链接共享统一 RT-Thread 源码
+  // BSP: eric206lorasensormain, eric820calcnewcan, eric820dispnewcan, eric888calc, eric888display, znotusteric820dispnewcan
+
+  // 文件浏览器中隐藏无关目录，聚焦 Eric500 产品代码
+  "files.exclude": {
+    "**/.git": true,
+    "**/.DS_Store": true,
+    "**/rt-thread/bsp/!(stm32)": true,
+    "**/rt-thread/bsp/stm32/!(eric206lorasensormain|eric820calcnewcan|eric820dispnewcan|eric888calc|eric888display|znotusteric820dispnewcan|libraries|docs)": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+
+  // 搜索范围优化 - 排除无关 BSP 和编译产物
+  "search.exclude": {
+    "**/rt-thread/bsp/!(stm32)": true,
+    "**/rt-thread/bsp/stm32/!(eric206lorasensormain|eric820calcnewcan|eric820dispnewcan|eric888calc|eric888display|znotusteric820dispnewcan|libraries|docs)": true,
+    "**/build": true,
+    "**/*.bin": true,
+    "**/*.axf": true,
+    "**/*.elf": true,
+    "**/*.o": true,
+    "**/*.d": true,
+    "**/*.map": true,
+    "**/*.htm": true,
+    "**/JLinkLog.txt": true
+  },
+
+  // C/C++ 嵌入式开发关联
+  "files.associations": {
+    "*.h": "c",
+    "*.c": "c",
+    "rtconfig.h": "c",
+    "board.h": "c",
+    "*.sct": "plaintext",
+    "*.icf": "plaintext",
+    "*.lds": "plaintext",
+    "Kconfig": "kconfig",
+    "SConscript": "python",
+    "SConstruct": "python"
+  },
+
+  // 编辑器设置
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "files.encoding": "utf8",
+  "files.eol": "\n"
+}

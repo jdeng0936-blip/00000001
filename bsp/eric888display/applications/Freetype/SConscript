@@ -1,0 +1,23 @@
+from building import *
+import os
+
+cwd = GetCurrentDir()
+
+src = Split('''
+src/base/ftbase.c
+src/base/ftbitmap.c
+src/base/ftdebug.c
+src/base/ftglyph.c
+src/base/ftinit.c
+src/cache/ftcache.c
+src/gzip/ftgzip.c
+src/sfnt/sfnt.c
+src/smooth/smooth.c
+src/truetype/truetype.c
+''')
+
+CPPPATH = [cwd+'/include']
+CPPDEFINES = ['FT2_BUILD_LIBRARY']
+group = DefineGroup('Freetype', src, depend = [''], CPPPATH = CPPPATH, CPPDEFINES = CPPDEFINES)
+
+Return('group')
