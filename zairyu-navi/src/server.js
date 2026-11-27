@@ -5,7 +5,7 @@ const path = require('node:path');
 const createEngine = require('./engine');
 const { createStore } = require('./store');
 
-const { validateProfilePatch, HttpError } = require('./validate');
+const { validateProfilePatch, validateInquiry, isDate, assertNoSensitive, sensitiveLabel, HttpError } = require('./validate');
 const assistant = require('./assistant');
 
 function createApp(opts) {
@@ -22,6 +22,26 @@ function createApp(opts) {
   const ref = createEngine({ now: nowOf() }); // 只用来取静态数据
   const nodeIds = new Set(ref.NODES.map((n) => n.id));
   const catKeys = new Set(ref.CATS.map((c) => c[0]));
+  const evTypes = new Set(Object.keys(ref.EVRULES)); // 用集合判断，'constructor' 这类继承来的键不算事件类型
+  const inquiryDeps = { hasCategory: (k) => catKeys.has(k), hasNode: (id) => nodeIds.has(id), getProvider: (id) => store.getProvider(id) };
+
+  // 限流（内存里的滑动窗口，单进程够用；多进程部署时要换成共享存储）。
+  // 助手：每个账号 10 分钟 20 次、24 小时 200 次。注册：每个来源地址 1 小时 30 个账号。
+  // 放在反向代理后面时，所有请求的来源地址都是代理，要在代理上按真实地址限流，并把 signupLimit 调大。
+  const limiter = (cfg) => {
+    const hits = new Map();
+    return (key) => {
+      const t = Date.now();
+      if (hits.size > 5000) for (const [k, v] of hits) if (!v.length || v[v.length - 1] <= t - cfg.windowMs) hits.delete(k);
+      const list = (hits.get(key) || []).filter((x) => x > t - cfg.windowMs);
+      if (list.length >= cfg.max) { hits.set(key, list); return Math.max(1, Math.ceil((list[0] + cfg.windowMs - t) / 1000)); } // 返回还要等多少秒
+      list.push(t); hits.set(key, list); return 0;
+    };
+  };
+  const chatShort = limiter(opts.chatLimit || { max: 20, windowMs: 10 * 60 * 1000 });
+  const chatDaily = limiter(opts.chatDailyLimit || { max: 200, windowMs: 24 * 60 * 60 * 1000 });
+  const signup = limiter(opts.signupLimit || { max: 30, windowMs: 60 * 60 * 1000 });
+  const tooMany = (wait, msg) => new HttpError(429, msg + '，请在' + (wait >= 120 ? Math.ceil(wait / 60) + '分钟' : wait + '秒') + '后再试', { 'retry-after': String(wait) });
 
   const user = (id, req) => {
     const tok = /^Bearer (.+)$/.exec(req.headers.authorization || '');
@@ -77,6 +97,7 @@ function createApp(opts) {
         if (seg[4] === 'reply' && m === 'POST') {
           const t = body && body.text;
           if (typeof t !== 'string' || t.trim().length < 2 || t.length > 3000) throw new HttpError(422, '回复须为2至3000字');
+          assertNoSensitive(t, '回复');
           if (q.status === 'closed') throw new HttpError(409, '这条咨询已经结束');
           store.addReply(q.id, t.trim()); return [201, { ok: true }];
         }
@@ -95,6 +116,8 @@ function createApp(opts) {
     if (seg[1] === 'users') {
       if (!seg[2] && m === 'POST') {
         if (!body || body.accept !== TERMS_VERSION) throw new HttpError(422, '要先同意使用条款和隐私政策（版本 ' + TERMS_VERSION + '）');
+        const wait = signup(req.socket.remoteAddress || '');
+        if (wait) throw tooMany(wait, '新建账号太频繁');
         return [201, store.createUser(TERMS_VERSION)];
       }
       const u = user(seg[2], req);
@@ -102,13 +125,14 @@ function createApp(opts) {
       if (!sub && m === 'GET') return u;
       if (!sub && m === 'DELETE') { store.deleteUser(u.id); return [204, null]; }
       if (sub === 'events') {
-        if (m === 'GET') return store.listEvents(u.id).map((ev) => Object.assign(ev, { label: ref.EVRULES[ev.type][0] }));
+        if (m === 'GET') return store.listEvents(u.id).map((ev) => Object.assign(ev, { label: evTypes.has(ev.type) ? ref.EVRULES[ev.type][0] : '' }));
         if (m === 'POST') {
           const b = body || {};
-          if (!ref.EVRULES[b.type]) throw new HttpError(422, '事件类型无效');
-          if (!ref.isDate(b.date)) throw new HttpError(422, 'date 须为 YYYY-MM-DD');
+          if (typeof b.type !== 'string' || !evTypes.has(b.type)) throw new HttpError(422, '事件类型无效');
+          if (!isDate(b.date)) throw new HttpError(422, 'date 须为 YYYY-MM-DD，且是真实存在的日期');
           if (b.note != null && (typeof b.note !== 'string' || b.note.length > 200)) throw new HttpError(422, 'note 须为200字以内');
-          return [201, { id: store.addEvent(u.id, b) }];
+          assertNoSensitive(b.note, '备注');
+          return [201, { id: store.addEvent(u.id, { type: b.type, date: b.date, note: b.note }) }];
         }
         if (m === 'DELETE' && seg[4]) { if (!store.deleteEvent(u.id, seg[4])) throw new HttpError(404, '没有这个事件'); return [204, null]; }
       }
@@ -139,7 +163,8 @@ function createApp(opts) {
         return engineFor(u).plan();
       }
       if (sub === 'plan' && m === 'GET') return engineFor(u).plan();
-      if (sub === 'reminders' && m === 'GET') return engineFor(u).reminders().map((r) => ({ date: r.d, text: r.txt, tag: r.tag }));
+      // date 是日本时间的日历日（YYYY-MM-DD 的文字，不是时刻）；src 是事件期限的依据（法条、官方页面），没有则为 null
+      if (sub === 'reminders' && m === 'GET') return engineFor(u).reminders().map((r) => ({ date: r.date, text: r.txt, tag: r.tag, src: r.src || null }));
       if (sub === 'advice' && m === 'GET') return engineFor(u).advice().map((a) => ({ title: a[0], text: a[1] }));
       if (sub === 'pr-check' && m === 'GET') return engineFor(u).prCheck();
       if (sub === 'chat' && m === 'POST') {
@@ -147,37 +172,50 @@ function createApp(opts) {
         if (!llm) throw new HttpError(503, '助手还没有配置（缺少 ANTHROPIC_API_KEY）');
         const b = body || {};
         if (typeof b.message !== 'string' || !b.message.trim() || b.message.length > 2000) throw new HttpError(422, 'message 须为1至2000字');
-        const r = await assistant.chat({ user: u, store, now: nowOf() }, Array.isArray(b.history) ? b.history.slice(-20) : [], b.message, { llm });
-        return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => ({ name: t.name, ok: t.ok })), history: r.messages };
+        // 对话内容会转给模型服务商，敏感号码在这里拦下
+        assertNoSensitive(b.message, '消息');
+        // 历史是网页端带回来的，逐条校验形状和大小；不合规则返回 422，网页端清空历史后重试
+        const history = assistant.validateHistory(b.history);
+        // 历史里的每一段文字都会转给模型：用户说的话、助手的话、工具调用的参数、工具结果，全部过一遍。
+        // 说明以 history 开头，网页端据此清空历史后重试（不然每一轮都会被同一条历史挡住）。
+        for (const t of assistant.historyTexts(history)) {
+          const label = sensitiveLabel(t);
+          if (label) throw new HttpError(422, 'history 无效（对话历史里疑似含有' + label + '）。请清空对话历史后重试');
+        }
+        const wait = chatShort(u.id) || chatDaily(u.id);
+        if (wait) throw tooMany(wait, '提问太频繁');
+        const r = await assistant.chat({ user: u, store, now: nowOf() }, history, b.message, { llm });
+        // draft：助手准备的咨询草稿（没有则为 null）。草稿没有发送，网页端显示给用户核对，用户同意后调 POST /inquiries。
+        return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => ({ name: t.name, ok: t.ok })), draft: r.draft, history: r.messages };
       }
       if (sub === 'inquiries' && m === 'GET') return store.listInquiries(u.id);
       if (sub === 'inquiries' && m === 'POST') {
         const b = body || {};
         if (b.consent !== true) throw new HttpError(422, '发给服务商之前必须先让用户看过摘要并明确同意');
-        if (!catKeys.has(b.category)) throw new HttpError(422, '服务类别无效');
-        if (b.nodeId && !nodeIds.has(b.nodeId)) throw new HttpError(422, '节点无效');
-        if (typeof b.summary !== 'string' || b.summary.trim().length < 5 || b.summary.length > 2000) throw new HttpError(422, '摘要须为5至2000字');
-        if (/\d{12}/.test(b.summary.replace(/[\s-]/g, ''))) throw new HttpError(422, '摘要里疑似含有个人编号，请删掉后再发');
-        const ids = Array.isArray(b.providerIds) ? b.providerIds : (b.providerId ? [b.providerId] : []);
-        if (!ids.length) throw new HttpError(422, '要先选服务商');
-        if (ids.length > 3 || new Set(ids).size !== ids.length) throw new HttpError(422, '一次最多发给三家，且不能重复');
-        for (const pid of ids) { const p = store.getProvider(pid); if (!p || !p.active || p.category !== b.category) throw new HttpError(422, '服务商无效或类别不符'); }
-        return [201, { ids: ids.map((pid) => store.addInquiry(u.id, { providerId: pid, nodeId: b.nodeId, category: b.category, summary: b.summary.trim() })) }];
+        const q = validateInquiry(b, inquiryDeps); // 和助手准备草稿用同一套校验
+        return [201, { ids: q.providerIds.map((pid) => store.addInquiry(u.id, { providerId: pid, nodeId: q.nodeId, category: q.category, summary: q.summary })) }];
       }
     }
     throw new HttpError(404, '没有这个接口');
   }
 
-  const webDir = path.join(__dirname, '..', 'web');
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://localhost');
-    const send = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(obj == null ? '' : JSON.stringify(obj)); };
+  const webDir = opts.webDir || path.join(__dirname, '..', 'web');
+  const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
+  async function handle(req, res, send) {
     try {
+      // 解析地址也放在 try 里：像 "//" 这样解析不了的请求返回 400，而不是让进程退出
+      let url;
+      try { url = new URL(req.url, 'http://localhost'); } catch (e) { throw new HttpError(400, '请求地址无效'); }
       if (!url.pathname.startsWith('/api/')) {
+        if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, '不支持这个方法');
         const f = path.join(webDir, url.pathname === '/' ? 'index.html' : path.normalize(url.pathname).replace(/^([/\\]|\.\.)+/, ''));
-        if (!f.startsWith(webDir) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) return send(404, { error: '没有这个页面' });
-        res.writeHead(200, { 'content-type': f.endsWith('.html') ? 'text/html; charset=utf-8' : 'application/octet-stream' });
-        return fs.createReadStream(f).pipe(res);
+        if (f.includes('\0') || !(f === webDir || f.startsWith(webDir + path.sep)) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) return send(404, { error: '没有这个页面' });
+        const stream = fs.createReadStream(f);
+        // 文件读到一半出错（被删、磁盘错误）不能变成未处理的 error 事件
+        stream.on('error', (e) => { console.error(e); if (!res.headersSent) send(500, { error: '服务器内部错误' }); else res.destroy(); });
+        stream.once('open', () => { res.writeHead(200, { 'content-type': TYPES[path.extname(f)] || 'application/octet-stream' }); if (req.method === 'HEAD') { stream.destroy(); res.end(); } else stream.pipe(res); });
+        res.on('close', () => stream.destroy());
+        return;
       }
       let body = null;
       if (['POST', 'PATCH', 'PUT'].includes(req.method)) {
@@ -191,9 +229,22 @@ function createApp(opts) {
       if (Array.isArray(r) && typeof r[0] === 'number') return send(r[0], r[1]);
       send(200, r);
     } catch (e) {
-      if (e instanceof HttpError) return send(e.status, { error: e.message });
+      if (e instanceof HttpError) return send(e.status, { error: e.message }, e.headers);
       console.error(e); send(500, { error: '服务器内部错误' });
     }
+  }
+  const server = http.createServer((req, res) => {
+    // send 自己不会抛错：响应已经发出或连接已断时什么都不做
+    const send = (status, obj, headers) => {
+      try {
+        if (res.headersSent || res.destroyed) { if (!res.writableEnded) res.destroy(); return; }
+        res.writeHead(status, Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, headers || {}));
+        res.end(obj == null ? '' : JSON.stringify(obj));
+      } catch (e) { console.error(e); try { res.destroy(); } catch (e2) { /* 连接已经没了 */ } }
+    };
+    req.on('error', () => {}); res.on('error', () => {});
+    // 最后一道兜底：handle 里任何没接住的错误都在这里结束，不会变成未处理的 rejection 让进程退出
+    handle(req, res, send).catch((e) => { console.error(e); send(500, { error: '服务器内部错误' }); });
   });
   return { server, store };
 }

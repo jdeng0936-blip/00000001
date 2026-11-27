@@ -43,12 +43,26 @@ function createStore(file) {
       db.prepare('UPDATE users SET profile=?, done=?, plan=?, auth=? WHERE id=?').run(JSON.stringify(u.profile), JSON.stringify(u.done), JSON.stringify(u.plan), JSON.stringify(u.auth), u.id);
       log(u.id, action, detail);
     },
+    // 删除账号：一个事务里删掉全部数据，并把留痕表里这个用户的痕迹抹掉。
+    // 留痕只保留“什么时候发生过什么动作”，用户 id 和细节（改了哪些字段、发给了哪家服务商、咨询 id）都清空。
     deleteUser(id) {
-      for (const q of db.prepare('SELECT id FROM inquiries WHERE user_id=?').all(id)) db.prepare('DELETE FROM replies WHERE inquiry_id=?').run(q.id);
-      db.prepare('DELETE FROM inquiries WHERE user_id=?').run(id);
-      db.prepare('DELETE FROM events WHERE user_id=?').run(id);
-      db.prepare('DELETE FROM users WHERE id=?').run(id);
-      log(null, 'user.delete');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const q of db.prepare('SELECT id FROM inquiries WHERE user_id=?').all(id)) {
+          db.prepare('DELETE FROM replies WHERE inquiry_id=?').run(q.id);
+          // 服务商回复时留下的痕迹不带用户 id，但带咨询 id，一并清掉
+          db.prepare("UPDATE audit SET detail=NULL WHERE action='inquiry.reply' AND detail=?").run(JSON.stringify({ id: q.id }));
+        }
+        db.prepare('DELETE FROM inquiries WHERE user_id=?').run(id);
+        db.prepare('DELETE FROM events WHERE user_id=?').run(id);
+        db.prepare('DELETE FROM users WHERE id=?').run(id);
+        db.prepare('UPDATE audit SET user_id=NULL, detail=NULL WHERE user_id=?').run(id);
+        log(null, 'user.delete');
+        db.exec('COMMIT');
+      } catch (e) {
+        try { db.exec('ROLLBACK'); } catch (e2) { /* 事务已经不在了 */ }
+        throw e;
+      }
     },
     // ---- 事件 ----
     addEvent(userId, ev) {
@@ -96,6 +110,8 @@ function createStore(file) {
       db.prepare("UPDATE inquiries SET status='replied' WHERE id=?").run(inquiryId);
       log(null, 'inquiry.reply', { id: inquiryId });
     },
+    // 留痕记录（测试和运维排查用，不经接口对外）
+    auditRows() { return db.prepare('SELECT at, user_id AS userId, action, detail FROM audit ORDER BY id').all(); },
     auditCount() { return db.prepare('SELECT COUNT(*) AS n FROM audit').get().n; },
     close() { db.close(); }
   };

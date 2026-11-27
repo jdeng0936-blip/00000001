@@ -5,7 +5,9 @@ module.exports = function createEngine(state) {
 state = state || {};
 var NODES = JSON.parse(JSON.stringify(require('../data/nodes.json')));
 var P, DONE, DOCS = [], SEL = null, DSEL = null, SNOOZE = {}, PVSEL = null;
-function today(){var t=state.now?new Date(state.now):new Date();t.setHours(0,0,0,0);return t}
+// 日期一律按日本时间（Asia/Tokyo）的日历日计算，内部用 UTC 零点的 Date 表示，和服务器、浏览器所在时区无关。
+function jstDay(t){return new Date(Math.floor((t.getTime()+324e5)/864e5)*864e5)}
+function today(){var t=state.now?new Date(state.now):new Date();return jstDay(isNaN(t.getTime())?new Date():t)}
 function save(){}
 var STAGES=["来日前","落地","生活基建","驾照","在留维持","永驻"];
 var TITLES=["准备出发","新到大阪","落地生根","生活上手","可以上路","稳定在留","永驻达成"];
@@ -14,12 +16,16 @@ function xpOf(id){return LEGAL[id]?30:20}
 
 var DEF={status:"work",entry:"2026-11-18",addr:"2026-11-20",exp:"2027-11-20",ins:true,age:true,lic:true,pr:true,
   arrive:"2019-04-01",work:"2021-04-01",hsp:"0",jp:"n2",pay:true,married:"",trips:[["2024-01-10","2024-02-20"],["2025-08-01","2025-08-21"]]};
-function D(s){return s?new Date(s+"T00:00:00"):null}
-function addDays(d,n){if(!d)return null;var x=new Date(d);x.setDate(x.getDate()+n);return x}
-function addMonths(d,n){if(!d)return null;var x=new Date(d);x.setMonth(x.getMonth()+n);return x}
+function D(s){return isDate(s)?new Date(s+"T00:00:00Z"):null}
+function ymd(y,m,d){return new Date(Date.UTC(y,m,d))}
+function iso(d){return d.toISOString().slice(0,10)}
+function addDays(d,n){return d?new Date(d.getTime()+n*864e5):null}
+function addMonths(d,n){if(!d)return null;var m=d.getUTCMonth()+n,x=ymd(d.getUTCFullYear(),m,d.getUTCDate());if(x.getUTCMonth()!==((m%12)+12)%12)x=ymd(d.getUTCFullYear(),m+1,0);return x}
 function addYears(d,n){return addMonths(d,n*12)}
-function fmt(d){return d.getFullYear()+"年"+(d.getMonth()+1)+"月"+d.getDate()+"日"}
+function fmt(d){var x=new Date(d.getTime()+324e5);return x.getUTCFullYear()+"年"+(x.getUTCMonth()+1)+"月"+x.getUTCDate()+"日"}
 function days(a,b){return Math.round((b-a)/864e5)}
+function yearsBetween(a,b){if(!a||!b||b<a)return 0;var n=b.getUTCFullYear()-a.getUTCFullYear();if(addYears(a,n)>b)n--;var s=addYears(a,n);return n+days(s,b)/days(s,addYears(a,n+1))}
+function y1(y){return (Math.floor(y*10+1e-9)/10).toFixed(1)}
 function dueText(d){if(!d)return"";var n=days(today(),d);return n<0?"已过期限 "+fmt(d):"还有"+n+"天（"+fmt(d)+"）"}
 function nodeOf(id){return NODES.filter(function(x){return x.id===id})[0]}
 function compute(){
@@ -41,7 +47,7 @@ function compute(){
     else if(id==="3-1")P.lic?need(reg,"先完成住民登记"):set(id,"na","没有符合条件的驾照");
     else if(id==="3-2")P.lic?set(id,"na","可走外免切替"):need(reg,"先完成住民登记");
     else if(id==="4-1")s==="pr"?set(id,"na","永住者无需更新在留期间"):set(id,"todo","",D(P.exp));
-    else if(id==="4-2")(s==="work"||s==="hsp"||s==="student"||s==="ssw"||s==="biz")?set(id,"todo","换工作、离职、毕业时办"):s==="spouse"?set(id,"todo","离婚或配偶去世时，14天内向入管申报"):set(id,"na","当前身份无此申报");
+    else if(id==="4-2")(s==="work"||s==="hsp"||s==="student"||s==="ssw"||s==="biz")?set(id,"todo","换工作、离职、毕业时办"):s==="spouse"?set(id,"todo","离婚或配偶去世时，14天内向入管申报"):s==="family"?set(id,"todo","如果你是以配偶身份持有家族滞在：离婚或配偶去世时，14天内向入管申报"):set(id,"na","当前身份无此申报");
     else if(id==="4-3"||id==="5-1"||id==="5-2")(P.pr&&s!=="pr")?set(id,"todo"):set(id,"na",s==="pr"?"已是永住者":"未设永驻目标");
     else if(id==="4-4")set(id,"todo","每年6月前后确认");
     else if(id==="4-5")set(id,"todo","每年11月至次年3月");
@@ -67,30 +73,45 @@ function nextQuest(R){
   return t[0]||null;
 }
 var EVENTS=[];
-var EVRULES={job_change:["换工作或离职",[[14,"换工作或离职：14天内向入管提交所属机关的届出（见任务“换工作后的申报”）"]]],
- move:["搬家",[[14,"搬家：搬进新住址后14天内到区役所办转入或转居，在留卡上的住址一并变更"]]],
- divorce:["离婚或配偶去世",[[14,"离婚或配偶去世：14天内向入管提交配偶者的届出"]]],
- birth:["孩子出生",[[14,"孩子出生：14天内到区役所办出生届"],[30,"孩子出生：30天内向入管申请在留资格取得（出生后60天内离开日本的不用办）"]]]};
+var EVRULES={job_change:["换工作或离职",[
+  {n:14,st:{work:1,ssw:1},txt:"换工作或离职：自离职（合同结束）或入职（签新合同）之日起14天内，向入管提交所属机关（契约机关）的届出；离职和入职各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html"}},
+  {n:14,st:{student:1,biz:1},txt:"离开或转到别的学校、机构：自离开（退学、毕业、离任）或转入之日起14天内，向入管提交所属机关（活动机关）的届出；离开和转入各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号",title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}},
+  {n:14,st:{hsp:1},txt:"换工作或离职：自离职或入职之日起14天内，向入管提交所属机关的届出；高度专门职1号イ、ロ交契约机关的届出，1号ハ交活动机关的届出，离职和入职各申报一次（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号・第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出（1号ハ）",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]}}]],
+ move:["搬家",[
+  {n:14,txt:"搬家：搬进新住址后14天内，带在留卡到新住址的区役所办转入或转居，在留卡上的住址当场一并变更（搬到别的市区町村的，先在原住址办转出）",src:{law:"入管法第19条の9第1項",title:"入管厅：住居地的变更届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00023.html"}}]],
+ divorce:["离婚或配偶去世",[
+  {n:14,st:{spouse:1,family:1},txt:"离婚或配偶去世：14天内向入管提交配偶者的届出",alt:{family:"如果你是以配偶身份持有家族滞在：离婚或配偶去世后14天内向入管提交配偶者的届出（以子女身份持有的没有这项届出）"},src:{law:"入管法第19条の16第3号",title:"入管厅：配偶者的届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00016.html"}}]],
+ birth:["孩子出生",[
+  {n:13,any:1,txt:"孩子出生：14天内到区役所办出生届，出生当天算第1天",src:{law:"戸籍法第49条",title:"法务省：出生届",url:"https://www.moj.go.jp/ONLINE/FAMILYREGISTER/5-1.html"}},
+  {n:30,any:1,txt:"孩子出生：30天内向入管申请在留资格取得（孩子有日本国籍的、出生后60天内离开日本的不用办）",src:{law:"入管法第22条の2・第22条の3",title:"入管厅：在留资格取得许可申请",url:"https://www.moj.go.jp/isa/applications/procedures/16-10.html"}}]]};
+// 一件事按当前身份产生的期限。尚无签证（人在中国）的没有；短期滞在的只有标了 any 的规则（孩子在日本出生：出生届不看在留资格）。
+function evDue(ev){
+  var r=Object.prototype.hasOwnProperty.call(EVRULES,ev.type)?EVRULES[ev.type]:null,d=D(ev.date),s=P.status,out=[];
+  if(!r||!d||s==="none")return out;
+  r[1].forEach(function(x){if(s==="short"?!x.any:(x.st&&!x.st[s]))return;out.push({d:addDays(d,x.n),txt:(x.alt&&x.alt[s])||x.txt,src:x.src})});
+  return out;
+}
 function reminders(){
-  var R=compute(),L=[],t=today(),card=P.status!=="none"&&P.status!=="short";
-  function add(d,txt,tag){if(d)L.push({d:d,txt:txt,tag:tag||""})}
-  if(!card){add(t,"先完成第0关：选定路线并申请在留资格认定证明书","路线");return L}
+  var R=compute(),L=[],t=today(),Y=t.getUTCFullYear(),M=t.getUTCMonth(),card=P.status!=="none"&&P.status!=="short";
+  function add(d,txt,tag,src){if(d&&!isNaN(d.getTime()))L.push({d:d,date:iso(d),txt:txt,tag:tag||"",src:src||null})}
+  function evs(){EVENTS.forEach(function(ev){evDue(ev).forEach(function(x){add(x.d,x.txt,"事件",x.src)})})}
+  if(!card){add(t,"先完成第0关：选定路线并申请在留资格认定证明书","路线");evs();L.sort(function(a,b){return a.d-b.d});return L}
   if(R["1-1"].state==="todo")add(R["1-1"].due,"住民登记：定下住所后14天内到区役所办理","法定期限");
   if(R["1-3"].state==="todo")add(R["1-3"].due,"国民健康保险：成为对象后14天内加入","法定期限");
-  if(R["4-1"].state==="todo"&&P.exp){var e=D(P.exp);[[4,"在留更新：开始准备材料"],[3,"在留更新：确认可以开始申请的时期"],[1,"在留更新：尽快递交"]].forEach(function(x){add(addMonths(e,-x[0]),x[1],"在留")});add(e,"在留期满日","在留")}
+  if(R["4-1"].state==="todo"&&D(P.exp)){var e=D(P.exp);[[4,"在留更新：开始准备材料"],[3,"在留更新：确认可以开始申请的时期"],[1,"在留更新：尽快递交"]].forEach(function(x){add(addMonths(e,-x[0]),x[1],"在留")});add(e,"在留期满日","在留")}
   if(P.entry)add(addMonths(D(P.entry),6),"入境满6个月：去银行办理账户的居住者变更","银行");
-  if(R["1-4"].state==="todo"||R["1-4"].state==="done")add(new Date(t.getFullYear(),t.getMonth()+1,1),"国民年金：本月保险料缴纳","每月");
-  var june=new Date(t.getFullYear(),5,1);if(june<t)june=new Date(t.getFullYear()+1,5,1);
+  if(R["1-4"].state==="todo"||R["1-4"].state==="done")add(ymd(Y,M+1,1),"国民年金：本月保险料缴纳","每月");
+  var june=ymd(Y,5,1);if(june<t)june=ymd(Y+1,5,1);
   if(!P.ins)add(june,"住民税：6月前后收到缴款单，按期缴纳并保存收据","每年");
-  var nov=new Date(t.getFullYear(),10,1);if(nov<t)nov=new Date(t.getFullYear()+1,10,1);
+  var nov=ymd(Y,10,1);if(nov<t)nov=ymd(Y+1,10,1);
   add(nov,"年末调整：按公司通知提交扶养控除等申告书；有海外扶养亲属的备齐亲属关系文件和汇款凭证","每年");
-  if(t.getMonth()>=10)add(t,"现在是年末调整的时期：公司发来的申告书请按期交回，12月的工资里会结算全年所得税","每年");
-  var kk=new Date(t.getFullYear(),2,15);if(kk<t)kk=new Date(t.getFullYear()+1,2,15);
+  if(M>=10)add(t,"现在是年末调整的时期：公司发来的申告书请按期交回，12月的工资里会结算全年所得税","每年");
+  var kk=ymd(Y,2,15);if(kk<t)kk=ymd(Y+1,2,15);
   add(kk,"确定申告截止（需要申告的人）：2月16日起受理，纳税期限同日","每年");
   if(P.pr&&P.status!=="pr")add(t,"永驻目标：每次缴纳住民税和年金后拍照存档收据","习惯");
-  if(AUTH.mail){add(new Date(t.getTime()+9*864e5),"示例：邮箱里识别到国民健康保险料纳付通知，纳期限已提取"+(AUTH.cal?"，已写入日历":""),"邮箱示例");add(new Date(t.getTime()+3*864e5),"示例：运营商账单邮件，本月金额已记入，待你确认是否换套餐","邮箱示例")}
+  if(AUTH.mail){add(addDays(t,9),"示例：邮箱里识别到国民健康保险料纳付通知，纳期限已提取"+(AUTH.cal?"，已写入日历":""),"邮箱示例");add(addDays(t,3),"示例：运营商账单邮件，本月金额已记入，待你确认是否换套餐","邮箱示例")}
   PLT.forEach(function(x){if(PL.subs[x[0]])add(t,"已订阅“"+x[1]+"”的方案变动提醒：正式版每天联网复核，价格或条件变化时推送","方案")});
-  EVENTS.forEach(function(ev){var r=EVRULES[ev.type],d=D(ev.date);if(!r||!d)return;r[1].forEach(function(x){add(addDays(d,x[0]),x[1],"事件")})});
+  evs();
   L.sort(function(a,b){return a.d-b.d});return L;
 }
 /* ---------- 咨询价值：给你的判断 ---------- */
@@ -101,9 +122,10 @@ function advice(){
   if(nq0&&r0.due){var n0=days(t,r0.due);out.push(["最要紧的一件",nq0.t+"，法定期限 "+fmt(r0.due)+"（"+(n0<0?"已过 "+(-n0)+" 天":n0===0?"今天":"还有 "+n0+" 天")+"）。费用："+cny(nq0.cost)+"。","#reminders","看全部提醒"])}
   else if(nq0)out.push(["现在该办的一件",nq0.t+"，没有法定期限。费用："+cny(nq0.cost)+"。","#reminders","看全部提醒"]);
   else if(rs.length){var x=rs[0];out.push(["接下来要留意",x.txt,"#reminders","看全部提醒"])}
-  if(P.pr&&P.status!=="pr"){var arr=D(P.arrive),hsp=+P.hsp,needY=P.status==="spouse"?1:hsp>=80?1:hsp>=70?3:10;
-    if(arr){var e=addYears(arr,needY);out.push(["永驻最早什么时候",e<=t?"在留年数已满 "+needY+" 年，可以做一次完整体检，看其他条件。":"按在留年数算，最早 "+fmt(e)+" 满 "+needY+" 年，还有 "+days(t,e)+" 天。纳税、年金和出国天数从现在起就在算。","#pr-check","做永驻体检"])}
-    else out.push(["永驻最早什么时候","填上来日日期，就能算出最早哪天满足在留年数。","#pr-check","去填写"])}
+  if(P.pr&&P.status!=="pr"){var pc=prCheck(),e=pc.when;
+    if(!D(P.arrive))out.push(["永驻最早什么时候","填上来日日期，就能算出最早哪天满足在留年数。","#pr-check","去填写"]);
+    else if(e)out.push(["永驻最早什么时候",e<=t?"年数条件已满（在留 "+pc.needY+" 年等），可以做一次完整体检，逐项确认其他条件。":"按年数条件算，最早 "+fmt(e)+" 满足（在留 "+pc.needY+" 年等），还有 "+days(t,e)+" 天。纳税、年金和出国天数从现在起就在算。","#pr-check","做永驻体检"]);
+    else out.push(["永驻最早什么时候",pc.why,"#pr-check","做永驻体检"])}
   var po=phoneOptions(),ph=po[0];if(PL.card==="no"){var ok=po.filter(function(o){return o.pts.indexOf("没有信用卡也能办")>=0})[0];if(ok)ph=ok}
   if(R["2-1"]&&R["2-1"].state!=="done"&&R["2-1"].state!=="na")out.push(["电话卡怎么选最省",(PL.card==="no"?"没有日本信用卡、":"")+"每月约 "+{"3":"3GB","10":"10GB","30":"30GB","max":"不限量"}[PL.usage]+" 的话，"+(PL.card==="no"?"确认能办的里面最便宜的是 ":"月费最低的是 ")+ph.name+"，"+cny(ph.price)+"。","#plans","比较全部方案"]);
   else out.push(["花钱的事怎么选","电话卡、驾照、开公司都已按你的情况排好方案和费用。","#plans","比较全部方案"]);
@@ -114,11 +136,12 @@ function packText(){
   return "身份："+(STATUS_NAME[P.status]||"未填")+"\n入境日："+(P.entry||"未填")+"　在留期满日："+(P.exp||"未填")+"\n已办完："+(dn.length?dn.join("、"):"无")+"\n正在办："+(nq?nq.t:"无")+"\n可提供的资料："+(DOCS.length?DOCS.slice(0,5).map(function(d){return d.title}).join("、"):"暂无")+(PVNODE?"\n咨询事项："+linkTitle(PVNODE[0])+"（"+PVNODE[2]+"）\n对方一般会要的资料："+PVNODE[3]+"（以对方给的清单为准）":"")+"\n（不含个人编号和银行账号）";
 }
 function prCheck(){
-  var t=today(),arr=D(P.arrive),wk=D(P.work),hsp=+P.hsp,sp=P.status==="spouse",needY=sp?1:hsp>=80?1:hsp>=70?3:10,out=[];
-  var yrs=arr?days(arr,t)/365.25:0, wy=wk?days(wk,t)/365.25:0;
-  out.push(["在留年数","需连续"+needY+"年，现"+yrs.toFixed(1)+"年",yrs>=needY?"ok":"bad",Math.min(1,yrs/needY)]);
-  if(sp){var md=D(P.married),my=md?days(md,t)/365.25:0;out.push(["婚姻持续年数","需实际持续3年以上，现"+my.toFixed(1)+"年；2027年4月1日以后的申请预计改为婚姻5年、在留3年（待核实）",my>=3?"ok":"bad",Math.min(1,my/3),1])}
-  else if(hsp<70)out.push(["就労或居住资格年数","需连续5年，现"+wy.toFixed(1)+"年"+(P.status==="ssw"?"；特定技能1号的年数不算在内":""),wy>=5&&P.status!=="ssw"?"ok":P.status==="ssw"?"warn":"bad",Math.min(1,wy/5)]);
+  // 高度专门职本身就以70分为前提：积分没填或填了70分以下时按70分算。年数是否达标按周年日判断，和 when 用同一套算法。
+  var t=today(),arr=D(P.arrive),wk=D(P.work),sp=P.status==="spouse",hsp=Math.max(+P.hsp||0,P.status==="hsp"?70:0),needY=sp?1:hsp>=80?1:hsp>=70?3:10,out=[],why="";
+  var yrs=yearsBetween(arr,t), wy=yearsBetween(wk,t), md=D(P.married), my=yearsBetween(md,t), ssw=P.status==="ssw";
+  out.push(["在留年数","需连续"+needY+"年，现"+y1(yrs)+"年"+(arr?"":"（还没填来日日期）")+(P.status==="hsp"&&!(+P.hsp>=70)?"；按高度专门职70分算，80分以上的请把积分选为80分以上":""),arr&&addYears(arr,needY)<=t?"ok":"bad",Math.min(1,yrs/needY)]);
+  if(sp)out.push(["婚姻持续年数","需实际持续3年以上，现"+y1(my)+"年"+(md?"":"（还没填结婚日期）")+"；2027年4月1日以后的申请预计改为婚姻5年、在留3年（待核实）",md&&addYears(md,3)<=t?"ok":"bad",Math.min(1,my/3),1]);
+  else if(hsp<70)out.push(["就労或居住资格年数","需连续5年，现"+y1(wy)+"年"+(wk?"":"（还没填开始日期）")+(ssw?"；特定技能1号的年数不算在内":""),ssw?"warn":wk&&addYears(wk,5)<=t?"ok":"bad",Math.min(1,wy/5)]);
   var tenAgo=addYears(t,-10),longest=0,total=0;
   P.trips.forEach(function(x){var a=D(x[0]),b=D(x[1]);if(!a||!b||b<a)return;longest=Math.max(longest,days(a,b));var s=a<tenAgo?tenAgo:a;if(b>s)total+=days(s,b)});
   out.push(["单次出国","半年以上不利；最长一次"+longest+"天",longest<183?"ok":"bad",Math.min(1,longest/183),1]);
@@ -126,8 +149,16 @@ function prCheck(){
   var jp={n1:["达到","ok"],n2:["达到","ok"],n3:["需确认分数","warn"],low:["可能不足","bad"]}[P.jp]||["还没填写","warn"];
   out.push(["日语能力","需 B1 相当以上；"+jp[0],jp[1],null,1]);
   out.push(["税和社保按期缴纳","近5年住民税、近2年年金和医保",P.pay?"ok":"bad",null]);
-  var when=null;if(arr){when=addYears(arr,needY);if(sp&&D(P.married)){var m3=addYears(D(P.married),3);if(m3>when)when=m3}if(!sp&&hsp<70&&wk){var w5=addYears(wk,5);if(w5>when)when=w5}}
-  return {rows:out,when:when};
+  // when 只在算得出来的时候给日期：缺日期、特定技能、长期出国时为 null；年数已满但还有不达标的项目时也为 null。原因写在 why 里。
+  var when=null;
+  if(!arr)why="还没填来日日期，算不出最早时点。";
+  else if(sp&&!md)why="还没填结婚日期，算不出最早时点。";
+  else if(!sp&&hsp<70&&ssw)why="特定技能1号的年数不算进就劳资格的5年，要先换成其他就劳资格再起算，最早时点属于个别判断，请咨询行政书士。";
+  else if(!sp&&hsp<70&&!wk)why="还没填开始持就劳或居住资格的日期，算不出最早时点。";
+  else if(longest>=183||total>=913)why="出国时间较长，连续在留的年数可能要重新起算，最早时点属于个别判断，请咨询行政书士。";
+  else{when=addYears(arr,needY);if(sp){var m3=addYears(md,3);if(m3>when)when=m3}else if(hsp<70){var w5=addYears(wk,5);if(w5>when)when=w5}
+    if(when<=t&&out.some(function(r){return r[2]==="bad"})){when=null;why="年数条件已满，但上面还有不达标的项目，现在还不能按已达到申请条件来看。"}}
+  return {rows:out,when:when,whenDate:when?iso(when):"",why:why,needY:needY};
 }
 var CATS=[["edu","学校和升学服务","学位课程的咨询和报名（含推广）","取得学历、高度人才加分"],["gyosei","行政书士","签证、在留更新和变更、永驻申请的文书制作和取次","COE、在留更新、高度人才、永驻"],["zeirishi","税理士","确定申告、扶养扣除等个别税务咨询","住民税和扶养扣除"],["sharoshi","社会保险劳务士","年金和社保手续","国民年金"],["shiho","司法书士","公司设立登记和变更登记","开公司"],
   ["estate","不动产","面向外国人的租房","租房"],["mobile","电话卡","外国人容易办理的运营商","电话卡"],["school","驾校","外免切替练车和驾校课程","外免切替、上驾校"],["escort","陪同翻译","窗口办事陪同，只做口头翻译，不代填官方文书","住民登记、国保"]];
@@ -178,7 +209,7 @@ var SYS="你是「在留导航」里随时可以呼出的助手，帮助在日�
 "F 违法或规避请求（旅游签打工、虚假材料、挂靠公司、买卖账户等）：拒绝，并说明后果。\nG 与在日生活手续无关：一句话说明不在服务范围。\n"+
 "3. 引用到标有“待核实”的内容时，明说这一项尚未核实。\n4. 用简体中文，简短直接，先说结论，分点，每点一句。不用 Markdown 标题。\n"+
 "5. 回答涉及税或在留时，最后一行写：AI 回答不构成税务或法律意见。\n"+
-"6. 用户说明自己的情况时，用 update_profile 记录，只记录明确说过的内容。用户说某件事办完了，用 mark_done 记录。用户提到出国和回国日期，用 add_trip 记录。用户提到换工作或离职、搬家、离婚或配偶去世、孩子出生并说了具体日期时，用 add_event 记录，并告诉他由此产生的期限。\n"+
+"6. 用户说明自己的情况时，用 update_profile 记录，只记录明确说过的内容。用户说某件事办完了，用 mark_done 记录。用户提到出国和回国日期，用 add_trip 记录。用户提到换工作或离职、搬家、离婚或配偶去世、孩子出生并说了具体日期时，用 add_event 记录，并告诉他工具返回的期限和依据（法条、官方页面）；工具没有返回这件事的期限时，只说本工具没有登记到对应的期限，这不代表没有其他手续，请他以入管厅或区役所的说明为准，不要下“没有法定届出”“不用办”的结论。\n"+
 "7. 用户问该办什么、进度如何时，用 get_plan 取结果再回答，不自己编排，不自己计算期限。\n"+
 "8. C、D、E 类问题或用户想找人帮忙时，用 suggest_providers 列出对应类别；这里的服务商是示例占位，要告诉用户。\n"+
 "10. 用户问来日本走哪条路、怎么取得学历、高度人才还差几分和怎么加分、电话卡套餐、驾照怎么拿、驾校、开公司费用、第一年要准备多少钱这类需要做选择的问题时，先用 get_options 取方案再回答：按返回的顺序介绍前两三套，说明价格、适合谁、注意什么，并说明价格的核对日期和哪些是待实测。不自己补充价格。提到日元金额时同时给出工具返回的人民币折算。路线的排序和积分的计算是按用户所填条件得出的参考，要说明这不是能否获批的判断，积分以入管审查为准；不说“一定能批”“保证加分”。预算是估算，要说明没有算进去的项目；税和社保的金额仍按C类不计算。\n"+
@@ -190,7 +221,7 @@ var SYS="你是「在留导航」里随时可以呼出的助手，帮助在日�
 var STATUS_NAME={none:"尚无签证（人在中国）",short:"短期滞在（旅游签）",student:"留学",work:"技术·人文知识·国际业务",hsp:"高度专门职",family:"家族滞在",spouse:"日本人或永住者的配偶",ssw:"特定技能",biz:"经营·管理",pr:"永住者"};
 function profileText(){return "身份="+(STATUS_NAME[P.status]||"未知")+"；入境日="+(P.entry||"未填")+"；定下住所日="+(P.addr||"未填")+"；在留期满日="+(P.exp||"未填")+"；公司社保="+(P.ins?"是":"否")+"；20至59岁="+(P.age?"是":"否")+"；有符合条件的中国驾照="+(P.lic?"是":"否")+"；永驻目标="+(P.pr?"是":"否")}
 function planData(){var R=compute();return NODES.map(function(n){var r=R[n.id];return {id:n.id,title:n.t,state:r.state,note:r.note,due:r.due?fmt(r.due):"",cost:n.cost}}).filter(function(x){return x.state!=="na"})}
-function isDate(s){return /^\d{4}-\d{2}-\d{2}$/.test(s||"")}
+function isDate(s){var m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof s==="string"?s:"");if(!m)return false;var d=new Date(Date.UTC(+m[1],+m[2]-1,+m[3]));return d.getUTCFullYear()===+m[1]&&d.getUTCMonth()===+m[2]-1&&d.getUTCDate()===+m[3]}
 var JOBS=[["中文客服","正社员","pro","大阪市中央区"],["贸易公司翻译和事务","正社员","pro","大阪市北区"],["软件工程师","正社员","pro","大阪市淀川区"],["便利店店员","兼职","site","大阪市浪速区"],["餐厅后厨","兼职","site","大阪市中央区"],["仓库分拣","兼职","site","堺市"]];
 var CITY={house:[["一居室，近地铁","接受外国人，可中文沟通","大阪市浪速区"],["合租单间","含水电网","东大阪市"],["家庭两居室","近小学","吹田市"]],
  used:[["电饭煲和微波炉","回国转让","大阪市西成区"],["自行车","已做防盗登记，随车转让手续","大阪市天王寺区"],["书桌和椅子","自取","大阪市生野区"]],
@@ -326,11 +357,11 @@ function degreeOptions(){
   o.sort(function(a,b){return a.score-b.score});return o;
 }
 function hspPoints(s){
-  var age=+s.pAge,inc=+s.pInc,ex=+s.pExp,b={};
-  b["学历"]=+s.pEdu;
+  var age=parseFloat(s.pAge),inc=+s.pInc||0,ex=+s.pExp||0,b={},noAge=isNaN(age);
+  b["学历"]=+s.pEdu||0;
   b["职历"]=ex>=10?20:ex>=7?15:ex>=5?10:ex>=3?5:0;
-  b["年龄"]=age<=29?15:age<=34?10:age<=39?5:0;
-  var lim=age<=29?400:age<=34?500:age<=39?600:800;
+  b["年龄"]=noAge?0:age<=29?15:age<=34?10:age<=39?5:0;
+  var lim=noAge?800:age<=29?400:age<=34?500:age<=39?600:800;
   b["年收"]=inc>=1000?40:inc>=900?35:inc>=800?30:inc>=lim?(inc>=700?25:inc>=600?20:inc>=500?15:10):0;
   b["日语"]=s.pJp==="n1"?15:s.pJp==="n2"?10:0;
   b["在日本取得学位"]=s.pJd==="yes"?10:0;
@@ -352,7 +383,7 @@ function pointsOptions(){
   if(PL.pCert==="0")tryIt("考过1项信息处理类考试（日本的或中国的软考）",{pCert:"1"},"只需报名费","几个月",certNote,1.5,0,"");
   if(PL.pCert!=="2")tryIt("凑满2项信息处理类考试或国家资格",{pCert:"2"},"只需报名费","半年到一年",certNote,2,0,"");
   if(PL.pJp!=="n1")tryIt("考过日语N1",{pJp:"n1"},"只需报名费","按现有日语水平，半年到两年",[],1);
-  var inc=+PL.pInc,nxt=[400,500,600,700,800,900,1000].filter(function(x){return x>inc&&hspPoints({pEdu:PL.pEdu,pAge:PL.pAge,pInc:x,pExp:PL.pExp,pJp:PL.pJp,pJd:PL.pJd}).total>cur.total})[0];
+  var inc=+PL.pInc,nxt=[400,500,600,700,800,900,1000].filter(function(x){var s={};Object.keys(PL).forEach(function(k){s[k]=PL[k]});s.pInc=String(x);return x>inc&&hspPoints(s).total>cur.total})[0];
   if(nxt)tryIt("年收提高到"+nxt+"万日元",{pInc:String(nxt)},"不用花钱","看换工作或加薪的机会",["年收按申请时雇佣合同上的预定年收计算","换工作前先看“换工作申报”任务"],2);
   var lg=PL.pLang,canJa=lg==="ja"||lg==="both",canEn=lg==="en"||lg==="both";
   var RT=[
@@ -392,6 +423,6 @@ function options(topic, params){
 }
 function plan(){ var R = compute(), nq = nextQuest(R), pg = progress(R); return { profile: profileText(), next: nq ? { id: nq.id, title: nq.t } : null, level: pg.level, done: pg.done, total: pg.total, tasks: planData() } }
 return { EVRULES: EVRULES, NODES: NODES, DEF: DEF, STAGES: STAGES, CATS: CATS, REGULATED: REGULATED, LINKS: LINKS, JOBS: JOBS, CITY: CITY, PLT: PLT, STATUS_NAME: STATUS_NAME, SYS: SYS, RATE: RATE,
-  profile: P, compute: compute, progress: progress, nextQuest: nextQuest, plan: plan, reminders: reminders, advice: advice, prCheck: prCheck,
-  options: options, hspPoints: function(s){ return hspPoints(Object.assign({}, PL, s||{})) }, kb: kb, profileText: profileText, linksOf: linksOf, jobFit: jobFit, cny: cny, fmt: fmt, isDate: isDate };
+  profile: P, compute: compute, progress: progress, nextQuest: nextQuest, plan: plan, reminders: reminders, eventDeadlines: function(ev){ return evDue(ev).map(function(x){ return { date: iso(x.d), txt: x.txt, src: x.src } }) }, advice: advice, prCheck: prCheck,
+  options: options, hspPoints: function(s){ return hspPoints(Object.assign({}, PL, s||{})) }, kb: kb, profileText: profileText, linksOf: linksOf, jobFit: jobFit, cny: cny, fmt: fmt, isDate: isDate, today: today, iso: iso };
 };

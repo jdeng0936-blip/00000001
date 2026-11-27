@@ -20,7 +20,7 @@ const call = async (method, path, body, token) => {
 };
 
 test.before(async () => {
-  app = createApp({ now: '2026-11-26', adminToken: 'adm-secret' });
+  app = createApp({ now: '2026-11-26', adminToken: 'adm-secret', signupLimit: { max: 1000, windowMs: 3600000 } });
   await new Promise((ok) => app.server.listen(0, '127.0.0.1', ok));
   base = 'http://127.0.0.1:' + app.server.address().port;
 });
@@ -202,3 +202,100 @@ test('对接全流程：用户发给两家，服务商只看到自己的、看�
   assert.ok(!(await call('GET', '/api/providers?category=gyosei')).body.some((x) => x.id === p2.id), '下架后不再展示');
   assert.equal((await call('GET', '/api/provider/inquiries', null, p2.token)).status, 401, '下架后令牌失效');
 });
+
+test('日期：日历上不存在的日期一律拒绝（概况、出国记录、事件）', async () => {
+  const u = (await call('POST', '/api/users')).body;
+  for (const d of ['2025-02-31', '2026-02-30', '2026-02-29', '2026-04-31', '2026-13-01', '2026-00-10', '2026-01-00']) {
+    assert.equal((await call('PATCH', `/api/users/${u.id}/profile`, { entry: d })).status, 422, d);
+    assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: d })).status, 422, '事件 ' + d);
+  }
+  assert.equal((await call('PATCH', `/api/users/${u.id}/profile`, { trips: [['2026-01-31', '2026-02-30']] })).status, 422);
+  assert.equal((await call('PATCH', `/api/users/${u.id}/profile`, { entry: ['2026-01-10'] })).status, 422, '日期必须是字符串');
+  assert.equal((await call('PUT', `/api/users/${u.id}/state`, { profile: { exp: '2027-06-31' }, done: {} })).status, 422);
+  assert.equal((await call('PATCH', `/api/users/${u.id}/profile`, { entry: '2028-02-29' })).status, 200, '闰年的2月29日是真实的日期');
+  assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2028-02-29' })).status, 201);
+  assert.equal((await call('GET', `/api/users/${u.id}/events`)).body.length, 1);
+});
+
+test('事件类型：继承来的键和非字符串都拒绝，不会存进去也不会返回 500', async () => {
+  const u = (await call('POST', '/api/users')).body;
+  for (const type of ['constructor', '__proto__', 'toString', 'hasOwnProperty', ['move'], { a: 1 }, 5, null]) {
+    assert.equal((await call('POST', `/api/users/${u.id}/events`, { type, date: '2026-01-01' })).status, 422, JSON.stringify(type));
+  }
+  const list = await call('GET', `/api/users/${u.id}/events`);
+  assert.equal(list.status, 200); assert.equal(list.body.length, 0);
+});
+
+test('删除账号：留痕里不再有这个用户的 id、咨询 id 和服务商 id', async () => {
+  const u = (await call('POST', '/api/users')).body, other = (await call('POST', '/api/users')).body;
+  const p = await newProvider({ name: '删除测试行政书士事务所' });
+  await call('PATCH', `/api/users/${u.id}/profile`, { status: 'work' });
+  await call('PATCH', `/api/users/${other.id}/profile`, { status: 'student' });
+  await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-12-01' });
+  const sent = await call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: 'gyosei', providerId: p.id, summary: '想咨询在留更新的手续。' });
+  const qid = sent.body.ids[0];
+  assert.equal((await call('POST', `/api/provider/inquiries/${qid}/reply`, { text: '可以办理，请来面谈。' }, p.token)).status, 201);
+  const before = app.store.auditRows();
+  assert.ok(before.some((a) => a.userId === u.id), '删除前留痕里有这个用户');
+  assert.equal((await call('DELETE', `/api/users/${u.id}`)).status, 204);
+  const after = app.store.auditRows();
+  assert.ok(!JSON.stringify(after).includes(u.id), '用户 id 不能留在留痕里');
+  assert.ok(!JSON.stringify(after).includes(qid), '咨询 id 不能留在留痕里');
+  assert.ok(!after.some((a) => a.action === 'inquiry.create' && a.detail && a.detail.includes(p.id)), '发给了哪家服务商不能留在留痕里');
+  assert.equal(after.length, before.length + 1, '留痕的条数不变，只多一条删除记录');
+  assert.equal(after[after.length - 1].action, 'user.delete');
+  assert.ok(after.some((a) => a.userId === other.id && a.action === 'profile.update'), '别的用户的留痕不受影响');
+  assert.equal((await call('GET', '/api/provider/inquiries', null, p.token)).body.length, 0, '服务商那边的咨询也删掉');
+});
+
+test('合规：事件备注和服务商回复里的敏感号码也拒绝', async () => {
+  const u = (await call('POST', '/api/users')).body, p = await newProvider({ name: '过滤测试行政书士事务所' });
+  assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-01-01', note: '123456789012' })).status, 422);
+  assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-01-01', note: 'my number 1234 5678 9012 passport EA1234567' })).status, 422);
+  assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-01-01', note: '搬到大阪市北区，电话 090-1234-5678' })).status, 201);
+  const bad = await call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: 'gyosei', providerIds: [p.id], summary: '我的个人编号是１２３４５６７８９０１２ 以及 1234.5678.9012 护照号EA1234567' });
+  assert.equal(bad.status, 422); assert.match(bad.body.error, /个人编号/);
+  assert.equal((await call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: 'gyosei', providerIds: [p.id], summary: '护照号 E12345678, 账号 1234567' })).status, 422);
+  assert.equal((await call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: 'gyosei', providerIds: [p.id], nodeId: 'constructor', summary: '想咨询在留更新的手续。' })).status, 422);
+  const sent = await call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: 'gyosei', providerIds: [p.id], summary: '  在留期间 2026-11-30 到期，2027-01-15 前想办完更新。电话 090-1234-5678，预算 120,000 日元。  ' });
+  assert.equal(sent.status, 201, '日期、电话、金额不拦');
+  assert.equal((await call('GET', `/api/users/${u.id}/inquiries`)).body[0].summary.startsWith('在留期间'), true, '摘要去掉首尾空白');
+  const qid = sent.body.ids[0];
+  const r = await call('POST', `/api/provider/inquiries/${qid}/reply`, { text: '请把报酬汇到银行账号 1234567，或告诉我护照号。' }, p.token);
+  assert.equal(r.status, 422); assert.match(r.body.error, /回复里疑似含有/);
+  assert.equal((await call('POST', `/api/provider/inquiries/${qid}/reply`, { text: '请把您的マイナンバー 1234-5678-9012 发给我确认。' }, p.token)).status, 422);
+  assert.equal((await call('POST', `/api/provider/inquiries/${qid}/reply`, { text: '可以办理，报酬 120,000 日元起，来所前请致电 06-1234-5678。' }, p.token)).status, 201);
+});
+
+test('提醒接口：日期是 YYYY-MM-DD 的文字，事件期限带法条和官方页面；短期滞在记录孩子出生也有期限', async () => {
+  const u = (await call('POST', '/api/users')).body;
+  await call('PATCH', `/api/users/${u.id}/profile`, { status: 'hsp', entry: '2026-01-10', addr: '2026-01-12', exp: '2027-11-20', ins: true });
+  await call('POST', `/api/users/${u.id}/events`, { type: 'job_change', date: '2026-11-20' });
+  const all = (await call('GET', `/api/users/${u.id}/reminders`)).body;
+  assert.ok(all.length > 3);
+  for (const r of all) { assert.match(r.date, /^\d{4}-\d{2}-\d{2}$/, JSON.stringify(r)); assert.ok('src' in r); }
+  const ev = all.find((r) => r.tag === '事件');
+  assert.equal(ev.date, '2026-12-04');
+  assert.match(ev.src.law, /入管法第19条の16/); assert.match(ev.src.url, /nyuukokukanri10_00015/); assert.match(ev.src.more[0].url, /nyuukokukanri10_00014/);
+  assert.equal(all.find((r) => r.tag !== '事件').src, null);
+  // 短期滞在
+  const s = (await call('POST', '/api/users')).body;
+  await call('PATCH', `/api/users/${s.id}/profile`, { status: 'short' });
+  assert.equal((await call('POST', `/api/users/${s.id}/events`, { type: 'birth', date: '2026-11-01' })).status, 201);
+  const sr = (await call('GET', `/api/users/${s.id}/reminders`)).body.filter((r) => r.tag === '事件');
+  assert.deepEqual(sr.map((r) => r.date), ['2026-11-14', '2026-12-01']); assert.match(sr[0].src.law, /戸籍法第49条/);
+});
+
+test('敏感号码：发咨询、事件备注、服务商回复里，12位数字的各种分组都拒绝，几个年份照常通过', async () => {
+  const u = (await call('POST', '/api/users')).body, p = await newProvider({ name: '过滤测试行政书士事务所' });
+  await call('PATCH', `/api/users/${u.id}/profile`, { status: 'work', entry: '2026-01-10', addr: '2026-01-12' });
+  const inq = (summary) => call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: 'gyosei', providerIds: [p.id], summary });
+  for (const s of ['想咨询 123456 789012 的事', '想咨询 123456-789012 的事', '想咨询 123 456 789 012 的事', '想咨询 1234/5678/9012', '想咨询 1234,5678,9012']) assert.equal((await inq(s)).status, 422, s);
+  assert.equal((await adminlessProviderInquiries(p)).length, 0, '被拒的内容服务商收不到');
+  assert.equal((await inq('永驻申请，需要 2023 2024 2025 三年的纳税证明吗')).status, 201);
+  assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-11-20', note: '2023 2024 2025 年都住这里' })).status, 201);
+  assert.equal((await call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-11-20', note: '123456 789012' })).status, 422);
+  const q = (await adminlessProviderInquiries(p))[0];
+  assert.equal((await call('POST', `/api/provider/inquiries/${q.id}/reply`, { text: '请准备 2023 2024 2025 三个年度的课税证明书和纳税证明书' }, p.token)).status, 201);
+});
+async function adminlessProviderInquiries(p) { return (await call('GET', '/api/provider/inquiries', null, p.token)).body; }

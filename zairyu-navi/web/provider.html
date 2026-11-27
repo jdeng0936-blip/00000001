@@ -28,29 +28,50 @@ button{padding:8px 14px;border-radius:8px;border:1px solid #0f5f5a;background:#0
   <p><button type="button" id="go">进入</button> <span id="msg" role="status"></span></p>
 </div>
 <div id="me" hidden></div>
+<p class="draft" id="list-msg" role="status" hidden></p>
 <div id="list"></div>
 </main>
 <script>
-var T=null,NAME={sent:"新咨询",viewed:"已查看",replied:"已回复",closed:"已结束"};
+// 页面上所有来自服务器和用户的文字都用 textContent 放进去，不拼 HTML。
+var T=null,NAME={sent:"新咨询",viewed:"已查看",replied:"已回复",closed:"已结束"},DRAFT={}; // DRAFT：还没发出去的回复草稿，按咨询 id 记
 function $(i){return document.getElementById(i)}
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
-function api(m,p,b){return fetch("/api"+p,{method:m,headers:{"content-type":"application/json",authorization:"Bearer "+T},body:b?JSON.stringify(b):undefined}).then(function(r){return r.json().catch(function(){return {}}).then(function(j){if(!r.ok)throw new Error(j.error||r.status);return j})})}
-function load(){
-  return api("GET","/provider/inquiries").then(function(l){var box=$("list");box.textContent="";
-    if(!l.length)box.appendChild(el("p","muted","还没有咨询。"));
-    l.forEach(function(q){var c=el("div","card");c.appendChild(el("b",null,NAME[q.status]+"　"+q.createdAt.slice(0,10)));
-      var pre=el("p",null,q.summary);pre.style.whiteSpace="pre-wrap";c.appendChild(pre);
-      q.replies.forEach(function(r){var d=el("p","muted","你的回复（"+r.createdAt.slice(0,10)+"）："+r.text);d.style.whiteSpace="pre-wrap";c.appendChild(d)});
-      if(q.status!=="closed"){var ta=el("textarea");ta.rows=3;ta.setAttribute("aria-label","回复内容");c.appendChild(ta);
-        var row=el("p"),s=el("button",null,"发送回复"),x=el("button","ghost","结束这条咨询"),note=el("span");note.setAttribute("role","status");s.type=x.type="button";
-        s.onclick=function(){api("POST","/provider/inquiries/"+q.id+"/reply",{text:ta.value}).then(load).catch(function(e){note.textContent=" "+e.message})};
-        x.onclick=function(){api("PUT","/provider/inquiries/"+q.id+"/status",{status:"closed"}).then(load)};
-        row.appendChild(s);row.appendChild(document.createTextNode(" "));row.appendChild(x);row.appendChild(note);c.appendChild(row);
-        if(q.status==="sent")api("PUT","/provider/inquiries/"+q.id+"/status",{status:"viewed"}).catch(function(){})}
-      box.appendChild(c)})});
+// 失败时 e.status：0 是连不上，其余是服务器返回的状态码；e.said 表示服务器给了说明文字
+function api(m,p,b){return fetch("/api"+p,{method:m,headers:{"content-type":"application/json",authorization:"Bearer "+T},body:b?JSON.stringify(b):undefined}).then(function(r){return r.json().catch(function(){return {}}).then(function(j){if(!r.ok){var e=new Error(j&&typeof j.error==="string"?j.error:String(r.status));e.status=r.status;e.said=!!(j&&typeof j.error==="string");throw e}return j})},function(){var e=new Error("连不上服务器");e.status=0;throw e})}
+// 只有 401 才说令牌不对；连不上和服务器出错分开说
+function why(e){
+  if(e.status===401)return "令牌不对，或账号已停用。";
+  if(e.status===0)return "连不上服务器，请检查网络后再试。";
+  if(e.said&&e.status>=400&&e.status<500)return e.message; // 例如回复里疑似含有银行账号、护照号：显示服务器的说明
+  return "服务器出了点问题（"+e.status+"），请稍后再试。";
 }
-$("go").onclick=function(){T=$("tok").value.trim();api("GET","/provider/me").then(function(p){$("login").hidden=true;var m=$("me");m.hidden=false;m.textContent="";m.appendChild(el("p",null,p.name+(p.licenseNo?"（登录番号 "+p.licenseNo+"）":"")));
-  m.appendChild(el("p","muted","回复时请不要作“保证获批”一类的承诺；报酬和范围请写清楚。"));return load()}).catch(function(e){$("msg").textContent="令牌不对，或账号已停用。"})};
+function render(l){
+  var box=$("list");box.textContent="";
+  if(!l.length)box.appendChild(el("p","muted","还没有咨询。"));
+  l.forEach(function(q){var c=el("div","card");c.appendChild(el("b",null,(NAME[q.status]||"")+"　"+String(q.createdAt).slice(0,10)));
+    var pre=el("p",null,q.summary);pre.style.whiteSpace="pre-wrap";c.appendChild(pre);
+    (q.replies||[]).forEach(function(r){var d=el("p","muted","你的回复（"+String(r.createdAt).slice(0,10)+"）："+r.text);d.style.whiteSpace="pre-wrap";c.appendChild(d)});
+    if(q.status!=="closed"){var ta=el("textarea");ta.rows=3;ta.setAttribute("aria-label","回复内容");ta.value=DRAFT[q.id]||"";ta.oninput=function(){DRAFT[q.id]=ta.value};c.appendChild(ta);
+      var row=el("p"),s=el("button",null,"发送回复"),x=el("button","ghost","结束这条咨询"),note=el("span");note.setAttribute("role","status");s.type=x.type="button";
+      s.onclick=function(){s.disabled=true;note.textContent="";api("POST","/provider/inquiries/"+q.id+"/reply",{text:ta.value}).then(function(){delete DRAFT[q.id];return load()}).catch(function(e){s.disabled=false;note.textContent=" 没有发出去："+why(e)})};
+      x.onclick=function(){x.disabled=true;note.textContent="";api("PUT","/provider/inquiries/"+q.id+"/status",{status:"closed"}).then(function(){return load()}).catch(function(e){x.disabled=false;note.textContent=" 没有结束成功："+why(e)})};
+      row.appendChild(s);row.appendChild(document.createTextNode(" "));row.appendChild(x);row.appendChild(note);c.appendChild(row);
+      if(q.status==="sent")api("PUT","/provider/inquiries/"+q.id+"/status",{status:"viewed"}).catch(function(){})}
+    box.appendChild(c)});
+}
+// 重新读名单。别的咨询里没发出去的草稿留在 DRAFT 里，重画之后还在。读不出来时把原因显示在名单上方，不清空已经显示的内容。
+function load(){
+  return api("GET","/provider/inquiries").then(function(l){$("list-msg").hidden=true;render(l)},function(e){
+    var m=$("list-msg");m.hidden=false;m.textContent="";m.appendChild(document.createTextNode("咨询名单没有读出来："+why(e)+" "));
+    var b=el("button","ghost","重试");b.type="button";b.id="list-retry";b.onclick=function(){load()};m.appendChild(b)});
+}
+$("go").onclick=function(){
+  T=$("tok").value.trim();if(!T){$("msg").textContent="请先填令牌。";return}
+  $("go").disabled=true;$("msg").textContent="";
+  api("GET","/provider/me").then(function(p){$("go").disabled=false;$("login").hidden=true;var m=$("me");m.hidden=false;m.textContent="";m.appendChild(el("p",null,p.name+(p.licenseNo?"（登录番号 "+p.licenseNo+"）":"")));
+    m.appendChild(el("p","muted","回复时请不要作“保证获批”一类的承诺；报酬和范围请写清楚。请不要在回复里写银行账号、护照号这类号码，系统会拦下。"));return load()},
+  function(e){$("go").disabled=false;$("msg").textContent=why(e)});
+};
 </script>
 </body>
 </html>
