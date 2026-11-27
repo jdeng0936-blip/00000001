@@ -1,0 +1,12 @@
+{
+  "name": "zairyu-navi",
+  "version": "0.3.0",
+  "private": true,
+  "description": "在留导航 第一期：路线、提醒、选方案、对接咨询",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
+    "eval": "node eval/run.js"
+  }
+}

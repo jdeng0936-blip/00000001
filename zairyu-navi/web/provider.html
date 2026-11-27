@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>服务商工作台｜在留导航</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0;font:16px/1.75 system-ui,-apple-system,"PingFang SC","Hiragino Sans GB","Noto Sans SC",sans-serif;background:#f6f5f1;color:#1d1d1b}
+main{max-width:720px;margin:0 auto;padding:24px 18px 64px}
+h1{font-size:24px;margin:8px 0 4px}h2{font-size:18px;margin:28px 0 6px}
+p,li{margin:6px 0}small,.muted{color:#5d5d57}
+a{color:#0f5f5a}table{border-collapse:collapse;width:100%}td,th{border:1px solid #d9d7cf;padding:6px 8px;text-align:left;vertical-align:top}
+.draft{border:1px solid #b9770e;background:#fdf3dd;color:#5a3a05;padding:10px 12px;border-radius:8px}
+textarea,input,button,select{font:inherit}textarea,input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #bdbbb2;border-radius:8px;background:#fff;color:inherit}
+button{padding:8px 14px;border-radius:8px;border:1px solid #0f5f5a;background:#0f5f5a;color:#fff;cursor:pointer}button.ghost{background:transparent;color:#0f5f5a}
+.card{background:#fff;border:1px solid #d9d7cf;border-radius:10px;padding:12px 14px;margin:12px 0}
+@media (prefers-color-scheme:dark){body{background:#161614;color:#ecebe6}.card,textarea,input{background:#1f1f1c;border-color:#3a3a35}td,th{border-color:#3a3a35}small,.muted{color:#a9a79f}a{color:#6fc9c1}.draft{background:#3a2c0c;color:#f3deb0;border-color:#8a6a1c}button.ghost{color:#6fc9c1;border-color:#6fc9c1}}
+</style>
+</head>
+<body>
+<main>
+<h1>服务商工作台</h1>
+<p class="muted">查看发给你的咨询并回复。你看到的只有咨询内容，看不到用户的账号信息。</p>
+<div class="card" id="login">
+  <label for="tok">入驻时拿到的令牌</label>
+  <input id="tok" type="password" autocomplete="off">
+  <p><button type="button" id="go">进入</button> <span id="msg" role="status"></span></p>
+</div>
+<div id="me" hidden></div>
+<div id="list"></div>
+</main>
+<script>
+var T=null,NAME={sent:"新咨询",viewed:"已查看",replied:"已回复",closed:"已结束"};
+function $(i){return document.getElementById(i)}
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+function api(m,p,b){return fetch("/api"+p,{method:m,headers:{"content-type":"application/json",authorization:"Bearer "+T},body:b?JSON.stringify(b):undefined}).then(function(r){return r.json().catch(function(){return {}}).then(function(j){if(!r.ok)throw new Error(j.error||r.status);return j})})}
+function load(){
+  return api("GET","/provider/inquiries").then(function(l){var box=$("list");box.textContent="";
+    if(!l.length)box.appendChild(el("p","muted","还没有咨询。"));
+    l.forEach(function(q){var c=el("div","card");c.appendChild(el("b",null,NAME[q.status]+"　"+q.createdAt.slice(0,10)));
+      var pre=el("p",null,q.summary);pre.style.whiteSpace="pre-wrap";c.appendChild(pre);
+      q.replies.forEach(function(r){var d=el("p","muted","你的回复（"+r.createdAt.slice(0,10)+"）："+r.text);d.style.whiteSpace="pre-wrap";c.appendChild(d)});
+      if(q.status!=="closed"){var ta=el("textarea");ta.rows=3;ta.setAttribute("aria-label","回复内容");c.appendChild(ta);
+        var row=el("p"),s=el("button",null,"发送回复"),x=el("button","ghost","结束这条咨询"),note=el("span");note.setAttribute("role","status");s.type=x.type="button";
+        s.onclick=function(){api("POST","/provider/inquiries/"+q.id+"/reply",{text:ta.value}).then(load).catch(function(e){note.textContent=" "+e.message})};
+        x.onclick=function(){api("PUT","/provider/inquiries/"+q.id+"/status",{status:"closed"}).then(load)};
+        row.appendChild(s);row.appendChild(document.createTextNode(" "));row.appendChild(x);row.appendChild(note);c.appendChild(row);
+        if(q.status==="sent")api("PUT","/provider/inquiries/"+q.id+"/status",{status:"viewed"}).catch(function(){})}
+      box.appendChild(c)})});
+}
+$("go").onclick=function(){T=$("tok").value.trim();api("GET","/provider/me").then(function(p){$("login").hidden=true;var m=$("me");m.hidden=false;m.textContent="";m.appendChild(el("p",null,p.name+(p.licenseNo?"（登录番号 "+p.licenseNo+"）":"")));
+  m.appendChild(el("p","muted","回复时请不要作“保证获批”一类的承诺；报酬和范围请写清楚。"));return load()}).catch(function(e){$("msg").textContent="令牌不对，或账号已停用。"})};
+</script>
+</body>
+</html>
