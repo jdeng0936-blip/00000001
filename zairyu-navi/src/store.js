@@ -529,7 +529,9 @@ function createStore(file, opts) {
     // - 已开出还没付的一张：只能接在已付款的一段后面，把这段延到它的 付款期限 + 宽限天数（期限没过就不因为它下架；
     //   和 src/billing.js 发“不再展示”告知的条件 付款期限 + 宽限天数 < 今天 一致）。没有付过款的那一段不展示。
     // legacy-hold（老服务商迁移时资料没过检查）不展示；经申请批准、还没领取令牌的不展示。
-    // 首月免费（src/billing.js 的 firstInvoice）记成一张金额 0 的已付款记录，所以按同一套规则算：批准当月结束 + 宽限天数。
+    // 30 天免费期（src/billing.js 的 firstInvoice）记成一张金额 0 的已付款记录（period_start 批准日、period_end 批准日 + 30 天），按同一套规则接，
+    // 只是它本身只覆盖到免费期最后一天、不加宽限（“展示到批准日 + 30 天”）；第一张账单的期限就是免费期最后一天，没付的照常再宽限 BILLING_GRACE_DAYS 天。
+    // 免费期之后按天折算的第一期从免费期结束的第二天开始，正好接上。
     // 宽限天数由 configureListing 设（src/billing.js 按 BILLING_GRACE_DAYS 设好），默认 7。返回 { listed, listedUntil }，listedUntil 是展示到哪一天（direct 为 null）。
     configureListing(cfg) { if (cfg && Number.isInteger(cfg.graceDays)) listing.graceDays = cfg.graceDays; },
     providerListing(id, today) {
@@ -538,18 +540,24 @@ function createStore(file, opts) {
       if (!p) return { listed: false, listedUntil: null };
       if (p.source === 'direct') return { listed: !!p.active, listedUntil: null };
       if (p.source === 'legacy-hold') return { listed: false, listedUntil: null };
-      // 经申请批准的：领取令牌之前看不到咨询，不展示（首月免费的覆盖也要等领取之后）
+      // 经申请批准的：领取令牌之前看不到咨询，不展示（免费期的覆盖也要等领取之后）
       if (p.source === 'apply' && !p.claimed_at) return { listed: false, listedUntil: null };
       const g = listing.graceDays, runs = [];
+      // 免费期过后才领取的，第一期从领取那天起收费（src/billing.js 的 billStartOf），接不上免费期；这一期还没付时照样从领取那天起展示到 期限 + 宽限，
+      // 和免费期里领取、第一期接在免费期后面的服务商一样（领取在哪个月都一样）
+      const claimDay = p.source === 'apply' && p.claimed_at ? jstToday(Date.parse(p.claimed_at)) : null;
       let cur = null; // { from, until }
-      for (const inv of db.prepare("SELECT period_start, period_end, due_date, status FROM invoices WHERE provider_id=? AND status IN ('paid','issued') ORDER BY period_start").all(id)) {
+      for (const inv of db.prepare("SELECT period_start, period_end, due_date, status, method FROM invoices WHERE provider_id=? AND status IN ('paid','issued') ORDER BY period_start").all(id)) {
         const joins = cur && inv.period_start <= addDays(cur.until, 1);
         if (inv.status === 'paid') {
-          const e = addDays(inv.period_end, g);
+          // 免费期（method first_month_free，见 src/billing.js 的 FREE）只到免费期最后一天，本身不加宽限：宽限从第一张账单的期限（就是免费期最后一天）起算
+          const e = inv.method === 'first_month_free' ? inv.period_end : addDays(inv.period_end, g);
           if (joins) { if (e > cur.until) cur.until = e; } else { cur = { from: inv.period_start, until: e }; runs.push(cur); }
         } else if (joins) {
           const e = addDays(inv.due_date, g);
           if (e > cur.until) cur.until = e;
+        } else if (claimDay && inv.period_start === claimDay) {
+          cur = { from: inv.period_start, until: addDays(inv.due_date, g) }; runs.push(cur);
         }
       }
       const hit = runs.find((r) => r.from <= today && today <= r.until);
@@ -628,9 +636,9 @@ function createStore(file, opts) {
         return true;
       });
     },
-    // 批准：一个事务里建服务商（不发令牌：token_hash 是谁也用不了的 unclaimed:随机值，用联系邮箱领取）、补充资料、联系邮箱和首月免费的覆盖记录，
-    // 再排一封批准邮件。check：{ method, checkedOn, note } 登录番号的核对记录。invoice：billing.firstInvoice 算好的首月免费记录。mail(inv)：返回 { subject, body }。
-    // 只能从 pending 批准；key（管理员看到的 reviewKey）对不上、联系邮箱已经是别家服务商的时返回 null。返回 { providerId, freeUntil }（免费到哪一天，批准当月的最后一天）。
+    // 批准：一个事务里建服务商（不发令牌：token_hash 是谁也用不了的 unclaimed:随机值，用联系邮箱领取）、补充资料、联系邮箱和免费期的覆盖记录，
+    // 再排一封批准邮件。check：{ method, checkedOn, note } 登录番号的核对记录。invoice：billing.firstInvoice 算好的免费期记录。mail(inv)：返回 { subject, body }。
+    // 只能从 pending 批准；key（管理员看到的 reviewKey）对不上、联系邮箱已经是别家服务商的时返回 null。返回 { providerId, freeUntil }（免费期的最后一天：批准日 + 30 天，日本时间）。
     approveApplication(id, by, check, invoice, mail, key) {
       return this.tx(() => {
         const a = db.prepare("SELECT * FROM provider_applications WHERE id=? AND status='pending'").get(id);
@@ -663,7 +671,8 @@ function createStore(file, opts) {
       const token = newToken();
       this.tx(() => {
         db.prepare('UPDATE providers SET token_hash=? WHERE id=?').run(hash(token), id);
-        db.prepare('UPDATE provider_meta SET claimed_at=? WHERE provider_id=?').run(now(), id);
+        // claimed_at 只记第一次领取（换令牌不改）：展示费从第一次领取那天算（src/billing.js 的 claimDayOf）
+        db.prepare('UPDATE provider_meta SET claimed_at=COALESCE(claimed_at, ?) WHERE provider_id=?').run(now(), id);
         if (notice) this.enqueueMail({ kind: 'notice', to: notice.to, subject: notice.subject, body: notice.body });
         log(null, 'provider.claim', { id });
       });

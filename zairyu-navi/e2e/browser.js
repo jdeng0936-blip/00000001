@@ -629,7 +629,7 @@ async function step(name, fn) {
     await ctx6.close();
   });
 
-  await step('服务商入驻：申请页填写（验证码从发件箱读）→ 管理后台批准（要填核对方式）→ 工作台用联系邮箱领取令牌 → 批准当月免费，领取后就展示 → 下个月的账单开出了就标记已付款 → 用户发咨询 → 通知邮件里没有咨询内容 → 工作台回复 → 关掉通知 → 下架后 401', async () => {
+  await step('服务商入驻：申请页填写（验证码从发件箱读）→ 管理后台批准（要填核对方式）→ 工作台用联系邮箱领取令牌 → 30 天免费期，领取后就展示 → 免费期之后的第一期账单开出了就标记已付款 → 用户发咨询 → 通知邮件里没有咨询内容 → 工作台回复 → 关掉通知 → 下架后 401', async () => {
     const PE = 'e2e.office@example.jp', PNAME = '端到端中文行政书士事务所<b>不是标签</b>', SUM = '想咨询经营管理签证的更新，公司第二年。';
     const reviewer = { authorization: 'Bearer ' + REVIEWER, 'content-type': 'application/json' };
     const code = async (to, after) => {
@@ -687,14 +687,20 @@ async function step(name, fn) {
     assert.ok(pmails.some((m) => /已批准/.test(m.subject)), '应当有批准邮件'); assert.ok(pmails.every((m) => !m.body.includes(ptok)), '任何邮件里都没有令牌');
     await pw.click('#cl-use');
     await pw.waitForSelector('#listing', { timeout: 5000 });
-    assert.match(await pw.innerText('#listing'), /名单上展示中/, '批准当月免费：领取令牌后就展示');
+    assert.match(await pw.innerText('#listing'), /名单上展示中/, '免费期：领取令牌后就展示');
+    assert.match(await pw.innerText('#free-until'), /免费期到 \d{4}-\d{2}-\d{2}（批准日 \+ 30 天，日本时间）。之后的第一张账单从 \d{4}-\d{2}-\d{2} 起收费，(收到那个月底，按天折算|是整月)，在那天之前 14 天开出/, '工作台写着免费期到哪天、第一期从哪天起');
+    {
+      // 整月还是按天折算，要和第一期开始的那天是不是 1 日一致
+      const ft = await pw.innerText('#free-until'), fs = /从 (\d{4}-\d{2}-(\d{2})) 起收费/.exec(ft);
+      assert.equal(/按天折算/.test(ft), fs[2] !== '01', ft);
+    }
     await pw.waitForFunction(() => /展示费账单/.test(document.getElementById('billing').innerText), null, { timeout: 5000 });
-    assert.match(await pw.innerText('#billing'), /还没有账单。批准当月免费/, '首月免费的记录不是账单，不列出');
-    assert.ok(pmails.some((m) => /已批准/.test(m.subject) && /批准当月免费/.test(m.body) && !/参考编号/.test(m.body)), '批准邮件里写首月免费，没有账单');
+    assert.match(await pw.innerText('#billing'), /还没有账单。之后的第一张账单从 \d{4}-\d{2}-\d{2} 起收费/, '免费期的记录不是账单，不列出');
+    assert.ok(pmails.some((m) => /已批准/.test(m.subject) && /批准后 30 天免费/.test(m.body) && /第一张账单是/.test(m.body) && !/参考编号/.test(m.body)), '批准邮件里写 30 天免费期和第一期，没有账单');
     // 4. 首页名单上已经有这家（不用先付款）
     const pid = app.providerId;
     assert.ok((await json('/api/providers?category=gyosei')).some((x) => x.id === pid), '领取令牌后就在名单上');
-    // 5. 跑一轮展示费：离下个月不到 14 天时开出下个月的账单（按今天的日期，可能还没到），开出了就在管理后台标记已付款
+    // 5. 跑一轮展示费：刚批准时还在免费期里，第一期的账单要在免费期结束前 14 天才开（端到端用真实时钟，所以这里一般没有账单；开出了就在管理后台标记已付款）
     await json('/api/admin/billing/run', { method: 'POST', headers: reviewer });
     const next = (await json('/api/admin/invoices?status=issued', { headers: reviewer })).filter((i) => i.providerId === pid);
     if (next.length) {

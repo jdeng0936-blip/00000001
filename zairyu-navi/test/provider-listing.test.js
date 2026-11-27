@@ -46,12 +46,14 @@ test('作废了中间的一期：付了下一期就展示', async () => {
   const s = await start();
   const h = helpers(s);
   try {
+    // 11 月 27 日批准：免费期到 12 月 27 日，第一期 12 月 28 日至 31 日（12 月 14 日开出，期限 12 月 27 日）
     const p = await s.onboard('void@example.jp', null, true);
-    await h.run(); // 开出 12 月
+    s.set(noon('2026-12-14')); await h.run();
     const dec = h.inv(p.providerId, '2026-12');
-    s.set(noon('2026-12-20'));
+    assert.equal(dec.periodStart, '2026-12-28');
+    s.set(noon('2027-01-04'));
     await h.run();
-    assert.equal(h.listing(p.providerId).listed, false, '12 月过了宽限期');
+    assert.equal(h.listing(p.providerId).listed, false, '第一期过了宽限期（期限 12 月 27 日 + 7 天）');
     assert.equal((await s.adm('POST', '/api/admin/invoices/' + dec.id + '/void', { reason: '这一期不收' })).status, 200);
     s.set(noon('2027-01-05'));
     await h.run();
@@ -70,12 +72,13 @@ test('拖欠了不止一期：补上旧的、再付了当期，当期就展示',
   const s = await start(null, noon('2026-11-02'));
   const h = helpers(s);
   try {
+    // 11 月 2 日批准：免费期到 12 月 2 日，第一期 12 月 3 日起（11 月 19 日开出）
     const p = await s.onboard('lapse@example.jp', MOBILE, true);
     s.set(noon('2026-11-20')); await h.run();
     const dec = h.inv(p.providerId, '2026-12');
-    assert.equal(dec.dueDate, '2026-11-30');
-    s.set(noon('2026-12-08')); await h.run();
-    assert.equal(h.listing(p.providerId).listed, false, '12 月拖欠，下架');
+    assert.equal(dec.dueDate, '2026-12-02');
+    s.set(noon('2026-12-10')); await h.run();
+    assert.equal(h.listing(p.providerId).listed, false, '第一期拖欠，下架');
     s.set(noon('2027-01-10')); await h.run();
     s.set(noon('2027-02-02')); await h.run();
     await h.pay(dec);
@@ -85,7 +88,7 @@ test('拖欠了不止一期：补上旧的、再付了当期，当期就展示',
     await h.pay(feb);
     assert.deepEqual(h.listing(p.providerId), { listed: true, listedUntil: '2027-03-07' });
     assert.equal((await s.listed('mobile')).length, 1);
-    // 只作废旧的、不补也一样：以前的 11 月覆盖不会挡住新付的一期
+    // 只作废旧的、不补也一样：以前的免费期覆盖不会挡住新付的一期
     const s2 = await start(null, noon('2026-11-02'));
     const h2 = helpers(s2);
     try {
@@ -100,31 +103,37 @@ test('拖欠了不止一期：补上旧的、再付了当期，当期就展示',
   } finally { await s.stop(); }
 });
 
-test('月底批准：下一期的账单期限在覆盖结束之后时，期限加宽限天数之前照常展示；过了才下架，同一轮发告知', async () => {
+test('定时任务跑晚了：第一期的账单期限在免费期结束之后时，期限加宽限天数之前照常展示；过了才下架，同一轮发告知', async () => {
   const s = await start(null, noon('2026-11-28'));
   const h = helpers(s);
   try {
+    // 11 月 28 日批准：免费期到 12 月 28 日，第一期 12 月 29 日起，本该 12 月 15 日开出；定时任务 12 月 25 日才第一次跑
     const p = await s.onboard('late@example.jp', null, true);
-    await h.run();
-    const dec = h.inv(p.providerId, '2026-12');
-    assert.equal(dec.dueDate, '2026-12-12', '开得晚了，期限从开出起 14 天');
-    for (const [d, on] of [['2026-12-07', true], ['2026-12-08', true], ['2026-12-12', true], ['2026-12-19', true], ['2026-12-20', false]]) {
+    assert.equal(p.freeUntil, '2026-12-28');
+    s.set(noon('2026-12-25')); await h.run();
+    const dec = h.inv(p.providerId, '2026-12'), jan = h.inv(p.providerId, '2027-01');
+    assert.equal(dec.periodStart, '2026-12-29');
+    assert.equal(dec.dueDate, '2027-01-08', '开得晚了，期限从开出起 14 天');
+    assert.equal(jan.dueDate, '2027-01-08');
+    for (const [d, on] of [['2026-12-28', true], ['2026-12-29', true], ['2027-01-08', true], ['2027-01-15', true], ['2027-01-16', false]]) {
       s.set(noon(d));
       assert.equal(h.listing(p.providerId).listed, on, d);
     }
-    s.set(noon('2026-12-10'));
-    assert.equal(h.listing(p.providerId).listedUntil, '2026-12-19');
-    s.set(noon('2026-12-20'));
+    s.set(noon('2027-01-01'));
+    assert.equal(h.listing(p.providerId).listedUntil, '2027-01-15');
+    s.set(noon('2027-01-16'));
     const r = await h.run();
     assert.equal(r.hidden, 1, '下架的那天就告知');
     assert.ok(s.mails('late@example.jp').some((m) => /不在名单上展示|暂停展示|不再展示/.test(m.subject + m.body)));
-    // 付了 12 月就恢复
+    // 付了第一期和 1 月就恢复
     await h.pay(dec);
+    assert.equal(h.listing(p.providerId).listed, false, '只付第一期：覆盖到 1 月 7 日，今天已经过了');
+    await h.pay(jan);
     assert.equal(h.listing(p.providerId).listed, true);
   } finally { await s.stop(); }
 });
 
-test('批准了没领取令牌的不展示；首月免费过了、下个月的账单没付的，期限 + 宽限天数之后不展示', async () => {
+test('批准了没领取令牌的不展示；免费期过了、第一期的账单没付的，期限 + 宽限天数之后不展示', async () => {
   const s = await start();
   const h = helpers(s);
   try {
@@ -134,12 +143,13 @@ test('批准了没领取令牌的不展示；首月免费过了、下个月的�
     assert.equal((await s.listed()).length, 0);
     const p = await s.onboard('unpaid@example.jp');
     await h.run();
-    assert.equal(h.listing(p.providerId).listed, true, '首月免费');
+    assert.deepEqual(h.listing(p.providerId), { listed: true, listedUntil: '2026-12-27' }, '免费期：展示到批准日 + 30 天');
+    s.set(noon('2026-12-14')); await h.run();
     const dec = h.inv(p.providerId, '2026-12');
-    assert.equal(dec.dueDate, '2026-12-11');
-    s.set(noon('2026-12-18')); assert.equal(h.listing(p.providerId).listed, true);
-    s.set(noon('2026-12-19')); await h.run();
-    assert.equal(h.listing(p.providerId).listed, false, '下个月的账单没付');
+    assert.equal(dec.dueDate, '2026-12-27');
+    s.set(noon('2027-01-03')); assert.equal(h.listing(p.providerId).listed, true);
+    s.set(noon('2027-01-04')); await h.run();
+    assert.equal(h.listing(p.providerId).listed, false, '第一期的账单没付');
     assert.deepEqual((await s.listed()).map((x) => x.id), []);
   } finally { await s.stop(); }
 });

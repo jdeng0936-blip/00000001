@@ -198,10 +198,16 @@ const TEXTS = {
   applyReceived: (ref) => ({ subject: '【在留导航】已收到服务商入驻申请', text: '我们已经收到你的入驻申请。\n\n申请编号：' + ref + '\n\n审核时我们会对照所属会的公开检索核对登录番号等资料，结果会发到这个邮箱。审核期间可以在申请页面的“查看或修改申请”里用这个邮箱查看进度，或者撤回申请。' + PSIGN }),
   applyChanges: (ref, msg) => ({ subject: '【在留导航】入驻申请需要修改', text: '你的入驻申请（编号 ' + ref + '）需要修改后重新提交。审核人员的说明：\n\n' + msg + '\n\n请在申请页面的“查看或修改申请”里，用这个邮箱收验证码后修改并重新提交。' + PSIGN }),
   applyRejected: (ref, reason) => ({ subject: '【在留导航】入驻申请的审核结果', text: '很抱歉，你的入驻申请（编号 ' + ref + '）没有通过审核。说明：\n\n' + reason + '\n\n申请资料会在 90 天后删除。' + PSIGN }),
-  // 批准：写明怎么领取令牌（不写令牌本身）和首月免费
-  // inv 是首月免费的记录（批准当月不收费，没有账单）；payText、regNo 不再用，参数为兼容保留
-  // 批准当月免费：只是这个月不收费、不开这个月的账单。下个月的账单照常提前 issueDays 天开出，月底批准的可能当天就收到（src/billing.js 的 runOnce）。
-  applyApproved: (ref, workbenchUrl, inv, issueDays) => ({ subject: '【在留导航】入驻申请已批准', text: '你的入驻申请（编号 ' + ref + '）已经批准。\n\n第一步：领取工作台的令牌\n打开服务商工作台 ' + workbenchUrl + ' ，点“第一次使用或令牌丢了：用联系邮箱领取”，填这个邮箱，再填收到的验证码。令牌只显示一次，请保存好；我们不会用邮件发送令牌，也不会向你要令牌。领取令牌后，你的事务所就会出现在名单上。\n\n展示费：批准当月免费\n批准当月（到 ' + cnDate(inv.periodEnd) + ' 为止）不收展示费，这个月没有账单。免费期从批准当天算到当月最后一天，和什么时候领取令牌无关；领取令牌之前不开账单，也不在名单上展示。\n从下个月起按月收固定的展示费（不按咨询数或成交数收费）。下个月的账单在下个月开始前 ' + (issueDays || 14) + ' 天开出、发到这个邮箱，所以批准时离月底不到 ' + (issueDays || 14) + ' 天的，下个月的账单最早会在本月内（可能就在这几天）开出；按账单上写的期限付款即可继续展示。' + PSIGN }),
+  // 批准：写明怎么领取令牌（不写令牌本身）和 30 天免费期（规则见 src/billing.js 开头）
+  // inv 是免费期的记录（period_start 批准日，period_end 免费期最后一天）；first 是 billing.firstPaid 算的第一张账单（期间、按天折算的金额、开出日、期限）
+  applyApproved: (ref, workbenchUrl, inv, issueDays, first, graceDays) => {
+    const iss = issueDays || 14, g = graceDays == null ? 7 : graceDays;
+    const firstText = first ? '第一张账单是 ' + cnDate(first.periodStart) + ' 至 ' + cnDate(first.periodEnd) + (first.prorated
+      ? ' 的展示费，不是整月，按天折算：月额 × 收费天数 ÷ 当月天数，不足 1 日元的部分舍去（按现在的价目表是 ' + yen(first.amountYen) + '，月额 ' + yen(first.fullYen) + '）'
+      : ' 的整月展示费（按现在的价目表是 ' + yen(first.amountYen) + '）') +
+      '，会在 ' + cnDate(first.issueOn) + ' 前后开出、发到这个邮箱（开始收费的那天之前 ' + iss + ' 天），付款期限是 ' + cnDate(first.dueDate) + (first.dueDate === inv.periodEnd ? '（免费期的最后一天）' : '') + '，过了期限还有 ' + g + ' 天宽限。之后每个月的账单在那个月开始前 ' + iss + ' 天开出，期限是那个月开始的前一天' + (iss <= 7 ? '（离开出不到 7 天的，期限是开出后的第 ' + (first.firstDueDays || 14) + ' 天）' : '') + '。金额以账单为准。' : '';
+    return { subject: '【在留导航】入驻申请已批准', text: '你的入驻申请（编号 ' + ref + '）已经批准。\n\n第一步：领取工作台的令牌\n打开服务商工作台 ' + workbenchUrl + ' ，点“第一次使用或令牌丢了：用联系邮箱领取”，填这个邮箱，再填收到的验证码。令牌只显示一次，请保存好；我们不会用邮件发送令牌，也不会向你要令牌。领取令牌后，你的事务所就会出现在名单上。\n\n展示费：批准后 30 天免费\n从批准日（' + cnDate(inv.periodStart) + '）的第二天起算 30 天，到 ' + cnDate(inv.periodEnd) + ' 为止不收展示费（批准当天也免费），这期间没有要付的账单。免费期按批准日算，和什么时候领取令牌无关；领取令牌之前不开账单，也不在名单上展示。免费期过后才领取令牌的，从领取那天起收费（那个月按天折算），领取之前的日子不收。\n免费期结束后按自然月收固定的展示费（不按咨询数或成交数收费）。' + firstText + PSIGN };
+  },
   claimCode: (code) => ({ subject: '【在留导航】领取服务商令牌的验证码', text: '你正在用服务商的联系邮箱领取在留导航服务商工作台的令牌。\n\n验证码：' + code + '\n\n10 分钟内有效，只能用一次，请在刚才的页面里输入。领取后原来的令牌立即失效。\n\n不是你本人操作的话，不用理会这封邮件；没有验证码对方领不到令牌。请不要把验证码告诉任何人。' + PSIGN }),
   tokenIssued: (ms) => ({ subject: '【在留导航】服务商令牌已重新发放', text: '刚才有人用发到这个邮箱的验证码领取了服务商工作台的新令牌，原来的令牌已经失效。\n\n领取时间：' + jst(ms) + '\n\n是你本人的话，不用做任何事。不是你本人的话：说明别人能收到这个邮箱的邮件，请先改邮箱密码，再用这个邮箱重新领取一次（对方拿到的令牌随之失效）。' + PSIGN }),
   invoiceIssued: (inv, payText, regNo) => ({ subject: '【在留导航】展示费账单（' + inv.refCode + '）', text: '下一期的展示费账单已经开出。展示费是固定的，不按咨询数或成交数收费。\n\n' + invoiceLines(inv, regNo) + '\n\n' + payText + PSIGN }),

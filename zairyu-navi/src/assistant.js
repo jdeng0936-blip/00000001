@@ -187,51 +187,236 @@ function cleanContent(content) {
   }).filter(Boolean);
 }
 
-// llm(body) -> Anthropic Messages API 的响应对象。测试时可以注入假的。
-function anthropicLLM(apiKey, fetchImpl) {
+// ---- 调用 Claude 的请求 ----
+// 现在的模型（默认 claude-sonnet-5-5）有几条硬规定，违反了接口直接返回 400：
+// - 思考是自适应的、默认打开，不能发 thinking: {type: "disabled"}；本助手不发 thinking 字段，深浅只用 output_config.effort 控制。
+// - 不能发 temperature、top_p、top_k；不能强制调用工具（tool_choice 的 any、tool），本助手不发 tool_choice（默认 auto）。
+// - 不能用助手预填：发出去的 messages 最后一条必须是 user。
+// checkRequest 在发出之前把这几条再查一遍，写错了直接抛错，不会发出去。
+const DEFAULT_MODEL = 'claude-sonnet-5-5';
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// 消费者聊天、要调工具和守规则：默认 medium（Sonnet 5.5 不写时是 high，又慢又贵）。可用环境变量 EFFORT 改，eval 可以对比 low 和 medium。
+const DEFAULT_EFFORT = 'medium';
+// 思考的 token 也算在 max_tokens 里：8000 给思考和回答都留了余地；被截断时用 MAX_TOKENS_CAP 重试一次，仍被截断就不给半截回答
+const DEFAULT_MAX_TOKENS = 8000, MAX_TOKENS_CAP = 16000;
+const SAMPLING = ['temperature', 'top_p', 'top_k'];
+
+// 模型、effort、max_tokens：opts 优先，其次环境变量 MODEL、EFFORT、MAX_TOKENS。写错时抛错。
+function llmConfig(env, opts) {
+  env = env || {}; opts = opts || {};
+  const model = opts.model || env.MODEL || DEFAULT_MODEL;
+  const effort = opts.effort || env.EFFORT || DEFAULT_EFFORT;
+  if (!EFFORTS.includes(effort)) throw new Error('EFFORT 须为 ' + EFFORTS.join('、') + ' 之一');
+  const mt = opts.maxTokens != null ? opts.maxTokens : env.MAX_TOKENS ? Number(env.MAX_TOKENS) : DEFAULT_MAX_TOKENS;
+  if (!Number.isInteger(mt) || mt < 1000 || mt > MAX_TOKENS_CAP) throw new Error('MAX_TOKENS 须为 1000 到 ' + MAX_TOKENS_CAP + ' 的整数');
+  return { model, effort, maxTokens: mt };
+}
+function buildRequest(cfg, system, messages, maxTokens) {
+  return { model: cfg.model, max_tokens: maxTokens || cfg.maxTokens, system, tools: TOOL_DEFS, messages, output_config: { effort: cfg.effort } };
+}
+function checkRequest(body) {
+  if (!body || typeof body !== 'object') throw new Error('请求无效');
+  for (const k of SAMPLING) if (k in body) throw new Error('请求里不能有 ' + k + '（现在的模型会返回 400）');
+  if (body.tool_choice && body.tool_choice.type !== 'auto' && body.tool_choice.type !== 'none') throw new Error('不能强制调用工具（tool_choice ' + body.tool_choice.type + '）');
+  if (body.thinking && body.thinking.type !== 'adaptive') throw new Error('thinking 只能不写或写 adaptive');
+  const ms = body.messages;
+  if (!Array.isArray(ms) || !ms.length || ms[0].role !== 'user') throw new Error('messages 的第一条必须是 user');
+  if (ms[ms.length - 1].role !== 'user') throw new Error('messages 的最后一条必须是 user（模型不接受助手预填）');
+  return body;
+}
+
+// llm(body, { signal }) -> Anthropic Messages API 的响应对象。测试时可以注入假的（fetchImpl 或整个 llm）。
+// - anthropic-version 用项目一直用的 2023-06-01（现在的接口仍接受它，没有要求更新的版本）。
+// - 429、500 以上（含 529 overloaded）和连不上、超时、响应体读到一半断了或不是 JSON：退避后重试，最多 maxRetries 次；
+//   有 retry-after 就按它等满；retry-after 比 maxWaitMs 还长时不再重试，直接抛出（带 wait，调用方可以照它告诉用户多久后再试）。
+//   x-should-retry: false 时不重试，true 时照样重试。400、401、403、404 等不重试。
+// - 每次请求 timeoutMs 毫秒超时（AbortController），读响应体也算在里面。
+// - signal（调用方的 AbortSignal）中止时：正在发的请求立即中断，等待重试的也不再等，抛出 type 为 aborted 的错误，不再重试。
+// 默认值是给 eval 用的（每次 5 分钟、重试 4 次）；聊天接口用 CHAT_LLM_OPTS（短得多），见 src/server.js。
+// 出错时抛出的 Error 带 status（HTTP 状态码，连不上、超时、中止为 0）和 type（接口返回的错误类型），消息里不带接口返回的原文。
+function abortError(type) { return Object.assign(new Error(type === 'deadline' ? '这一轮用的时间太长，停下了' : '请求已中止'), { status: 0, type: type || 'aborted', retryable: false, wait: null }); }
+// 等 p，但 signal 中止时马上抛出（注入的 llm 不理 signal 时也不会一直等下去）
+function untilAborted(p, signal) {
+  if (!signal) return p;
+  if (signal.aborted) { Promise.resolve(p).catch(() => {}); return Promise.reject(abortError(signal.reason && signal.reason.type)); }
+  return new Promise((ok, no) => {
+    const onAbort = () => no(abortError(signal.reason && signal.reason.type));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(p).then((v) => { signal.removeEventListener('abort', onAbort); ok(v); }, (e) => { signal.removeEventListener('abort', onAbort); no(e); });
+  });
+}
+function anthropicLLM(apiKey, fetchImpl, opts) {
   const f = fetchImpl || fetch;
-  return async (body) => {
-    const r = await f('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify(body) });
-    if (!r.ok) throw new Error('模型接口返回 ' + r.status);
-    return r.json();
+  opts = opts || {};
+  const maxRetries = opts.maxRetries != null ? opts.maxRetries : 4, timeoutMs = opts.timeoutMs || 300000, maxWaitMs = opts.maxWaitMs || 60000;
+  const baseMs = opts.baseDelayMs != null ? opts.baseDelayMs : 1000;
+  // 等待也要能被中止
+  const sleep = opts.sleep || ((ms, signal) => new Promise((ok) => {
+    const t = setTimeout(done, ms);
+    function done() { clearTimeout(t); if (signal) signal.removeEventListener('abort', done); ok(); }
+    if (signal) signal.addEventListener('abort', done, { once: true });
+  }));
+  const url = (opts.baseUrl || 'https://api.anthropic.com').replace(/\/+$/, '') + '/v1/messages';
+  const fail = (status, type, retryable, wait) => Object.assign(new Error('模型接口返回 ' + (status || '错误（' + type + '）')), { status, type, retryable, wait });
+  // retry-after 是秒数或 HTTP 日期
+  const retryAfter = (h) => {
+    if (!h) return null;
+    const n = Number(h);
+    if (Number.isFinite(n) && n >= 0) return n * 1000;
+    const t = Date.parse(h);
+    return Number.isFinite(t) ? Math.max(0, t - Date.now()) : null;
+  };
+  async function once(body, signal) {
+    const ac = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
+    const onAbort = () => ac.abort();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    // 连不上、超时、读响应体失败：中止的是调用方时不重试
+    const lost = () => (signal && signal.aborted && !timedOut ? abortError(signal.reason && signal.reason.type) : fail(0, timedOut ? 'timeout' : 'connection', true, null));
+    try {
+      let r;
+      try {
+        r = await f(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify(body), signal: ac.signal });
+      } catch (e) { throw lost(); }
+      // 响应体也在超时里读完；读到一半断了或不是 JSON 算连接出错，可以重试
+      if (r.ok) { try { return await r.json(); } catch (e) { throw lost(); } }
+      let type = 'http_' + r.status;
+      try { const j = await r.json(); if (j && j.error && typeof j.error.type === 'string') type = j.error.type; } catch (e) { /* 不是 JSON */ }
+      const get = (k) => (r.headers && typeof r.headers.get === 'function' ? r.headers.get(k) : null);
+      const should = get('x-should-retry');
+      const retryable = should === 'true' ? true : should === 'false' ? false : r.status === 408 || r.status === 409 || r.status === 429 || r.status >= 500;
+      throw fail(r.status, type, retryable, retryAfter(get('retry-after')));
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  }
+  return async (body, callOpts) => {
+    checkRequest(body);
+    const signal = callOpts && callOpts.signal;
+    for (let attempt = 0; ; attempt++) {
+      if (signal && signal.aborted) throw abortError(signal.reason && signal.reason.type);
+      try { return await once(body, signal); } catch (e) {
+        if (!e.retryable || attempt >= maxRetries) throw e;
+        // 服务器要求等的比 maxWaitMs 还久：提前重试只会再被拒，不如直接告诉调用方
+        if (e.wait != null && e.wait > maxWaitMs) throw e;
+        const backoff = Math.min(maxWaitMs, baseMs * 2 ** attempt) * (0.75 + Math.random() * 0.5);
+        await sleep(e.wait != null ? e.wait : backoff, signal);
+      }
+    }
   };
 }
 
-// 返回 { text, category, toolCalls, draft, messages }
+// 聊天接口（有人在页面上等着）用的设置：每次请求最多 60 秒、最多重试 2 次、每次最多等 15 秒；整轮（含工具循环）最多 CHAT_DEADLINE_MS。
+// eval 不用这些，用 anthropicLLM 的默认值（每次 5 分钟、重试 4 次）。
+const CHAT_LLM_OPTS = { maxRetries: 2, timeoutMs: 60000, maxWaitMs: 15000 };
+const CHAT_DEADLINE_MS = 120000;
+
+// 给用户看的固定说法
+const RETRY_TEXT = '这次没有成功，请再试一次。';
+const REFUSAL_TEXT = '这个问题我没办法回答。在留手续、生活办事方面的问题可以换个说法再问；涉及你个人具体情况的，请咨询行政书士等专业人士。';
+const TRUNCATED_TEXT = '这次的回答太长，没能完整生成。请把问题拆小一点再问一次。';
+const newUsage = () => ({ requests: 0, input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 });
+const addUsage = (sum, u) => {
+  sum.requests++;
+  if (!u || typeof u !== 'object') return;
+  for (const k of ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']) if (Number.isFinite(u[k])) sum[k] += u[k];
+};
+
+// 返回 { text, category, toolCalls, draft, messages, stopReason, refusal, usage, model, effort }
 // draft：这一轮里助手准备好的咨询草稿（没有则为 null）。草稿没有发送，要由用户在页面上确认后调 POST /inquiries。
 // messages：已按轮裁剪过的完整历史，网页端原样保存、下一轮带回。
+// stopReason：最后一次模型回复的 stop_reason（end_turn、refusal、max_tokens、pause_turn……；工具轮数用完是 max_turns）。
+// refusal：模型拒答时的 { category, explanation }（接口的 stop_details），否则 null。usage：这一轮所有请求的 token 合计。
+//
+// 思考块（thinking、redacted_thinking）的处理：
+// - 取回答文字时只看 text 块，思考块（默认文字是空的）一律忽略。
+// - 同一轮的工具循环里，助手的回复原样（包括思考块和签名）发回给模型；系统提示在这一轮开始时生成一次，整轮不变
+//   （接口会核对思考块产生之后 system、tools 和之前的消息有没有被改过，改过的新账号直接 400）。工具改了概况，模型从工具结果里看到。
+// - 返回给网页端保存的历史里不留思考块（cleanContent 只留 text 和 tool_use）：跨轮重放思考块不是必须的，接口会丢掉读不了的块；
+//   历史由网页端保存、会被裁剪，留着反而可能因为前面的消息变了而被拒。
+// 拒答（stop_reason refusal，HTTP 200）：给用户固定的说法，这一轮（用户这句话和这一轮里的工具调用）不进历史，免得下一轮带着同样的内容又被拒；
+// 工具已经写进库的改动照常保留。
+// 被截断（max_tokens）：用 MAX_TOKENS_CAP 重试一次；仍被截断就不给半截回答，回复 TRUNCATED_TEXT，被截断的工具调用不执行。
+// pause_turn（本助手没有服务器端工具，不应出现）和其他没见过的 stop_reason：回复 RETRY_TEXT。
+// opts.signal（AbortSignal）：中止后不再发新的请求、不再执行工具（不会替没人等的请求改数据），正在发的请求也带着它中断；抛出 status 0 的错误。
+// opts.usage：调用方给的用量对象（字段同返回的 usage），每次请求的用量都加进去；出错、超时中止时调用方也知道已经花了多少。
+// 出错时抛出的错误也带 usage（到出错为止的合计）。
 async function chat(ctx, history, userText, opts) {
+  opts = opts || {};
+  const cfg = llmConfig(process.env, opts);
   const engOf = () => createEngine({ profile: ctx.user.profile, done: ctx.user.done, plan: ctx.user.plan, auth: ctx.user.auth, events: ctx.store ? ctx.store.listEvents(ctx.user.id) : [], now: ctx.now });
-  const messages = trimHistory(history || []).concat([{ role: 'user', content: userText }]);
-  const toolCalls = []; let draft = null;
-  const done = (text, category) => ({ text, category, toolCalls, draft, messages: trimHistory(messages) });
-  for (let i = 0; i < (opts.maxTurns || 6); i++) {
-    // 每一轮都按最新的概况生成提示词（工具可能刚改过概况）
-    const res = await opts.llm({ model: opts.model || process.env.MODEL || 'claude-sonnet-5-5', max_tokens: 1200, system: systemPrompt(engOf(), ctx.now), tools: TOOL_DEFS, messages });
-    const content = cleanContent(res && res.content);
-    const uses = content.filter((b) => b.type === 'tool_use');
-    if (!uses.length || res.stop_reason !== 'tool_use') {
-      // 模型只调用了不认识的工具（已被 cleanContent 丢掉）又没说话：给一句收尾的话，这一轮照常结束
-      const dropped = Array.isArray(res && res.content) && res.content.some((b) => b && b.type === 'tool_use') && !uses.length;
-      const text = content.filter((b) => b.type === 'text').map((b) => b.text).join('') || (dropped ? '这次没有成功，请再试一次。' : '');
-      // 历史里不留没有结果的 tool_use（例如模型被截断时），否则下一轮会被模型接口拒绝
-      messages.push({ role: 'assistant', content: content.filter((b) => b.type === 'text').length ? content.filter((b) => b.type === 'text') : [{ type: 'text', text: text || '（没有回答）' }] });
-      const m = /^\s*【([A-G])】\s*/.exec(text);
-      return done(m ? text.slice(m[0].length) : text, m ? m[1] : null);
+  const prior = trimHistory(history || []);
+  const messages = prior.concat([{ role: 'user', content: userText }]); // 返回给网页端的历史
+  const api = messages.slice(); // 发给模型的；这一轮里助手的回复原样放进来
+  const system = systemPrompt(engOf(), ctx.now);
+  const toolCalls = [], usage = opts.usage || newUsage(), signal = opts.signal;
+  const stopIfAborted = () => { if (signal && signal.aborted) throw abortError(signal.reason && signal.reason.type); };
+  try { return await loop(); } catch (e) { if (e && typeof e === 'object' && !e.usage) e.usage = usage; throw e; }
+  async function loop() {
+    let draft = null;
+    const done = (text, category, stopReason, extra) => Object.assign({ text, category, toolCalls, draft, messages: trimHistory(messages), stopReason, refusal: null, usage, model: cfg.model, effort: cfg.effort }, extra || {});
+    const finish = (text, stopReason) => {
+      messages.push({ role: 'assistant', content: [{ type: 'text', text: text || '（没有回答）' }] });
+      return done(text, null, stopReason);
+    };
+    for (let i = 0; i < (opts.maxTurns || 6); i++) {
+      let res, maxTokens = cfg.maxTokens;
+      for (;;) {
+        stopIfAborted();
+        // 用量在响应回来时就记：中止之后才回来的响应也记上（钱已经花了）
+        const call = Promise.resolve(opts.llm(checkRequest(buildRequest(cfg, system, api, maxTokens)), { signal }));
+        call.then((r) => addUsage(usage, r && r.usage), () => {});
+        res = await untilAborted(call, signal);
+        if (res && res.stop_reason === 'max_tokens' && maxTokens < MAX_TOKENS_CAP) { maxTokens = MAX_TOKENS_CAP; continue; }
+        break;
+      }
+      const stop = res && res.stop_reason;
+      if (stop === 'refusal') {
+        const d = res.stop_details && typeof res.stop_details === 'object' ? res.stop_details : {};
+        return done(REFUSAL_TEXT, null, 'refusal', { messages: trimHistory(prior), refusal: { category: d.category == null ? null : String(d.category), explanation: d.explanation == null ? null : String(d.explanation).slice(0, 500) } });
+      }
+      if (stop === 'max_tokens') return finish(TRUNCATED_TEXT, 'max_tokens');
+      const raw = Array.isArray(res && res.content) ? res.content : [];
+      const content = cleanContent(raw);
+      const uses = content.filter((b) => b.type === 'tool_use');
+      if (stop !== 'tool_use' || !uses.length) {
+        if (stop !== 'end_turn' && stop !== 'stop_sequence' && stop !== 'tool_use') return finish(RETRY_TEXT, stop || 'unknown');
+        // 模型只调用了不认识的工具（已被 cleanContent 丢掉）又没说话：给一句收尾的话，这一轮照常结束
+        const dropped = raw.some((b) => b && b.type === 'tool_use') && !uses.length;
+        const texts = content.filter((b) => b.type === 'text');
+        const text = texts.map((b) => b.text).join('') || (dropped ? RETRY_TEXT : '');
+        // 历史里不留没有结果的 tool_use，否则下一轮会被模型接口拒绝
+        messages.push({ role: 'assistant', content: texts.length ? texts : [{ type: 'text', text: text || '（没有回答）' }] });
+        const m = /^\s*【([A-G])】\s*/.exec(text);
+        return done(m ? text.slice(m[0].length) : text, m ? m[1] : null, stop);
+      }
+      const valid = new Set(uses.map((b) => b.id)), results = new Map();
+      stopIfAborted();
+      for (const b of uses) {
+        try {
+          const out = execTool(b.name, b.input, ctx); toolCalls.push({ name: b.name, input: b.input, ok: true });
+          if (b.name === 'create_inquiry') draft = out.draft;
+          results.set(b.id, { type: 'tool_result', tool_use_id: b.id, content: JSON.stringify(out) });
+        } catch (e) { toolCalls.push({ name: b.name, input: b.input, ok: false, error: e.message }); results.set(b.id, { type: 'tool_result', tool_use_id: b.id, content: String(e.message), is_error: true }); }
+      }
+      // 发给模型的：回复原样，每个 tool_use 都要有结果（不认识的工具给错误结果）
+      api.push({ role: 'assistant', content: raw });
+      const seen = new Set(), apiResults = [];
+      for (const b of raw) {
+        if (!b || b.type !== 'tool_use' || typeof b.id !== 'string' || !b.id || seen.has(b.id)) continue;
+        seen.add(b.id);
+        apiResults.push(valid.has(b.id) ? results.get(b.id) : { type: 'tool_result', tool_use_id: b.id, content: '没有这个工具', is_error: true });
+      }
+      api.push({ role: 'user', content: apiResults });
+      // 给网页端的：只有 text 和认识的 tool_use，结果一一对应
+      messages.push({ role: 'assistant', content });
+      messages.push({ role: 'user', content: uses.map((b) => results.get(b.id)) });
     }
-    messages.push({ role: 'assistant', content });
-    messages.push({ role: 'user', content: uses.map((b) => {
-      try {
-        const out = execTool(b.name, b.input, ctx); toolCalls.push({ name: b.name, input: b.input, ok: true });
-        if (b.name === 'create_inquiry') draft = out.draft;
-        return { type: 'tool_result', tool_use_id: b.id, content: JSON.stringify(out) };
-      } catch (e) { toolCalls.push({ name: b.name, input: b.input, ok: false, error: e.message }); return { type: 'tool_result', tool_use_id: b.id, content: String(e.message), is_error: true }; }
-    }) });
+    // 工具轮数用完：补一条助手的话收尾，让历史停在完整的一轮上
+    return finish(RETRY_TEXT, 'max_turns');
   }
-  // 工具轮数用完：补一条助手的话收尾，让历史停在完整的一轮上
-  const text = '这次没有成功，请再试一次。';
-  messages.push({ role: 'assistant', content: [{ type: 'text', text }] });
-  return done(text, null);
 }
 
-module.exports = { TOOL_DEFS, systemPrompt, execTool, chat, anthropicLLM, validateHistory, historyTexts, trimHistory };
+module.exports = { TOOL_DEFS, systemPrompt, execTool, chat, anthropicLLM, abortError, newUsage, CHAT_LLM_OPTS, CHAT_DEADLINE_MS, llmConfig, buildRequest, checkRequest, validateHistory, historyTexts, trimHistory, DEFAULT_MODEL, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, EFFORTS, REFUSAL_TEXT, TRUNCATED_TEXT, RETRY_TEXT };

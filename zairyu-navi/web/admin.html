@@ -72,7 +72,7 @@ function appCard(a){
   g.appendChild(field("核对方式",sel));g.appendChild(field("核对日期",d));g.appendChild(field("核对备注（选填）",n));c.appendChild(g);
   var ns=note(),row=el("p");
   row.appendChild(btn("批准","approve",function(){ns.textContent="";var lc=sel.value||a.regulated||a.checkWhere?{method:sel.value,checkedOn:d.value,note:n.value}:undefined;
-    api("POST","/admin/applications/"+a.id+"/approve",lc?{licenseCheck:lc,reviewKey:a.reviewKey}:{reviewKey:a.reviewKey}).then(function(r){ns.className="muted";ns.textContent="已批准。批准当月免费展示（服务商领取令牌后上名单），下个月的账单按时自动开出。";return loadApps()},function(e){ns.className="err";ns.textContent=e.message})}));
+    api("POST","/admin/applications/"+a.id+"/approve",lc?{licenseCheck:lc,reviewKey:a.reviewKey}:{reviewKey:a.reviewKey}).then(function(r){ns.className="muted";ns.textContent="已批准。免费期到 "+r.freeUntil+"（批准日 + 30 天；服务商领取令牌后上名单），之后的第一期从第二天起收费（第二天不是 1 日时按天折算），账单按时自动开出。";return loadApps()},function(e){ns.className="err";ns.textContent=e.message})}));
   c.appendChild(row);
   var msg=el("textarea","review-msg");msg.rows=2;msg.maxLength=500;c.appendChild(field("拒绝的理由或要修改的地方（会写进发给申请人的邮件，5 至 500 字）",msg));
   var row2=el("p");
@@ -91,7 +91,7 @@ function loadProviders(){return api("GET","/admin/providers").then(function(l){v
     box.appendChild(c)})},function(e){$("providers").textContent=e.message})}
 function loadInvoices(){var st=$("inv-status").value;return api("GET","/admin/invoices"+(st?"?status="+encodeURIComponent(st):"")).then(function(l){var box=$("invoices");box.textContent="";if(!l.length)box.appendChild(el("p","muted","没有这个状态的账单。"));
   l.forEach(function(i){var c=el("div","card");c.dataset.ref=i.refCode;c.appendChild(el("b",null,i.refCode));c.appendChild(document.createTextNode("　"+i.providerName+"　"));c.appendChild(el("span","tag",INV[i.status]||i.status));
-    c.appendChild(el("p",null,"期间 "+i.periodStart+" 至 "+i.periodEnd+"　金额 "+i.amountYen+" 日元（含税）　期限 "+i.dueDate+(i.paidOn?"　入账日 "+i.paidOn+"（"+i.paidBy+"）":"")+(i.voidReason?"　作废理由："+i.voidReason:"")));
+    c.appendChild(el("p",null,"期间 "+i.periodStart+" 至 "+i.periodEnd+(i.method==="first_month_free"?"（免费期）":i.periodStart.slice(8)!=="01"?"（按天折算）":"")+"　金额 "+i.amountYen+" 日元（含税）　期限 "+i.dueDate+(i.paidOn?"　入账日 "+i.paidOn+"（"+i.paidBy+"）":"")+(i.voidReason?"　作废理由："+i.voidReason:"")));
     if(i.status==="issued"){var g=el("div","grid"),d=el("input","paid-date");d.type="date";d.value=today();var n=el("input","paid-note");n.maxLength=200;var r=el("input","void-reason");r.maxLength=200;
       g.appendChild(field("入账日",d));g.appendChild(field("入账备注（选填）",n));g.appendChild(field("作废理由（作废时填）",r));c.appendChild(g);
       var ns=note(),row=el("p");row.appendChild(btn("标记已付款","mark-paid",function(){ns.textContent="";api("POST","/admin/invoices/"+i.id+"/paid",{paidOn:d.value,note:n.value}).then(loadInvoices,function(e){ns.textContent=e.message})}));row.appendChild(document.createTextNode(" "));

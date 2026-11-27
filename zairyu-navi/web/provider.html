@@ -79,17 +79,21 @@ function load(){
 // 展示状态、账单、新咨询通知的开关
 function showMe(p){
   var m=$("me");m.hidden=false;m.textContent="";m.appendChild(el("p",null,p.name+(p.licenseNo?"（登录番号 "+p.licenseNo+"）":"")));
-  var st=el("p",null,p.listed?"名单上展示中"+(p.listedUntil?"，展示到 "+p.listedUntil+"（按时付下一期的展示费会延续）":""):"现在不在名单上展示：批准当月免费展示，之后要按时付展示费；过了付款期限和宽限期、或付款确认前不展示。工作台照常能用。");st.id="listing";m.appendChild(st);
+  var st=el("p",null,p.listed?"名单上展示中"+(p.listedUntil?"，展示到 "+p.listedUntil+"（按时付下一期的展示费会延续）":""):"现在不在名单上展示：批准后 30 天免费展示，之后要按时付展示费；过了付款期限和宽限期、或付款确认前不展示。工作台照常能用。");st.id="listing";m.appendChild(st);
+  ME=p;
+  if(p.free){var fu=el("p","muted","免费期到 "+p.free.until+(p.free.days30?"（批准日 + 30 天，日本时间）":"（日本时间）")+"。"+firstText(p.free,p.issueDays));fu.id="free-until";m.appendChild(fu)}
   if(p.contact){var lb=el("label"),cb=el("input"),ns=el("span");cb.type="checkbox";cb.id="notify";cb.checked=!!p.notify;cb.style.width="auto";ns.setAttribute("role","status");
     cb.onchange=function(){cb.disabled=true;ns.textContent="";api("PUT","/provider/me/notify",{on:cb.checked}).then(function(r){cb.disabled=false;cb.checked=r.notify},function(e){cb.disabled=false;cb.checked=!cb.checked;ns.textContent=" 没有改成："+why(e)})};
     lb.appendChild(cb);lb.appendChild(document.createTextNode(" 有新咨询时发邮件通知到 "+p.contact+"（邮件里只有数量，不写咨询内容）"));lb.appendChild(ns);m.appendChild(lb)}
   m.appendChild(el("p","muted","回复时请不要作“保证获批”一类的承诺；报酬和范围请写清楚。请不要在回复里写银行账号、护照号这类号码，系统会拦下。"));
 }
-var INV={issued:"待付款",paid:"已付款",void:"已作废"};
+var INV={issued:"待付款",paid:"已付款",void:"已作废"},ME=null;
+// 免费期之后的第一期：从 1 日起是整月，否则按天折算到那个月底
+function firstText(f,days){return "之后的第一张账单从 "+f.firstBillStart+" 起收费"+(f.firstProrated?"，收到那个月底，按天折算":"，是整月")+"，在那天之前 "+days+" 天开出。"}
 function loadInvoices(){return api("GET","/provider/invoices").then(function(l){var b=$("billing");b.hidden=false;b.textContent="";b.appendChild(el("h2",null,"展示费账单"));
-  if(!l.length)b.appendChild(el("p","muted","还没有账单。批准当月免费，下个月的账单会在下个月开始之前开出。"));
+  if(!l.length)b.appendChild(el("p","muted","还没有账单。"+(ME&&ME.free?firstText(ME.free,ME.issueDays):ME?"账单在每一期开始收费之前 "+ME.issueDays+" 天开出。":"")));
   l.forEach(function(i){var c=el("div","card");c.appendChild(el("b",null,i.refCode+"　"+(INV[i.status]||i.status)));
-    c.appendChild(el("p",null,"期间 "+i.periodStart+" 至 "+i.periodEnd+"　金额 "+i.amountYen+" 日元（含税）"+(i.taxYen!=null?"，其中消费税 "+i.taxYen+" 日元（登记号 "+i.regNo+"）":"")+"　付款期限 "+i.dueDate+(i.paidOn?"　入账日 "+i.paidOn:"")));
+    c.appendChild(el("p",null,"期间 "+i.periodStart+" 至 "+i.periodEnd+(i.prorated?"（不是整月，按天折算）":"")+"　金额 "+i.amountYen+" 日元（含税）"+(i.taxYen!=null?"，其中消费税 "+i.taxYen+" 日元（登记号 "+i.regNo+"）":"")+"　付款期限 "+i.dueDate+(i.paidOn?"　入账日 "+i.paidOn:"")));
     if(i.payText){var t=el("p","muted",i.payText);t.style.whiteSpace="pre-wrap";c.appendChild(t)}
     b.appendChild(c)})},function(e){var b=$("billing");b.hidden=false;b.textContent="账单没有读出来："+why(e)})}
 function enter(){

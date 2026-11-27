@@ -397,7 +397,7 @@ function createApp(opts) {
         if (a.status !== 'pending') throw new HttpError(409, '这份申请不在审核中（' + a.status + '）');
         sameVersion(a, b);
         const inv = billing.firstInvoice(a.category);
-        const r = store.approveApplication(a.id, who, check, inv, (x) => { const mm = TEXTS.applyApproved(a.ref, appUrlOf() + '/provider.html', x, billing.config.issueDays); return { subject: mm.subject, body: mm.text }; }, b.reviewKey);
+        const r = store.approveApplication(a.id, who, check, inv, (x) => { const mm = TEXTS.applyApproved(a.ref, appUrlOf() + '/provider.html', x, billing.config.issueDays, billing.firstPaid(a.category, x.periodEnd), billing.config.graceDays); return { subject: mm.subject, body: mm.text }; }, b.reviewKey);
         if (!r) { const now2 = store.getApplication(a.id); throw new HttpError(409, now2.status !== 'pending' ? '这份申请不在审核中' : now2.reviewKey !== b.reviewKey ? CHANGED : '申请的联系邮箱已经是别家服务商的联系邮箱'); }
         kick();
         return r; // 没有令牌：令牌由服务商自己用联系邮箱领取
@@ -453,7 +453,7 @@ function createApp(opts) {
       if (!seg[3] && m === 'GET') {
         return store.listAllProviders().map((p) => {
           const meta = store.providerMeta(p.id) || {}, c = store.providerContact(p.id), inv = store.listInvoices({ providerId: p.id })[0] || null;
-          return Object.assign(p, store.providerListing(p.id, billing.todayOf()), { source: meta.source || 'legacy', address: meta.address || '', licenseBody: meta.licenseBody || '', claimed: !!meta.claimedAt, contact: c ? maskEmail(c.email) : null, notify: !!c && c.notify, latestInvoice: inv && { id: inv.id, refCode: inv.refCode, period: inv.period, status: inv.status, dueDate: inv.dueDate, amountYen: inv.amountYen } });
+          return Object.assign(p, store.providerListing(p.id, billing.todayOf()), { freeUntil: billing.freeEndOf(p.id), source: meta.source || 'legacy', address: meta.address || '', licenseBody: meta.licenseBody || '', claimed: !!meta.claimedAt, contact: c ? maskEmail(c.email) : null, notify: !!c && c.notify, latestInvoice: inv && { id: inv.id, refCode: inv.refCode, period: inv.period, status: inv.status, dueDate: inv.dueDate, amountYen: inv.amountYen } });
         });
       }
       // 管理员直接入驻：会把令牌返回给管理员，所以只在 createApp({ allowDirectProvider: true }) 时开（测试和端到端用），正式环境 404
@@ -479,7 +479,8 @@ function createApp(opts) {
       const p = provider(req);
       if (seg[2] === 'me' && !seg[3] && m === 'GET') {
         const meta = store.providerMeta(p.id) || {}, c = store.providerContact(p.id);
-        return Object.assign(p, store.providerListing(p.id, billing.todayOf()), { address: meta.address || '', licenseBody: meta.licenseBody || '', termsVersion: meta.termsVersion || null, notify: !!c && c.notify, contact: c ? maskEmail(c.email) : null });
+        // free：免费期和之后第一期从哪天起收费（工作台按它写说明）；issueDays：账单在开始收费之前几天开出
+        return Object.assign(p, store.providerListing(p.id, billing.todayOf()), { freeUntil: billing.freeEndOf(p.id), free: billing.freeInfo(p.id), issueDays: billing.config.issueDays, address: meta.address || '', licenseBody: meta.licenseBody || '', termsVersion: meta.termsVersion || null, notify: !!c && c.notify, contact: c ? maskEmail(c.email) : null });
       }
       if (seg[2] === 'me' && seg[3] === 'notify' && !seg[4] && m === 'PUT') {
         if (!body || typeof body.on !== 'boolean') throw new HttpError(422, 'on 须为 true 或 false');
@@ -488,8 +489,8 @@ function createApp(opts) {
       }
       // 自己的账单，带付款说明（振込先和参考编号）；管理员的入账备注不给
       if (seg[2] === 'invoices' && !seg[3] && m === 'GET') {
-        // 首月免费的覆盖记录不是账单，不列出
-        return store.listInvoices({ providerId: p.id }).filter((i) => i.method !== FREE).map((i) => ({ id: i.id, refCode: i.refCode, period: i.period, periodStart: i.periodStart, periodEnd: i.periodEnd, amountYen: i.amountYen, taxYen: billing.config.regNo ? i.taxYen : null, regNo: billing.config.regNo || null, status: i.status, dueDate: i.dueDate, paidOn: i.paidOn, payText: i.status === 'issued' ? billing.payText(i) : '' }));
+        // 免费期的覆盖记录不是账单，不列出。prorated：免费期之后（或免费期过后才领取时领取之后）的第一期不是整月，金额按天折算
+        return store.listInvoices({ providerId: p.id }).filter((i) => i.method !== FREE).map((i) => ({ id: i.id, refCode: i.refCode, period: i.period, periodStart: i.periodStart, periodEnd: i.periodEnd, prorated: i.periodStart !== i.period + '-01', amountYen: i.amountYen, taxYen: billing.config.regNo ? i.taxYen : null, regNo: billing.config.regNo || null, status: i.status, dueDate: i.dueDate, paidOn: i.paidOn, payText: i.status === 'issued' ? billing.payText(i) : '' }));
       }
       if (seg[2] === 'inquiries' && !seg[3] && m === 'GET') return store.listInquiriesFor(p.id);
       if (seg[2] === 'inquiries' && seg[3]) {
@@ -680,7 +681,8 @@ function createApp(opts) {
       if (sub === 'advice' && m === 'GET') return engineFor(u).advice().map((a) => ({ title: a[0], text: a[1] }));
       if (sub === 'pr-check' && m === 'GET') return engineFor(u).prCheck();
       if (sub === 'chat' && m === 'POST') {
-        const llm = opts.llm || (process.env.ANTHROPIC_API_KEY ? assistant.anthropicLLM(process.env.ANTHROPIC_API_KEY) : null);
+        // 有人在等：每次请求的时限和重试次数都比 eval 短得多（assistant.CHAT_LLM_OPTS），整轮另有总时限
+        const llm = opts.llm || (process.env.ANTHROPIC_API_KEY ? assistant.anthropicLLM(process.env.ANTHROPIC_API_KEY, null, assistant.CHAT_LLM_OPTS) : null);
         if (!llm) throw new HttpError(503, '助手还没有配置（缺少 ANTHROPIC_API_KEY）');
         const b = body || {};
         if (typeof b.message !== 'string' || !b.message.trim() || b.message.length > 2000) throw new HttpError(422, 'message 须为1至2000字');
@@ -696,7 +698,19 @@ function createApp(opts) {
         }
         const wait = chatShort(u.id) || chatDaily(u.id);
         if (wait) throw tooMany(wait, '提问太频繁');
-        const r = await assistant.chat({ user: u, store, now: nowOf() }, history, b.message, { llm });
+        let r;
+        // 整轮的总时限：到了就中断正在发的请求，不再发新的、不再执行工具（不替已经没人等的请求改数据）
+        const ac = new AbortController(), deadline = setTimeout(() => ac.abort(assistant.abortError('deadline')), opts.chatDeadlineMs || assistant.CHAT_DEADLINE_MS);
+        // 模型接口忙（429、529 overloaded、5xx）或连不上、超时、超过总时限，anthropicLLM 已经退避重试过：告诉用户稍后再试（503），不当成服务器内部错误。
+        // retry-after：接口要求等的秒数（比重试时肯等的还长时 anthropicLLM 直接抛出），没有就是 30 秒
+        try { r = await assistant.chat({ user: u, store, now: nowOf() }, history, b.message, { llm, signal: ac.signal }); } catch (e) {
+          if (e && typeof e.status === 'number' && (e.status === 0 || e.status === 429 || e.status >= 500)) {
+            console.error('助手：模型接口 ' + (e.status || e.type));
+            const after = e.wait > 0 ? Math.min(3600, Math.ceil(e.wait / 1000)) : 30;
+            throw new HttpError(503, '助手现在忙不过来，请过一会儿再试', { 'retry-after': String(after) });
+          }
+          throw e;
+        } finally { clearTimeout(deadline); }
         // draft：助手准备的咨询草稿（没有则为 null）。草稿没有发送，网页端显示给用户核对，用户同意后调 POST /inquiries。
         return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => ({ name: t.name, ok: t.ok })), draft: r.draft, history: r.messages };
       }
@@ -775,6 +789,8 @@ if (require.main === module) {
   // 发信、提醒、展示费、新咨询通知的设置不全就不启动，并说清楚缺什么
   try { sender = createSender(process.env); rem = reminderConfig(process.env, sender); } catch (e) { console.error('邮件发送没有配置好：' + e.message); process.exit(1); }
   try { bc = billingConfig(process.env, sender); nc = notifyConfig(process.env); adminTokens(process.env.ADMIN_TOKENS); } catch (e) { console.error('服务商相关的设置不对，没有启动：' + e.message); process.exit(1); }
+  // 助手的模型、EFFORT、MAX_TOKENS 写错就不启动
+  try { assistant.llmConfig(process.env); } catch (e) { console.error('助手的设置不对，没有启动：' + e.message); process.exit(1); }
   app = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db'), sender, appUrl: rem.appUrl, billing: bc, notify: nc });
   app.server.listen(port, () => console.log('在留导航 后端已启动： http://localhost:' + port + ' （邮件：' + sender.name + '；提醒邮件：' + (rem.enabled ? '每 ' + rem.intervalMin + ' 分钟检查一次，日本时间 ' + rem.hour + ' 点以后发' : '定时任务没开') + '）'));
   // 每分钟：重试没发出去的邮件，清理过期的验证码和限流记录
