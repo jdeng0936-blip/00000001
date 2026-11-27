@@ -350,7 +350,60 @@ test('提示词：第2轮修改（C 类范围、身份前提、默认条件、�
   assert.match(e.SYS, /说明这是例子，不当作通则/);
   // F 类引用的那一行要真在助手的知识里：不带数字，所以待核实也照常显示；刑罚数字待核实，按上线规则隐去
   const kb = e.kb();
-  assert.match(kb, /转让账户=[^；]*是犯罪收益移转防止法禁止的犯罪[^；]*（待核实）/);
+  assert.match(kb, /\n  - 【待核实】转让账户=[^\n]*是犯罪收益移转防止法禁止的犯罪/);
   assert.doesNotMatch(kb, /100万日元以下罚金|500万日元以下罚金/);
   assert.ok(e.NODES.find((n) => n.id === '4-9').src.some((x) => /^https:\/\/www\.(npa|fsa)\.go\.jp\//.test(x[1])), '转让账户要有警察厅或金融厅的出处');
+});
+
+test('提示词：第3轮修改（境内变更属 E、C 类写任务编号、待核实按行、准备日期取自 get_plan、条件照原话、提醒功能）都在', () => {
+  const e = createEngine({ now: '2026-11-27' });
+  // E5：问自己的在留资格能不能在境内变更的，资料库有一般流程也是 E，要列行政书士并说 disclosure
+  assert.match(e.SYS, /E 个别在留判断（[^）]*我现在的在留资格能不能在日本境内直接变更或转换[^）]*）/);
+  assert.match(e.SYS, /也不用讲另一条流程的方式暗示结论/);
+  assert.match(e.SYS, /按第8条用 suggest_providers（category 为 gyosei）列出行政书士、照原文说 disclosure。资料库有一般流程也仍是 E。/);
+  assert.match(e.SYS, /问的是用户本人的在留资格能不能变更、能不能批的，属于 E）/);
+  // C1：C 类要说明条件在哪个任务
+  assert.match(e.SYS, /并说明这些条件在哪个任务（写编号和名称/);
+  // D5、N17：待核实按行
+  assert.match(e.SYS, /只有以“【待核实】”开头的那一行待核实/);
+  assert.match(e.SYS, /也不要给没标的项加上待核实/);
+  // B3、N16：日期只取工具给的
+  assert.match(e.SYS, /不自己计算期限或准备日期。日期只用 get_plan 的 tasks、reminders 和其他工具结果里给出的/);
+  // N4：条件照原话
+  assert.match(e.SYS, /条件类的说法（如“可作为……要件之一”）照原话引用/);
+  // 第17条：提醒功能和邮件提醒的天数要和 scheduler 一致
+  const sp = systemPrompt(e, '2026-11-27');
+  assert.match(sp, /17\. 用户要你提醒某个日期时/);
+  assert.match(sp, /不要说“没有提醒功能”“不能提醒你”/);
+  const fs = require('node:fs'), path = require('node:path');
+  const stages = /const STAGES = \[([0-9, ]+)\]/.exec(fs.readFileSync(path.join(__dirname, '..', 'src', 'scheduler.js'), 'utf8'))[1].split(',').map(Number);
+  assert.deepEqual(stages, [7, 1, 0], '提示词第17条写的是前7天、前1天和当天；改了 scheduler 的 STAGES 要同步改提示词');
+  assert.match(sp, /期限前7天、前1天和当天各收到一封邮件/);
+});
+
+test('助手的知识：要点一项一行，只有待核实的行带【待核实】开头，已核实的行不带', () => {
+  const e = createEngine({ now: '2026-11-27' });
+  const kb = e.kb();
+  const lines = kb.split('\n');
+  for (const n of e.NODES) {
+    for (const r of n.rows) {
+      const mine = lines.filter((l) => l.startsWith('  - ') && l.replace(/^  - (【待核实】)?/, '').startsWith(r[0] + '='));
+      assert.ok(mine.length >= 1, n.id + ' ' + r[0] + ' 不在知识里');
+      assert.equal(mine.some((l) => l.startsWith('  - 【待核实】')), !r[2], n.id + ' ' + r[0] + (r[2] ? ' 已核实，不能标待核实' : ' 待核实，要标出来'));
+    }
+  }
+  // 第3轮 D5、N17：1-1 的“逾期”（过料）和 5-1 的“适用时期”已核实
+  assert.match(kb, /\n  - 逾期=无正当理由可能被处以过料\n/);
+  assert.match(kb, /\n  - 适用时期=2027年4月1日以后的申请/);
+  assert.ok(!/（待核实）$/m.test(lines.filter((l) => l.startsWith('  - ')).join('\n')), '行末不再另加（待核实）');
+});
+
+test('工具：get_plan 带上提醒页的日期（在留更新的准备节点由引擎算好），不含示例和订阅', () => {
+  const ctx = ctxOf();
+  execTool('update_profile', { status: 'work', entry: '2026-11-18', addr: '2026-11-20', exp: '2027-11-20', ins: true }, ctx);
+  const p = execTool('get_plan', {}, ctx);
+  assert.ok(Array.isArray(p.reminders) && p.reminders.length);
+  assert.deepEqual(p.reminders.find((x) => x.text === '在留更新：开始准备材料'), { date: '2027年7月20日', text: '在留更新：开始准备材料', deadline: false });
+  assert.deepEqual(p.reminders.find((x) => x.text === '在留期满日'), { date: '2027年11月20日', text: '在留期满日', deadline: true });
+  assert.ok(!p.reminders.some((x) => /示例|订阅/.test(x.text)));
 });

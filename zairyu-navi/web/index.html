@@ -877,7 +877,7 @@ var TOOLS=[
 function providerCard(c){var m=el("div","msg a");m.appendChild(el("span","cls",c[1]+"（示例占位）"));m.appendChild(el("span",null,c[2]+"。"));
   var b=el("button","ghost","查看并申请咨询");b.type="button";b.style.display="block";b.style.marginTop="8px";b.onclick=function(){$("pv-cat").value=c[0];renderPV();closeDrawer();location.hash="#providers"};m.appendChild(b);$("chat").appendChild(m)}
 // 只在本地演示（不连服务器、在 claude.ai 里打开）时追加的规则：save_document 只有这里的 TOOLS 里有，服务器上的助手没有这个工具。
-var DEMO_RULES="\n\n【补充规则】\n15. 整理好的清单、窗口话术、咨询摘要可以用 save_document 保存，并告诉用户可以在“我的资料”里查看和下载；递交给官方的文书不保存。";
+var DEMO_RULES="\n\n【补充规则】\n15. 整理好的清单、窗口话术、咨询摘要可以用 save_document 保存，并告诉用户可以在“我的资料”里查看和下载；递交给官方的文书不保存。\n16. 用户要你提醒某个日期时：用 update_profile 记录在留期满日、入境日或定下住所日（其他日期本演示记录不了，照实说），再用 get_plan，只引用 reminders 里给出的日期，并告诉他这些期限和该开始准备的日子会显示在“提醒”页。不要说“没有提醒功能”“不能提醒你”。";
 var sample=null, HIST=[], busy=false;
 var HELLO="我在这儿。问我某个任务怎么办、要花多少钱，或者直接说“这个我办完了”。也可以拍照给我看，或让我整理一份清单存到“我的资料”。";
 function pushMsg(role,text){var m=el("div","msg "+role);if(role==="a"){m.appendChild(el("span","cls",""));m.appendChild(el("span","body",text))}else m.textContent=text;$("chat").appendChild(m);$("chat").scrollTop=$("chat").scrollHeight;return m}
