@@ -3,6 +3,19 @@
 const createEngine = require('./engine');
 const { validateProfilePatch, validateInquiry, isDate, HttpError } = require('./validate');
 
+// get_options 的条件说明由引擎的 OPTION_PARAMS 生成，和引擎实际读的键、取值保持一致（见 test/assistant.test.js）
+const OPTION_PARAMS = createEngine().OPTION_PARAMS;
+const OPTION_PARAM_LABELS = {
+  deg: '有无大学或专门学校学历', offer: '有无日本公司的雇佣合同', spouse: '配偶或父母是否已在日本', jsp: '配偶是否日本人或永住者',
+  edu: '现有学历（hs 高中、jc 大专、ba 本科及以上）', goal: '目标（work 就职的学历要件、points 高度人才加分）',
+  pEdu: '学历分（0 高中或专门士、10 大专本科、20 硕士、25 MBA等经营管理专门职、30 博士）', pAge: '年龄（岁）', pInc: '年收（万日元）', pExp: '相关工作年数（取不超过实际年数的一档）', pJp: '日语', pJd: '是否在日本取得学位', pTop: '毕业大学是否在加分名单',
+  pLang: '能用哪种语言上课（both 英语日语都行）', pCert: '和工作相关的国家资格或信息处理类考试合格项数',
+  usage: '每月流量 GB（max 不限量）', card: '有没有日本信用卡', shop: '是否需要门店办理', time: '能否连续空出两周', visa: '是否要拿经营·管理签证', bLife: '每人每月生活费（万日元）'
+};
+function optionParamsDoc() {
+  return 'params 可用的键：' + Object.keys(OPTION_PARAMS).map((t) => t + ' 用 ' + Object.entries(OPTION_PARAMS[t]).map(([k, v]) => k + ' ' + (OPTION_PARAM_LABELS[k] || '') + '：' + (v === 'num' ? '数字' : v.join('/'))).join('，')).join('；') + '。';
+}
+
 const TOOL_DEFS = [
   { name: 'update_profile', description: '记录或修改用户概况。只传用户明确说过的字段。日期用 YYYY-MM-DD。',
     input_schema: { type: 'object', properties: { status: { type: 'string', enum: ['none', 'short', 'student', 'work', 'hsp', 'family', 'spouse', 'ssw', 'biz', 'pr'] }, married: { type: 'string' }, entry: { type: 'string' }, addr: { type: 'string' }, exp: { type: 'string' }, ins: { type: 'boolean' }, age: { type: 'boolean' }, lic: { type: 'boolean' }, pr: { type: 'boolean' } } } },
@@ -10,8 +23,8 @@ const TOOL_DEFS = [
   { name: 'mark_done', description: '把某个任务标记为已完成。id 是任务编号，例如 1-1。', input_schema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
   { name: 'add_trip', description: '记录一次出国和回国日期，用于永驻的出国天数计算。', input_schema: { type: 'object', properties: { out: { type: 'string' }, back: { type: 'string' } }, required: ['out', 'back'] } },
   { name: 'add_event', description: '记录一件会产生期限的事。type：job_change 换工作或离职、move 搬家、divorce 离婚或配偶去世、birth 孩子出生。date 用 YYYY-MM-DD，必须是用户明确说过的日期。', input_schema: { type: 'object', properties: { type: { type: 'string', enum: ['job_change', 'move', 'divorce', 'birth'] }, date: { type: 'string' } }, required: ['type', 'date'] } },
-  { name: 'get_options', description: '按规则引擎取出某个选择题的几套方案和费用，已按用户情况排序。topic：route 来日本走哪条路、degree 怎么取得学历、points 高度人才积分规划、phone 电话卡套餐、drive 驾照怎么拿、company 开公司费用、budget 第一年要准备多少钱。params 是可选的条件。',
-    input_schema: { type: 'object', properties: { topic: { type: 'string', enum: ['route', 'degree', 'points', 'phone', 'drive', 'company', 'budget'] }, params: { type: 'object' } }, required: ['topic'] } },
+  { name: 'get_options', description: '按规则引擎取出某个选择题的几套方案和费用，已按用户情况排序。topic：route 来日本走哪条路、degree 怎么取得学历、points 高度人才积分规划、phone 电话卡套餐、drive 驾照怎么拿、company 开公司费用、budget 第一年要准备多少钱。params 是可选的条件，用户说了的条件就传进去，没说的不传（按默认或页面上的选择）；结果里的 params 是实际用到的条件。' + optionParamsDoc(),
+    input_schema: { type: 'object', properties: { topic: { type: 'string', enum: Object.keys(OPTION_PARAMS) }, params: { type: 'object' } }, required: ['topic'] } },
   { name: 'suggest_providers', description: '列出某一类专业服务的说明。category：gyosei 行政书士、zeirishi 税理士、sharoshi 社会保险劳务士、shiho 司法书士、edu 学校和升学服务。', input_schema: { type: 'object', properties: { category: { type: 'string' } }, required: ['category'] } },
   { name: 'create_inquiry', description: '准备一份给服务商的咨询草稿。这个工具不会发送任何内容：草稿会显示在用户的页面上，由用户本人核对摘要、勾选同意后自己点发送。providerIds 是用户自己选的服务商（最多三家，同一类别），来自 suggest_providers 的结果。summary 是5至2000字的摘要，不能写个人编号、护照号、银行账号、卡号。',
     input_schema: { type: 'object', properties: { category: { type: 'string' }, providerIds: { type: 'array', items: { type: 'string' }, maxItems: 3 }, nodeId: { type: 'string' }, summary: { type: 'string' } }, required: ['category', 'providerIds', 'summary'] } }
@@ -72,7 +85,7 @@ function execTool(name, input, ctx) {
     // 含推广按类别定（非士业一律标），和名单页一样；展示费的说明每次都带上，助手要照着告诉用户（ステマ規制）
     const promoted = !e.REGULATED[c[0]];
     const list = ctx.store ? ctx.store.listProviders(c[0]).map((p) => ({ providerId: p.id, name: p.name, area: p.area, langs: p.langs, feeNote: p.feeNote, promoted })) : [];
-    return { category: c[1], what: c[2], regulated: !!e.REGULATED[c[0]], providers: list, disclosure: PAID_LISTING + (promoted ? PROMO_NOTE : ''), note: '按入驻顺序列出，由用户自己选择，助手不推荐某一家。' + (list.length ? '介绍名单时要把 disclosure 的内容告诉用户' + (promoted ? '，并在每家后面标明“含推广”' : '') + '。' : '这一类还没有入驻的服务商。') };
+    return { category: c[1], what: c[2], regulated: !!e.REGULATED[c[0]], providers: list, disclosure: PAID_LISTING + (promoted ? PROMO_NOTE : ''), note: '按入驻顺序列出，由用户自己选择，助手不推荐某一家。' + (list.length ? '介绍名单时要把 disclosure 的内容告诉用户' + (promoted ? '，并在每家后面标明“含推广”' : '') + '。' : '这一类还没有入驻的服务商，请照实告诉用户，并照原文说一次 disclosure。') };
   }
   if (name === 'create_inquiry') {
     // 只准备草稿，不写库、不发送。校验和 POST /inquiries 用同一个函数；真正发送只能由用户在页面上带 consent:true 调接口。
@@ -419,4 +432,4 @@ async function chat(ctx, history, userText, opts) {
   }
 }
 
-module.exports = { TOOL_DEFS, systemPrompt, execTool, chat, anthropicLLM, abortError, newUsage, CHAT_LLM_OPTS, CHAT_DEADLINE_MS, llmConfig, buildRequest, checkRequest, validateHistory, historyTexts, trimHistory, DEFAULT_MODEL, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, EFFORTS, REFUSAL_TEXT, TRUNCATED_TEXT, RETRY_TEXT };
+module.exports = { OPTION_PARAM_LABELS, TOOL_DEFS, systemPrompt, execTool, chat, anthropicLLM, abortError, newUsage, CHAT_LLM_OPTS, CHAT_DEADLINE_MS, llmConfig, buildRequest, checkRequest, validateHistory, historyTexts, trimHistory, DEFAULT_MODEL, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, EFFORTS, REFUSAL_TEXT, TRUNCATED_TEXT, RETRY_TEXT };

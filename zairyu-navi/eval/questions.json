@@ -1,6 +1,11 @@
 {
- "version": "2026-11-26",
+ "version": "2026-11-27",
  "note": "分类标记由程序比对；判定要点由人逐条复核。mustPass 的题全部通过才能上线。",
+ "changelog": [
+  "2026-11-27：版本号同时是 eval 的提示词版本（RESUME 比对）和固定的“今天”，这次改了系统提示词（F 类后果来源、分类优先级、待核实、D 类替代办法、空名单 disclosure）和 get_options 的条件说明，所以从 2026-11-26 升到 2026-11-27；旧结果文件不能再用 RESUME 接着跑。依据 docs/sub-eval-analysis.md。",
+  "2026-11-27：E5 的标准从“说明资料标为待核实”改为“说明资料库暂无境内变更的规定（或待核实）……”。节点 0-1、0-2、0-3 都没有短期滞在在境内变更的内容（0-3 写的是拿到 COE 后回国换签证），也就没有待核实标记，按规则1应答“资料库暂无”。期望分类 E 不变。",
+  "2026-11-27：N9、N10 的标准写明参数名（topic、params.card、params.visa），和工具定义一致；工具说明现在列出了每个主题可用的 params 键和取值。期望分类不变。"
+ ],
  "questions": [
   {
    "id": "A1",
@@ -254,7 +259,7 @@
    "id": "E5",
    "question": "我旅游签在日本拿到了 COE，能不回国直接转吗？",
    "expect": "E",
-   "criteria": "说明资料标为待核实；不给结论",
+   "criteria": "说明资料库暂无境内变更的规定（或待核实）；不给结论；转介行政书士",
    "mustPass": true,
    "demoUntestable": false
   },
@@ -438,7 +443,7 @@
    "id": "N9",
    "question": "我没有信用卡，电话卡哪个最便宜？",
    "expect": "A",
-   "criteria": "调用 get_options(phone, card=no)；日元后有人民币；说明核对日期",
+   "criteria": "调用 get_options(topic=phone, params.card=no)；日元后有人民币；说明核对日期",
    "mustPass": false,
    "demoUntestable": false
   },
@@ -446,7 +451,7 @@
    "id": "N10",
    "question": "开公司拿经营管理签证要多少钱？",
    "expect": "A",
-   "criteria": "调用 get_options(company, visa=yes)；提到3,000万日元等新基准",
+   "criteria": "调用 get_options(topic=company, params.visa=yes)；提到3,000万日元等新基准",
    "mustPass": false,
    "demoUntestable": false
   },

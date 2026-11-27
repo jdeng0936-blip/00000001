@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createStore } = require('../src/store');
-const { execTool, chat, TOOL_DEFS, systemPrompt, validateHistory, trimHistory } = require('../src/assistant');
+const { execTool, chat, TOOL_DEFS, systemPrompt, validateHistory, trimHistory, OPTION_PARAM_LABELS } = require('../src/assistant');
 const createEngine = require('../src/engine');
 
 const ctxOf = () => { const store = createStore(); const user = store.createUser(); return { user, store, now: '2026-11-26' }; };
@@ -277,4 +277,58 @@ test('提示词：只提到服务器上真有的工具；不再说服务商是�
   const html = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'web', 'index.html'), 'utf8');
   assert.match(html, /var DEMO_RULES="[^"]*save_document/); assert.match(html, /\{name:"save_document"/);
   assert.match(html, /SYS\+kb\(\)\+DEMO_RULES/);
+});
+
+// get_options 的 params 说明要和引擎实际读的条件一致：N9、N10 曾因为工具说明没写 card、visa，模型没法传条件
+test('工具说明：get_options 列出的条件键就是引擎各主题实际读的 PL 字段', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'src', 'engine.js'), 'utf8');
+  const body = (fn) => { const i = src.indexOf('function ' + fn + '('); assert.ok(i >= 0, fn); const j = src.indexOf('\nfunction ', i + 1); return src.slice(i, j); };
+  const reads = (fn, obj) => new Set([...body(fn).matchAll(new RegExp('\\b' + obj + '\\.(\\w+)', 'g'))].map((m) => m[1]).filter((k) => k !== 'topic' && k !== 'subs'));
+  const union = (...sets) => new Set(sets.flatMap((x) => [...x]));
+  const expected = {
+    route: reads('routeOptions', 'PL'), degree: reads('degreeOptions', 'PL'), phone: reads('phoneOptions', 'PL'), drive: reads('driveOptions', 'PL'), company: reads('companyOptions', 'PL'),
+    points: union(reads('pointsOptions', 'PL'), reads('hspPoints', 's')), budget: union(reads('budgetOptions', 'PL'), reads('phoneOptions', 'PL'))
+  };
+  const e = createEngine({ now: '2026-11-26' });
+  assert.deepEqual(Object.keys(e.OPTION_PARAMS).sort(), e.PLT.map((t) => t[0]).sort());
+  const def = TOOL_DEFS.find((t) => t.name === 'get_options');
+  assert.deepEqual(def.input_schema.properties.topic.enum.sort(), e.PLT.map((t) => t[0]).sort());
+  for (const [topic, keys] of Object.entries(expected)) {
+    assert.deepEqual(Object.keys(e.OPTION_PARAMS[topic]).sort(), [...keys].sort(), topic + ' 的条件键和引擎读的不一致');
+    for (const [k, v] of Object.entries(e.OPTION_PARAMS[topic])) {
+      assert.ok(OPTION_PARAM_LABELS[k], k + ' 没有说明');
+      assert.ok(def.description.includes(k + ' ' + OPTION_PARAM_LABELS[k] + '：' + (v === 'num' ? '数字' : v.join('/'))), topic + ' 的 ' + k + ' 没写进工具说明');
+      // 每个取值都要能被引擎接受并回显
+      for (const val of v === 'num' ? ['34', '600'] : v) assert.equal(e.options(topic, { [k]: val }).params[k], val, topic + ' ' + k + '=' + val);
+    }
+  }
+  assert.match(def.description, /card 有没有日本信用卡：yes\/no/);
+  assert.match(def.description, /company 用 visa 是否要拿经营·管理签证：yes\/no/);
+});
+
+test('工具：get_options 的条件按传入的用，不受页面上保存的选择影响', () => {
+  const ctx = ctxOf();
+  ctx.user.plan = { card: 'yes', visa: 'no' }; ctx.store.saveUser(ctx.user, 'test.plan');
+  const r = execTool('get_options', { topic: 'phone', params: { card: 'no' } }, ctx);
+  assert.equal(r.params.card, 'no');
+  assert.ok(r.options[0].pts.some((p) => /没有信用卡/.test(p)), '按没有信用卡的条件排序');
+  assert.ok(!r.options[0].pts.some((p) => /这家办不了/.test(p)), '第一名不能是只收信用卡的');
+  assert.equal(execTool('get_options', { topic: 'phone' }, ctx).params.card, 'yes', '不传时按页面上的选择');
+  const c = execTool('get_options', { topic: 'company', params: { visa: 'yes' } }, ctx);
+  assert.equal(c.params.visa, 'yes'); assert.match(c.note, /3,000万日元/);
+  const bad = execTool('get_options', { topic: 'company', params: { card: 'no', visa: 'maybe' } }, ctx);
+  assert.deepEqual(bad.params, { visa: 'no' }); assert.match(bad.ignoredParams, /card、visa/);
+  assert.equal(execTool('get_options', { topic: 'phone', params: { card: false } }, ctx).params.card, 'no', '布尔值按 yes/no 处理');
+});
+
+test('提示词：F 类后果、分类优先级、待核实、D 类替代办法、空名单 disclosure 的规则都在', () => {
+  const e = createEngine({ now: '2026-11-26' });
+  assert.match(e.SYS, /后果只说节点资料、工具结果和第13条写明的/);
+  assert.match(e.SYS, /具体处罚资料库暂无/);
+  assert.match(e.SYS, /按 F、D、E、C、B、A 的顺序取第一个符合的/);
+  assert.match(e.SYS, /不添加资料里没有的提醒或忠告句/);
+  assert.match(e.SYS, /只对确实标了“待核实”的那一项这样说/);
+  assert.match(e.SYS, /拒绝后只给资料里有的替代办法/);
+  assert.match(e.SYS, /名单为空时也照原文说一次 disclosure/);
+  assert.match(e.SYS, /要作为条件参数传进去/);
 });
