@@ -332,5 +332,25 @@ test('提示词：F 类后果、分类优先级、待核实、D 类替代办法�
   assert.match(e.SYS, /只对确实标了“待核实”的那一项这样说/);
   assert.match(e.SYS, /拒绝后只给资料里有的替代办法/);
   assert.match(e.SYS, /名单为空时也照原文说一次 disclosure/);
-  assert.match(e.SYS, /要作为条件参数传进去/);
+  assert.match(e.SYS, /要作为条件参数传进去/);});
+
+// eval 第2轮：C4（我要不要做确定申告被判成 A 并给了结论）、N14（身份只是提问前提）、A9（默认条件说成用户的情况）、N1（自加评价）、F4（转让账户是犯罪）
+test('提示词：第2轮修改（C 类范围、身份前提、默认条件、事实问题不调方案、转让账户）都在', () => {
+  const e = createEngine({ now: '2026-11-27' });
+  assert.match(e.SYS, /C 个别税务判断（[^）]*我要不要做确定申告或年末调整[^）]*我的收入要不要交某种税）/);
+  assert.match(e.SYS, /用“资料写的一般条件是……”开头，不把它套到用户身上/);
+  assert.match(e.SYS, /建议咨询税理士，并按第8条列出税理士/);
+  assert.match(e.SYS, /只有用户的问题本身是要某个税额、扣除或是否需要申报、缴纳的结论[^。]*时才是 C；这时即使用户同时说明了自己的情况，也按 C。/);
+  assert.match(e.SYS, /用户主要是在说明自己的情况[^。]*属于 B，即使回答里顺带讲了流程/, '第1轮的 B 类说明还在');
+  assert.match(e.SYS, /用户只是把自己的身份当作提问前提[^。]*按问题本身分类，可以同时调用 update_profile。/);
+  assert.match(e.SYS, /defaults 里的条件是用户没说明的默认值，不要说成“按你的情况”/);
+  assert.match(e.SYS, /只问能不能、要不要的事实问题[^）]*按节点资料回答，不调用 get_options/);
+  assert.match(e.SYS, /不加“一般不是首选”“更推荐”这类工具结果里没有的评价/);
+  assert.match(e.SYS, /4-9 的“转让账户”一行/);
+  assert.match(e.SYS, /说明这是例子，不当作通则/);
+  // F 类引用的那一行要真在助手的知识里：不带数字，所以待核实也照常显示；刑罚数字待核实，按上线规则隐去
+  const kb = e.kb();
+  assert.match(kb, /转让账户=[^；]*是犯罪收益移转防止法禁止的犯罪[^；]*（待核实）/);
+  assert.doesNotMatch(kb, /100万日元以下罚金|500万日元以下罚金/);
+  assert.ok(e.NODES.find((n) => n.id === '4-9').src.some((x) => /^https:\/\/www\.(npa|fsa)\.go\.jp\//.test(x[1])), '转让账户要有警察厅或金融厅的出处');
 });

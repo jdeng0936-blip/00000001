@@ -443,3 +443,28 @@ test('4-1 手续费写明新标准的适用范围：2026年10月1日以后申请
   const fee = n.rows.find((r) => r[0] === '手续费（窗口）');
   for (const s of [fee[1], n.sum, n.cost]) { assert.match(s, /2026年10月1日以后/); assert.match(s, /6,000日元/); }
 });
+
+// N1（eval 第2轮）：routeOptions 把节点里标“待核实”的715元签证费写成了确定数字，模型照说。
+// get_options 返回的金额，只要在节点资料里只出现在待核实的内容里（没有出现在已核实的行里），那一段就必须带待核实一类的标记。
+test('方案里的金额：对应节点待核实内容的，必须带“待核实”（routeOptions 的签证费曾经没带）', () => {
+  const raw = require('../data/nodes.json'), e = eng({}), bad = [];
+  const MARK = /待核实|待实测|待调研|待查|待复核|待现场确认/;
+  const ok = raw.flatMap((n) => n.rows.filter((r) => r[2]).map((r) => r[1])).join('\n').normalize('NFKC');
+  const pending = raw.flatMap((n) => [...n.rows.filter((r) => !r[2]).map((r) => r[1]), ...[n.cost, n.time].flatMap((x) => x.split(/[；;]/)).filter((x) => MARK.test(x))]).join('\n').normalize('NFKC');
+  const money = (s) => (s.normalize('NFKC').match(/\d[\d,.]*(?:万)?(?:日元|元)/g) || []);
+  const variants = { route: [{}, { deg: 'yes', offer: 'yes' }, { spouse: 'yes' }, { jsp: 'yes' }, { deg: 'no', offer: 'no' }] };
+  let checked = 0;
+  for (const [topic] of e.PLT) for (const params of variants[topic] || [{}]) {
+    const r = eng({}).options(topic, params);
+    const texts = [r.note, ...r.options.flatMap((o) => [o.price, o.sub || '', ...(o.pts || [])])];
+    for (const t of texts) for (const seg of t.replace(/（约[^）]*）/g, '').split(/[；;。]/)) {
+      for (const tok of money(seg)) {
+        if (!pending.includes(tok) || ok.includes(tok)) continue;
+        checked++;
+        if (!MARK.test(seg)) bad.push(topic + ' ' + JSON.stringify(params) + '「' + seg + '」里的 ' + tok);
+      }
+    }
+  }
+  assert.deepEqual(bad, []);
+  assert.ok(checked > 0, '至少检查到一处（路线的签证费）');
+});
