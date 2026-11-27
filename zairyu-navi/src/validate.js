@@ -190,4 +190,80 @@ function normalizeEmail(s) {
 // 给用户看的邮箱只露第一个字符和域名：a***@example.com
 function maskEmail(e) { const i = e.indexOf('@'); return e.slice(0, 1) + '***' + e.slice(i); }
 
-module.exports = { validateProfilePatch, validateInquiry, isDate, findSensitive, sensitiveLabel, assertNoSensitive, normalizeEmail, maskEmail, HttpError, STATUSES };
+// ---- 服务商入驻申请 ----
+// 保证类用语：入驻申请（名称、地址、收费说明、区域、语言）、管理员直接入驻、老服务商迁移和服务商的回复共用这一个函数。
+// 先做 NFKC（全角的“１００％”“Ｎｏ．１”也算），再去掉零宽字符和所有空白（“包 过”“包​过”也算），简体、繁体、日文写法都拦。
+// “不保证”“无法保证”“不能确保”“不一定能”这种否定的说法是正当的提醒（回复里常用），先去掉再判断。
+const CLAIMS = /合格保[证証證]|包[过過]|必[过過]|保[证証證]|[确確]保|一定能|[绝絶絕][对対對]|最安|日本一|no\.?1(?!\d)|100%/i;
+const CLAIM_NEG = /(?:不|无法|無法|不能|没法|沒法|不可能)(?:保[证証證]|[确確]保|一定能|包[过過]|必[过過])/g;
+const claimText = (text) => text.normalize('NFKC').replace(RE.zw, '').replace(/\s+/g, '').replace(CLAIM_NEG, '');
+function hasClaims(text) { return typeof text === 'string' && CLAIMS.test(claimText(text)); }
+function assertNoClaims(text, what) {
+  if (hasClaims(text)) throw new HttpError(422, (what || '内容') + '里不能有保证类或夸大的用语（例如合格保证、包过、必过、绝对、100%、No.1、日本一、最安）');
+}
+// 登录番号：NFKC（全角转半角）后去掉空白和「第」「号」。只用来防打错，不算核实；核实由管理员对照各连合会的检索做。
+function normalizeLicense(s) { return typeof s === 'string' ? s.normalize('NFKC').replace(/[\s第号號]/g, '') : ''; }
+// 各类别登录番号的格式（normalizeLicense 之后）和要一起填的所属会。where：管理员去哪里核对。
+// 格式由人对照各连合会再核一次（docs/TODO.md 第 7 条）。
+const LICENSE_RULES = {
+  gyosei: { re: /^\d{8}$/, body: /^.{2,4}行政書士会$/, label: '行政書士の登録番号（8 位数字）', bodyLabel: '所属行政書士会（例：大阪府行政書士会）', where: '日本行政書士会連合会的会员检索' },
+  zeirishi: { re: /^\d{1,6}$/, body: /^.{2,5}税理士会$/, label: '税理士登録番号（1 至 6 位数字）', bodyLabel: '所属税理士会（例：近畿税理士会）', where: '日本税理士会連合会的税理士情報検索サイト' },
+  sharoshi: { re: /^\d{8}$/, body: /^.{2,4}社会保険労務士会$/, label: '社会保険労務士の登録番号（8 位数字）', bodyLabel: '所属社会保険労務士会（例：大阪府社会保険労務士会）', where: '全国社会保険労務士会連合会的社労士检索' },
+  shiho: { re: /^\d{1,5}$/, body: /^.{2,4}司法書士会$/, label: '司法書士の登録番号（1 至 5 位数字）', bodyLabel: '所属司法書士会（例：大阪司法書士会）', where: '各司法書士会或日本司法書士会連合会的检索' },
+  estate: { re: /^(?:国土交通大臣|.{2,3}知事)\(\d{1,2}\)\d{1,6}$/, body: null, label: '宅地建物取引業の免許番号（例：大阪府知事（3）第12345号）', where: '国土交通省的宅地建物取引業者检索' }
+};
+// 法人番号：13 位，第一位是校验位（国税厅公布的算法）
+function corpNumberOk(s) {
+  if (!/^\d{13}$/.test(s)) return false;
+  const base = s.slice(1);
+  let sum = 0;
+  for (let n = 1; n <= 12; n++) sum += +base[12 - n] * (n % 2 ? 1 : 2);
+  return +s[0] === 9 - (sum % 9);
+}
+// 登录番号和所属会的检查（入驻申请、管理员直接入驻、老服务商迁移共用）。士业和不动产按 LICENSE_RULES 的格式，所属会必填（不动产没有）；
+// 其他非士业的法人番号选填（13 位，带校验位）。不合格时抛 422，合格时返回 { licenseNo, licenseBody }（整理过的）。
+function checkLicense(category, licenseNo, licenseBody) {
+  if (licenseNo != null && typeof licenseNo !== 'string') throw new HttpError(422, '登录番号须为文字');
+  const rule = LICENSE_RULES[category], lic = normalizeLicense(licenseNo);
+  if (rule) {
+    if (!rule.re.test(lic)) throw new HttpError(422, '登录番号的格式不对：' + rule.label);
+    if (!rule.body) return { licenseNo: lic, licenseBody: '' };
+    const body = typeof licenseBody === 'string' ? licenseBody.normalize('NFKC').replace(/\s/g, '') : '';
+    if (!rule.body.test(body)) throw new HttpError(422, '要填写' + rule.bodyLabel);
+    return { licenseNo: lic, licenseBody: body };
+  }
+  if (lic && !corpNumberOk(lic)) throw new HttpError(422, '法人番号须为 13 位数字（校验位要对得上），不是法人可以不填');
+  return { licenseNo: lic, licenseBody: '' };
+}
+// 名单上公开的文字（名称、地址、收费说明、区域、语言）都不能有保证类用语。f：{ name, address, feeNote, area, langs }
+function assertListingText(f) {
+  for (const [k, label] of [['name', '名称'], ['address', '事务所地址'], ['feeNote', '收费说明'], ['area', '服务区域'], ['langs', '语言']]) assertNoClaims(f[k], label);
+}
+// 收费方式只按类别定：士业是 fixed_listing，其余是 affiliate_disclosed。两种都只付固定的展示费，
+// affiliate_disclosed 只表示“名单上标明含推广”（名字是早先定的，为了兼容旧数据没有改），不表示按咨询或成交给佣金。
+const feeModelOf = (regulated) => (regulated ? 'fixed_listing' : 'affiliate_disclosed');
+const APP_FIELDS = new Set(['challengeId', 'code', 'proof', 'category', 'name', 'address', 'licenseNo', 'licenseBody', 'feeNote', 'area', 'langs', 'agree', 'feeModel']);
+// 入驻申请的校验（新申请和“要求修改”后的重新提交共用）。deps：{ hasCategory(key), regulated(key), termsVersion }。
+// 收费方式不看请求：士业固定为 fixed_listing，其余为 affiliate_disclosed（请求里带 feeModel 一律忽略）。
+function validateApplication(b, deps) {
+  b = b || {};
+  for (const k of Object.keys(b)) {
+    if (FORBIDDEN.test(k)) throw new HttpError(422, '平台不收集个人编号、护照号和银行账号');
+    if (!APP_FIELDS.has(k)) throw new HttpError(422, '未知字段：' + k);
+  }
+  if (typeof b.category !== 'string' || !deps.hasCategory(b.category)) throw new HttpError(422, '服务类别无效');
+  if (b.agree !== deps.termsVersion) throw new HttpError(422, '要先阅读并同意服务商条款（版本 ' + deps.termsVersion + '）');
+  const text = (k, label, min, max) => {
+    const v = b[k] == null ? '' : b[k];
+    if (typeof v !== 'string' || v.trim().length < min || v.length > max) throw new HttpError(422, label + (min ? '须为' + min + '至' + max + '字' : '须为' + max + '字以内'));
+    assertNoSensitive(v, label);
+    return v.trim();
+  };
+  const out = { category: b.category, name: text('name', '名称', 2, 80), address: text('address', '事务所地址', 5, 200), feeNote: text('feeNote', '收费说明', 2, 200), area: text('area', '服务区域', 0, 100), langs: text('langs', '语言', 0, 100) };
+  assertListingText(out);
+  Object.assign(out, checkLicense(b.category, b.licenseNo, b.licenseBody));
+  out.feeModel = feeModelOf(!!deps.regulated(b.category));
+  return out;
+}
+
+module.exports = { validateApplication, checkLicense, assertListingText, feeModelOf, normalizeLicense, LICENSE_RULES, assertNoClaims, hasClaims, corpNumberOk, validateProfilePatch, validateInquiry, isDate, findSensitive, sensitiveLabel, assertNoSensitive, normalizeEmail, maskEmail, HttpError, STATUSES };

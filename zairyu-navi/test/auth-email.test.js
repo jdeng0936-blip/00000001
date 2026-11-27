@@ -23,10 +23,23 @@ async function start(opts) {
   // 发到某个邮箱的最后一封邮件，和里面的验证码
   const lastMail = (to) => app.store.listOutbox({ to }).pop();
   const codeIn = (mail) => (/验证码：(\d{6})/.exec(mail.body) || [])[1];
-  const bind = async (u, email) => {
-    const r = await call('POST', `/api/users/${u.id}/email`, { email, consent: true }, u.token);
+  // 更换、解除之前验证原来的邮箱，返回确认 proof。token 是发起操作的那台设备的令牌（默认是账号自己的）。
+  const proveOld = async (u, action, token) => {
+    const old = app.store.getEmail(u.id).email;
+    const r = await call('POST', `/api/users/${u.id}/email/old`, { action }, token || u.token);
     assert.equal(r.status, 202, JSON.stringify(r.body));
-    const v = await call('POST', `/api/users/${u.id}/email/verify`, { challengeId: r.body.challengeId, code: codeIn(lastMail(email)) }, u.token);
+    const v = await call('POST', `/api/users/${u.id}/email/old/verify`, { action, challengeId: r.body.challengeId, code: codeIn(lastMail(old)) }, token || u.token);
+    assert.equal(v.status, 200, JSON.stringify(v.body));
+    return v.body.proof;
+  };
+  // 解除邮箱（绑着的话先验证原来的邮箱）
+  const unbind = async (u, token) => call('DELETE', `/api/users/${u.id}/email`, app.store.getEmail(u.id) ? { proof: await proveOld(u, 'remove', token) } : null, token || u.token);
+  // 绑定；账号上已经绑着邮箱时先验证原来的邮箱（换绑）
+  const bind = async (u, email) => {
+    const proof = app.store.getEmail(u.id) ? await proveOld(u, 'change') : undefined;
+    const r = await call('POST', `/api/users/${u.id}/email`, { email, consent: true, proof }, u.token);
+    assert.equal(r.status, 202, JSON.stringify(r.body));
+    const v = await call('POST', `/api/users/${u.id}/email/verify`, { challengeId: r.body.challengeId, code: codeIn(lastMail(email)), proof }, u.token);
     assert.equal(v.status, 200, JSON.stringify(v.body));
     return v.body;
   };
@@ -35,7 +48,7 @@ async function start(opts) {
     assert.equal(r.status, 202);
     return call('POST', '/api/auth/recover/verify', { challengeId: r.body.challengeId, code: codeIn(lastMail(email)) });
   };
-  return { app, base, call, newUser, lastMail, codeIn, bind, recover, advance: (ms) => { t += ms; }, stop: async () => { await app.deliver(); app.server.close(); app.server.closeAllConnections(); app.store.close(); } };
+  return { app, base, call, newUser, lastMail, codeIn, bind, proveOld, unbind, recover, advance: (ms) => { t += ms; }, stop: async () => { await app.deliver(); app.server.close(); app.server.closeAllConnections(); app.store.close(); } };
 }
 const MIN = 60 * 1000;
 
@@ -105,19 +118,28 @@ test('验证码：10 分钟后过期；只能用一次；重新发送后旧的�
     assert.equal((await s.call('POST', `/api/users/${other.id}/email/verify`, { challengeId: r.body.challengeId, code }, other.token)).status, 422);
     assert.equal(s.app.store.getEmail(other.id), null);
     assert.equal((await s.call('POST', E + '/verify', { challengeId: r.body.challengeId, code }, u.token)).status, 200);
-    // 用过一次就不能再用
-    assert.equal((await s.call('POST', E + '/verify', { challengeId: r.body.challengeId, code }, u.token)).status, 422);
-    // 重新发送后旧的作废
-    const r1 = await s.call('POST', E, { email: 'b@example.com', consent: true }, u.token); const c1 = s.codeIn(s.lastMail('b@example.com'));
-    const r2 = await s.call('POST', E, { email: 'b@example.com', consent: true }, u.token); const c2 = s.codeIn(s.lastMail('b@example.com'));
+    // 用过一次就不能再用（现在绑着邮箱了，再绑要先验证原来的邮箱；没有确认是 403，有确认也还是 422）
+    assert.equal((await s.call('POST', E + '/verify', { challengeId: r.body.challengeId, code }, u.token)).status, 403);
+    const proof = await s.proveOld(u, 'change');
+    assert.equal((await s.call('POST', E + '/verify', { challengeId: r.body.challengeId, code, proof }, u.token)).status, 422);
+    // 重新发送后旧的作废（换绑：同一个确认可以用来重发新邮箱的验证码）
+    const r1 = await s.call('POST', E, { email: 'b@example.com', consent: true, proof }, u.token); const c1 = s.codeIn(s.lastMail('b@example.com'));
+    const r2 = await s.call('POST', E, { email: 'b@example.com', consent: true, proof }, u.token); const c2 = s.codeIn(s.lastMail('b@example.com'));
     assert.notEqual(r1.body.challengeId, r2.body.challengeId);
-    assert.equal((await s.call('POST', E + '/verify', { challengeId: r1.body.challengeId, code: c1 }, u.token)).status, 422, '旧验证码已作废');
-    assert.equal((await s.call('POST', E + '/verify', { challengeId: r2.body.challengeId, code: c2 }, u.token)).status, 200);
+    assert.equal((await s.call('POST', E + '/verify', { challengeId: r1.body.challengeId, code: c1, proof }, u.token)).status, 422, '旧验证码已作废');
+    assert.equal((await s.call('POST', E + '/verify', { challengeId: r2.body.challengeId, code: c2, proof }, u.token)).status, 200);
     assert.equal(s.app.store.getEmail(u.id).email, 'b@example.com', '换绑：新邮箱替换旧邮箱');
     assert.equal(s.app.store.userByEmail('a@example.com'), null);
-    // 找回用的验证码不能拿来绑定，反过来也不行
+    // 找回用的验证码不能拿来绑定、不能拿来验证原邮箱，反过来也不行
+    const p2 = await s.proveOld(u, 'change');
     const rr = await s.call('POST', '/api/auth/recover', { email: 'b@example.com' }); const rc = s.codeIn(s.lastMail('b@example.com'));
-    assert.equal((await s.call('POST', E + '/verify', { challengeId: rr.body.challengeId, code: rc }, u.token)).status, 422);
+    assert.equal((await s.call('POST', E + '/verify', { challengeId: rr.body.challengeId, code: rc, proof: p2 }, u.token)).status, 422);
+    assert.equal((await s.call('POST', E + '/old/verify', { action: 'change', challengeId: rr.body.challengeId, code: rc }, u.token)).status, 422);
+    const ro = await s.call('POST', E + '/old', { action: 'remove' }, u.token); const oc = s.codeIn(s.lastMail('b@example.com'));
+    assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: ro.body.challengeId, code: oc })).status, 422, '验证原邮箱的验证码不能用来找回');
+    assert.equal((await s.call('POST', E + '/verify', { challengeId: ro.body.challengeId, code: oc, proof: p2 }, u.token)).status, 422, '也不能用来绑定');
+    assert.equal((await s.call('POST', E + '/old/verify', { action: 'change', challengeId: ro.body.challengeId, code: oc }, u.token)).status, 422, '“解除”的验证码不能换来“更换”的确认');
+    assert.equal((await s.call('POST', E + '/old/verify', { action: 'remove', challengeId: ro.body.challengeId, code: oc }, u.token)).status, 200);
   } finally { await s.stop(); }
 });
 
@@ -356,7 +378,7 @@ test('解除绑定：邮箱、没用完的验证码、发给它的邮件都删�
     const d2 = (await s.recover('li@example.com')).body.token;
     const pending = await s.call('POST', '/api/auth/recover', { email: 'li@example.com' });
     const code = s.codeIn(s.lastMail('li@example.com'));
-    assert.equal((await s.call('DELETE', E, null, u.token)).status, 204);
+    assert.equal((await s.unbind(u)).status, 204);
     assert.deepEqual((await s.call('GET', E, null, u.token)).body, { email: null, verified: false, remindOptIn: false });
     await s.app.deliver();
     const fp = s.app.store.emailFootprint(u.id, 'li@example.com');
@@ -434,8 +456,9 @@ test('留痕：绑定、找回、退出、解除、删除都有记录，但不�
     const acts = check();
     for (const a of ['email.bind', 'session.recover', 'session.revoke']) assert.ok(acts.includes(a), a);
     s.advance(25 * 60 * MIN); // 刚找回的设备 24 小时内不能解除邮箱
-    assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, null, d2)).status, 204);
-    assert.ok(check().includes('email.remove'));
+    const proof = await s.proveOld(u, 'remove', d2); codes.push(proof, s.codeIn(s.lastMail('li.hua@example.com')));
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, { proof }, d2)).status, 204);
+    assert.ok(check().includes('email.remove')); assert.ok(check().includes('email.confirm'), '验证原来的邮箱有记录（只记动作）');
     await s.call('DELETE', `/api/users/${u.id}`, null, d2);
     const rows = s.app.store.auditRows(); check();
     assert.ok(!JSON.stringify(rows).includes(u.id), '删除账号后留痕里没有账号 id');
@@ -619,7 +642,10 @@ test('条款改版：老用户重新同意之前只能读取和删除自己的�
     assert.equal((await s.call('PUT', E4 + '/reminders', { on: true }, old4.token)).status, 409, '打开不行');
     const off = await s.call('PUT', E4 + '/reminders', { on: false }, old4.token);
     assert.equal(off.status, 200); assert.deepEqual(off.body, { remindOptIn: false }); assert.equal(store.remindTarget(old4.id), null);
-    assert.equal((await s.call('DELETE', E4, null, old4.token)).status, 204); assert.equal(store.getEmail(old4.id), null);
+    // 解除也要先验证原来的邮箱：验证“解除”的两步不拦，验证“更换”的拦下
+    assert.equal((await s.call('DELETE', E4, null, old4.token)).status, 403, '没验证原来的邮箱不能解除');
+    assert.equal((await s.call('POST', E4 + '/old', { action: 'change' }, old4.token)).status, 409, '验证原邮箱以便更换：要先同意');
+    assert.equal((await s.unbind(old4)).status, 204); assert.equal(store.getEmail(old4.id), null);
     assert.equal((await s.call('GET', `/api/users/${old4.id}/plan`, null, old4.token)).status, 409, '其余照旧要先同意');
     // 用邮箱找回的老用户也一样要先重新同意
     const old3 = store.createUser('2026-11-26'); store.bindEmail(old3.id, 'old3@example.com', '2026-11-26');

@@ -44,7 +44,7 @@ test('工具：create_inquiry 只准备草稿，不发送；校验和接口一�
   // 模型自己说“已确认”没有任何作用：结果只是草稿
   const r = execTool('create_inquiry', Object.assign({ confirmed: true, nodeId: '4-1' }, base, { summary: '  想咨询扶养扣除。  ', providerIds: [p.id, others[0].id] }), ctx);
   assert.equal(r.sent, false);
-  assert.deepEqual(r.draft, { category: 'zeirishi', nodeId: '4-1', summary: '想咨询扶养扣除。', providerIds: [p.id, others[0].id], providers: [{ id: p.id, name: '示例税理士事务所' }, { id: others[0].id, name: '乙' }] });
+  assert.deepEqual(r.draft, { category: 'zeirishi', nodeId: '4-1', summary: '想咨询扶养扣除。', providerIds: [p.id, others[0].id], providers: [{ id: p.id, name: '示例税理士事务所', promoted: false }, { id: others[0].id, name: '乙', promoted: false }], disclosure: '以下服务商向在留导航支付固定的展示费（不按咨询数或成交付费），排列按入驻先后，平台不推荐某一家。' });
   assert.equal(ctx.store.listInquiries(ctx.user.id).length, 0, '助手不能把咨询写进库里');
   assert.equal(ctx.store.listInquiriesFor(p.id).length, 0, '服务商什么都不应收到');
   assert.match(TOOL_DEFS.find((t) => t.name === 'create_inquiry').description, /不会发送/);

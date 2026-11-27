@@ -40,12 +40,25 @@ async function start(opts) {
       assert.equal(r.status, 200, JSON.stringify(r.body));
       return u;
     },
-    bind: async (u, email) => {
-      const r = await call('POST', `/api/users/${u.id}/email`, { email, consent: true }, u.token);
+    // 更换、解除之前验证原来的邮箱，返回确认 proof
+    proveOld: async (u, action) => {
+      const old = app.store.getEmail(u.id).email;
+      const r = await call('POST', `/api/users/${u.id}/email/old`, { action }, u.token);
       assert.equal(r.status, 202, JSON.stringify(r.body));
       await app.deliver();
-      const code = /验证码：(\d{6})/.exec(app.store.listOutbox({ to: email }).filter((m) => m.kind === 'code').pop().body)[1];
-      const v = await call('POST', `/api/users/${u.id}/email/verify`, { challengeId: r.body.challengeId, code }, u.token);
+      const v = await call('POST', `/api/users/${u.id}/email/old/verify`, { action, challengeId: r.body.challengeId, code: s.codeTo(old) }, u.token);
+      assert.equal(v.status, 200, JSON.stringify(v.body));
+      return v.body.proof;
+    },
+    codeTo: (email) => /验证码：(\d{6})/.exec(app.store.listOutbox({ to: email }).filter((m) => m.kind === 'code').pop().body)[1],
+    unbind: async (u) => call('DELETE', `/api/users/${u.id}/email`, app.store.getEmail(u.id) ? { proof: await s.proveOld(u, 'remove') } : null, u.token),
+    bind: async (u, email) => {
+      const proof = app.store.getEmail(u.id) ? await s.proveOld(u, 'change') : undefined;
+      const r = await call('POST', `/api/users/${u.id}/email`, { email, consent: true, proof }, u.token);
+      assert.equal(r.status, 202, JSON.stringify(r.body));
+      await app.deliver();
+      const code = s.codeTo(email);
+      const v = await call('POST', `/api/users/${u.id}/email/verify`, { challengeId: r.body.challengeId, code, proof }, u.token);
       assert.equal(v.status, 200, JSON.stringify(v.body));
       return v.body;
     },
@@ -384,7 +397,7 @@ test('在设置里关掉提醒、解除绑定、删除账号：排着队的提�
     const a = await s.ready('a@example.com'), b = await s.ready('b@example.com'), c = await s.ready('c@example.com');
     assert.equal((await s.run()).mails, 3);
     assert.equal((await s.optIn(a, false)).status, 200);
-    assert.equal((await s.call('DELETE', `/api/users/${b.id}/email`, null, b.token)).status, 204);
+    assert.equal((await s.unbind(b)).status, 204);
     assert.equal(s.app.store.emailFootprint(c.id, 'c@example.com').reminders, 1);
     assert.equal((await s.call('DELETE', `/api/users/${c.id}`, null, c.token)).status, 204);
     assert.deepEqual(s.app.store.emailFootprint(c.id, 'c@example.com'), { sessions: 0, emails: 0, challenges: 0, outbox: 0, reminders: 0, rate: 0 });

@@ -9,6 +9,7 @@
     "test": "node --test test/*.test.js",
     "e2e": "node e2e/run.js",
     "remind": "node src/scheduler.js",
+    "billing": "node src/billing.js",
     "eval": "node eval/run.js"
   }
 }

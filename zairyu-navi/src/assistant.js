@@ -27,6 +27,9 @@ const EXTRA_RULES = '\n\n【补充规则】\n' +
 function systemPrompt(eng, now) { return eng.SYS + eng.kb() + EXTRA_RULES + '\n\n【用户概况】' + eng.profileText() + '\n今天是' + eng.fmt(now ? new Date(now) : new Date()) + '。'; }
 
 // ctx: { user, store, now }
+// 名单上的服务商都向平台付固定的展示费：助手列名单、准备草稿时都要说明（和名单页上方的说明一致）
+const PAID_LISTING = '以下服务商向在留导航支付固定的展示费（不按咨询数或成交付费），排列按入驻先后，平台不推荐某一家。';
+const PROMO_NOTE = '这一类不是士业，名单上标明“含推广”。';
 function execTool(name, input, ctx) {
   input = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const u = ctx.user;
@@ -66,15 +69,20 @@ function execTool(name, input, ctx) {
   if (name === 'suggest_providers') {
     const e = eng(); const c = e.CATS.find((x) => x[0] === input.category);
     if (!c) throw new Error('服务类别无效');
-    const list = ctx.store ? ctx.store.listProviders(c[0]).map((p) => ({ providerId: p.id, name: p.name, area: p.area, langs: p.langs, feeNote: p.feeNote, promoted: p.feeModel === 'affiliate_disclosed' })) : [];
-    return { category: c[1], what: c[2], regulated: !!e.REGULATED[c[0]], providers: list, note: '按入驻顺序列出，由用户自己选择，助手不推荐某一家。' + (list.length ? '' : '这一类还没有入驻的服务商。') };
+    // 含推广按类别定（非士业一律标），和名单页一样；展示费的说明每次都带上，助手要照着告诉用户（ステマ規制）
+    const promoted = !e.REGULATED[c[0]];
+    const list = ctx.store ? ctx.store.listProviders(c[0]).map((p) => ({ providerId: p.id, name: p.name, area: p.area, langs: p.langs, feeNote: p.feeNote, promoted })) : [];
+    return { category: c[1], what: c[2], regulated: !!e.REGULATED[c[0]], providers: list, disclosure: PAID_LISTING + (promoted ? PROMO_NOTE : ''), note: '按入驻顺序列出，由用户自己选择，助手不推荐某一家。' + (list.length ? '介绍名单时要把 disclosure 的内容告诉用户' + (promoted ? '，并在每家后面标明“含推广”' : '') + '。' : '这一类还没有入驻的服务商。') };
   }
   if (name === 'create_inquiry') {
     // 只准备草稿，不写库、不发送。校验和 POST /inquiries 用同一个函数；真正发送只能由用户在页面上带 consent:true 调接口。
     if (!ctx.store) throw new Error('当前环境不能准备咨询');
     const e = eng();
-    const d = validateInquiry(input, { hasCategory: (k) => e.CATS.some((c) => c[0] === k), hasNode: (id) => e.NODES.some((n) => n.id === id), getProvider: (id) => ctx.store.getProvider(id) });
-    return { draft: { category: d.category, nodeId: d.nodeId, summary: d.summary, providerIds: d.providerIds, providers: d.providers }, sent: false,
+    // 和 POST /inquiries 一样只认此刻在名单上展示的服务商（在架，并且展示费已付或不收费）：批准了但没付款的不能出现在草稿里
+    const getProvider = (id) => { const p = ctx.store.getProvider(id); return p && Object.assign(p, { active: p.active && ctx.store.providerListing(id).listed }); };
+    const d = validateInquiry(input, { hasCategory: (k) => e.CATS.some((c) => c[0] === k), hasNode: (id) => e.NODES.some((n) => n.id === id), getProvider });
+    const promoted = !e.REGULATED[d.category];
+    return { draft: { category: d.category, nodeId: d.nodeId, summary: d.summary, providerIds: d.providerIds, providers: d.providers.map((p) => Object.assign({}, p, { promoted })), disclosure: PAID_LISTING + (promoted ? PROMO_NOTE : '') }, sent: false,
       note: '草稿已经显示在用户的页面上，还没有发送。请告诉用户：在页面上核对摘要、勾选同意后自己点发送。不要说已经发送。' };
   }
   throw new Error('未知工具：' + name);

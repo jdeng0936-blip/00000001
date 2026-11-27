@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>服务商入驻申请｜在留导航</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0;font:16px/1.75 system-ui,-apple-system,"PingFang SC","Hiragino Sans GB","Noto Sans SC",sans-serif;background:#f6f5f1;color:#1d1d1b}
+main{max-width:720px;margin:0 auto;padding:24px 18px 64px}
+h1{font-size:24px;margin:8px 0 4px}h2{font-size:18px;margin:4px 0 6px}
+p,li{margin:6px 0}small,.muted{color:#5d5d57}a{color:#0f5f5a}
+label{display:block;margin:10px 0 2px}
+.draft{border:1px solid #b9770e;background:#fdf3dd;color:#5a3a05;padding:10px 12px;border-radius:8px}
+.ok{border:1px solid #2f7d4f;background:#e6f4ea;color:#1d4d31;padding:10px 12px;border-radius:8px}
+textarea,input,button,select{font:inherit}textarea,input,select{width:100%;box-sizing:border-box;padding:8px;border:1px solid #bdbbb2;border-radius:8px;background:#fff;color:inherit}
+input[type=checkbox]{width:auto;margin-right:6px}
+button{padding:8px 14px;border-radius:8px;border:1px solid #0f5f5a;background:#0f5f5a;color:#fff;cursor:pointer}button.ghost{background:transparent;color:#0f5f5a}
+.card{background:#fff;border:1px solid #d9d7cf;border-radius:10px;padding:12px 14px;margin:12px 0}
+@media (prefers-color-scheme:dark){body{background:#161614;color:#ecebe6}.card,textarea,input,select{background:#1f1f1c;border-color:#3a3a35}small,.muted{color:#a9a79f}a{color:#6fc9c1}.draft{background:#3a2c0c;color:#f3deb0;border-color:#8a6a1c}.ok{background:#12301f;color:#cfe9d8;border-color:#2f7d4f}button.ghost{color:#6fc9c1;border-color:#6fc9c1}}
+</style>
+</head>
+<body>
+<main>
+<h1>服务商入驻申请</h1>
+<p class="muted">面向在日本为外国人提供手续服务的士业事务所和事业者。审核时我们会对照所属会的公开检索核对登录番号。入驻后按固定的展示费收费（不按咨询数或成交数收费，士业不支付介绍费），详见<a href="/provider-terms.html" target="_blank" id="terms-link">服务商条款</a>。</p>
+
+<div class="card" id="step1">
+  <h2>第一步：验证联系邮箱</h2>
+  <p class="muted">这个邮箱用来接收审核结果、领取工作台的令牌、账单和新咨询通知，不会公开。</p>
+  <label for="ap-email">联系邮箱</label><input id="ap-email" type="email" autocomplete="email">
+  <p><button type="button" id="ap-send">发送验证码</button> <span id="ap-send-msg" role="status"></span></p>
+  <label for="ap-code">邮件里的 6 位验证码</label><input id="ap-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+</div>
+
+<div class="card" id="form">
+  <h2 id="form-h">第二步：填写申请</h2>
+  <label for="ap-cat">服务类别</label><select id="ap-cat"></select>
+  <label for="ap-name">事务所或公司名称</label><input id="ap-name" maxlength="80">
+  <label for="ap-address">事务所地址（会公开在名单上）</label><input id="ap-address" maxlength="200">
+  <div id="lic-box">
+    <label for="ap-lic" id="ap-lic-label">登录番号</label><input id="ap-lic" maxlength="40">
+    <small id="ap-lic-hint"></small>
+    <div id="body-box"><label for="ap-body" id="ap-body-label">所属会</label><input id="ap-body" maxlength="30"></div>
+  </div>
+  <label for="ap-fee">收费说明（例：首次咨询30分钟5,500日元；不能有夸大或承诺结果的用语）</label><textarea id="ap-fee" rows="2" maxlength="200"></textarea>
+  <label for="ap-area">服务区域</label><input id="ap-area" maxlength="100">
+  <label for="ap-langs">可以使用的语言</label><input id="ap-langs" maxlength="100">
+  <p><label style="display:inline"><input type="checkbox" id="ap-agree">我已阅读并同意<a href="/provider-terms.html" target="_blank">服务商条款</a>（版本 <span id="ap-terms-v"></span>）</label></p>
+  <p class="muted">请不要在任何一栏里写个人编号、护照号、银行账号这类号码，系统会拦下。</p>
+  <p><button type="button" id="ap-submit">提交申请</button> <button type="button" class="ghost" id="ap-cancel-edit" hidden>取消修改</button> <span id="ap-msg" role="status"></span></p>
+</div>
+<p class="ok" id="ap-done" role="status" hidden></p>
+
+<div class="card" id="view">
+  <h2>查看或修改申请</h2>
+  <p class="muted">用申请时的邮箱收验证码，查看审核进度；被要求修改时可以改后重新提交，审核完之前可以撤回。</p>
+  <label for="vw-email">联系邮箱</label><input id="vw-email" type="email" autocomplete="email">
+  <p><button type="button" class="ghost" id="vw-send">发送验证码</button> <span id="vw-send-msg" role="status"></span></p>
+  <label for="vw-code">邮件里的 6 位验证码</label><input id="vw-code" inputmode="numeric" maxlength="6">
+  <p><button type="button" id="vw-open">查看</button> <span id="vw-msg" role="status"></span></p>
+  <div id="vw-out"></div>
+</div>
+</main>
+<script>
+// 页面上所有来自服务器和用户的文字都用 textContent 放进去，不拼 HTML。
+var TERMS="",CATS=[],CH={ap:null,vw:null},EDIT=null;
+// 登录番号的写法提示（格式由服务器检查，这里只是提示）
+var LIC={gyosei:["行政書士の登録番号（8 位数字）","所属行政書士会（例：大阪府行政書士会）"],zeirishi:["税理士登録番号（1 至 6 位数字）","所属税理士会（例：近畿税理士会）"],sharoshi:["社会保険労務士の登録番号（8 位数字）","所属社会保険労務士会（例：大阪府社会保険労務士会）"],shiho:["司法書士の登録番号（1 至 5 位数字）","所属司法書士会（例：大阪司法書士会）"],estate:["宅地建物取引業の免許番号（例：大阪府知事（3）第12345号）",""]};
+var STATUS={pending:"审核中",approved:"已批准",rejected:"未通过",changes_requested:"需要修改",withdrawn:"已撤回"};
+function $(i){return document.getElementById(i)}
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+function api(m,p,b){return fetch("/api"+p,{method:m,headers:{"content-type":"application/json"},body:b?JSON.stringify(b):undefined}).then(function(r){if(r.status===204)return null;return r.json().catch(function(){return {}}).then(function(j){if(!r.ok){var e=new Error(j&&typeof j.error==="string"?j.error:"服务器出了点问题（"+r.status+"），请稍后再试。");e.status=r.status;throw e}return j})},function(){var e=new Error("连不上服务器，请检查网络后再试。");e.status=0;throw e})}
+function licUI(){var c=$("ap-cat").value,l=LIC[c];
+  $("ap-lic-label").textContent=l?l[0]:"法人番号（13 位，选填；不是法人可以不填）";$("ap-lic-hint").textContent=l?"全角、半角都可以；「第」「号」可写可不写。":"";
+  $("body-box").hidden=!(l&&l[1]);if(l&&l[1])$("ap-body-label").textContent=l[1]}
+function sendCode(which){var em=$(which+"-email").value.trim(),msg=$(which+"-send-msg"),b=$(which+"-send");if(!em){msg.textContent="请先填邮箱。";return}
+  b.disabled=true;msg.textContent="";api("POST","/provider-apply/code",{email:em}).then(function(r){CH[which]=r.challengeId;msg.textContent="验证码已发出，10 分钟内有效。";b.disabled=false},function(e){msg.textContent=e.message;b.disabled=false})}
+function fields(){return {category:$("ap-cat").value,name:$("ap-name").value,address:$("ap-address").value,licenseNo:$("ap-lic").value,licenseBody:$("body-box").hidden?"":$("ap-body").value,feeNote:$("ap-fee").value,area:$("ap-area").value,langs:$("ap-langs").value,agree:$("ap-agree").checked?TERMS:""}}
+function fill(a){$("ap-cat").value=a.category;licUI();$("ap-name").value=a.name;$("ap-address").value=a.address;$("ap-lic").value=a.licenseNo;$("ap-body").value=a.licenseBody;$("ap-fee").value=a.feeNote;$("ap-area").value=a.area;$("ap-langs").value=a.langs;$("ap-agree").checked=false}
+function setEdit(x){EDIT=x;$("step1").hidden=!!x;$("ap-cancel-edit").hidden=!x;$("form-h").textContent=x?"修改申请（编号 "+x.ref+"）":"第二步：填写申请";$("ap-submit").textContent=x?"重新提交":"提交申请";$("ap-msg").textContent=""}
+$("ap-cat").onchange=licUI;
+$("ap-send").onclick=function(){sendCode("ap")};
+$("vw-send").onclick=function(){sendCode("vw")};
+$("ap-cancel-edit").onclick=function(){setEdit(null)};
+$("ap-submit").onclick=function(){
+  var msg=$("ap-msg"),b=$("ap-submit"),f=fields();msg.textContent="";
+  if(!$("ap-agree").checked){msg.textContent="要先阅读并同意服务商条款。";return}
+  var req;
+  if(EDIT){f.proof=EDIT.proof;req=api("PUT","/provider-apply/"+encodeURIComponent(EDIT.ref),f)}
+  else{if(!CH.ap){msg.textContent="请先发送验证码。";return}f.challengeId=CH.ap;f.code=$("ap-code").value.trim();req=api("POST","/provider-apply",f)}
+  b.disabled=true;
+  req.then(function(r){b.disabled=false;var d=$("ap-done");d.hidden=false;
+    d.textContent=EDIT?"已重新提交（编号 "+EDIT.ref+"），审核结果会发到联系邮箱。":"申请已提交。申请编号："+r.ref+"。审核结果会发到联系邮箱。";
+    if(!EDIT){$("ap-done").dataset.ref=r.ref}setEdit(null);$("form").hidden=true;$("step1").hidden=true},
+  function(e){b.disabled=false;msg.textContent=e.message})};
+function showApp(a,proof){
+  var out=$("vw-out");out.textContent="";var c=el("div");
+  c.appendChild(el("p",null,"申请编号："+a.ref+"　状态："+(STATUS[a.status]||a.status)));
+  c.appendChild(el("p","muted",a.name+"　"+a.address));
+  if(a.reviewMsg){var r=el("p","draft","审核人员的说明："+a.reviewMsg);r.style.whiteSpace="pre-wrap";c.appendChild(r)}
+  if(a.status==="approved")c.appendChild(el("p",null,"已批准。请按批准邮件里的步骤，在服务商工作台用联系邮箱领取令牌，并付展示费。"));
+  var row=el("p");
+  if(a.status==="changes_requested"){var e=el("button",null,"修改并重新提交");e.type="button";e.id="vw-edit";e.onclick=function(){fill(a);setEdit({ref:a.ref,proof:proof});$("form").hidden=false;$("ap-done").hidden=true;$("form").scrollIntoView({block:"start"})};row.appendChild(e);row.appendChild(document.createTextNode(" "))}
+  if(a.status==="pending"||a.status==="changes_requested"){var w=el("button","ghost","撤回申请");w.type="button";w.id="vw-withdraw";var note=el("span");note.setAttribute("role","status");
+    w.onclick=function(){if(!confirm("确定撤回这份申请吗？撤回后要重新申请。"))return;w.disabled=true;api("DELETE","/provider-apply/"+encodeURIComponent(a.ref),{proof:proof}).then(function(){a.status="withdrawn";a.reviewMsg="";showApp(a,proof)},function(er){w.disabled=false;note.textContent=" "+er.message})};row.appendChild(w);row.appendChild(note)}
+  c.appendChild(row);out.appendChild(c);
+}
+$("vw-open").onclick=function(){var msg=$("vw-msg");msg.textContent="";if(!CH.vw){msg.textContent="请先发送验证码。";return}
+  api("POST","/provider-apply/open",{challengeId:CH.vw,code:$("vw-code").value.trim()}).then(function(r){showApp(r.application,r.proof)},function(e){msg.textContent=e.message})};
+Promise.all([api("GET","/provider-terms"),api("GET","/providers/categories")]).then(function(x){TERMS=x[0].version;$("ap-terms-v").textContent=TERMS;CATS=x[1];
+  var s=$("ap-cat");CATS.forEach(function(c){var o=el("option",null,c.name);o.value=c.key;s.appendChild(o)});s.value="gyosei";licUI()},function(e){$("ap-msg").textContent="页面没有准备好："+e.message});
+</script>
+</body>
+</html>

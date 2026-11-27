@@ -1,5 +1,6 @@
 // 端到端：真实浏览器打开网页，数据应当存到服务器，换一个“设备”带同一账号能读回来。
-// 运行：先启动服务器（ADMIN_TOKEN 要和这里的一致，默认 e2e-admin），再 BASE=http://localhost:端口 node e2e/browser.js
+// 运行：npm run e2e（e2e/run.js 起好服务器再跑这里）。服务器要开 allowDirectProvider（前面几步直接入驻服务商）、ADMIN_TOKEN 和 ADMIN_TOKENS 里的 e2e 要和这里的一致，
+// 新咨询通知不延迟；这几项只能用 createApp 的参数设，所以对着 npm start 起的服务器跑不了服务商的那几步。
 // 需要已安装 playwright。助手没有配置密钥也能跑：助手接口的返回在浏览器里用 page.route 替换成固定内容，
 // 其余请求（发咨询、删账号、保存等）都打到真实的服务器上。
 // E2E_KEEP_GOING=1 时某一步失败后继续跑后面的步骤，最后一并报告（用来确认新加的检查在旧页面上确实会失败）。
@@ -21,6 +22,8 @@ async function step(name, fn) {
   let dialogs = [], acceptDialog = true;
   p.on('dialog', (d) => { dialogs.push(d.message()); return acceptDialog ? d.accept() : d.dismiss(); });
   const adm = { authorization: 'Bearer ' + (process.env.ADMIN_TOKEN || 'e2e-admin'), 'content-type': 'application/json' };
+  // 有名字的管理员令牌（ADMIN_TOKENS 里的 e2e），审核入驻申请用：核对记录里记下的核对人是 e2e
+  const REVIEWER = process.env.E2E_REVIEWER_TOKEN || 'e2e-reviewer-token-0123456789';
   const json = async (path, opt) => (await fetch(base + path, opt)).json();
   const go = (hash) => p.evaluate((x) => { location.hash = x; }, hash);
   const apiReady = (page) => page.waitForFunction(() => window.ZAIRYU_API === true, null, { timeout: 8000 });
@@ -100,7 +103,7 @@ async function step(name, fn) {
   });
 
   await step('咨询申请：没勾同意不能发；服务商或文字一变，同意的勾就取消；疑似敏感号码被拒并说明原因', async () => {
-    const mk = (name) => json('/api/admin/providers', { method: 'POST', headers: adm, body: JSON.stringify({ name, category: 'gyosei', area: '大阪', langs: '中文', feeNote: '首次咨询免费30分钟', licenseNo: '第12345678号' }) });
+    const mk = (name) => json('/api/admin/providers', { method: 'POST', headers: adm, body: JSON.stringify({ name, category: 'gyosei', area: '大阪', langs: '中文', feeNote: '首次咨询免费30分钟', licenseNo: '第12345678号', licenseBody: '大阪府行政書士会' }) });
     provA = await mk(NAME_A); provB = await mk(NAME_B);
     assert.ok(provA.token && provB.token, '应当拿到服务商令牌');
     await go('#providers'); await p.selectOption('#pv-cat', 'gyosei');
@@ -161,6 +164,8 @@ async function step(name, fn) {
     assert.equal(await card.count(), 1, '应当出现草稿卡片');
     const txt = await card.innerText();
     assert.ok(txt.includes('事务所甲') && txt.includes('事务所乙'), '卡片上应当有服务商的名字');
+    assert.ok(txt.includes('固定的展示费'), '草稿卡片上也要写明服务商付展示费');
+    assert.equal(await card.locator('.draft-promo').count(), 0, '士业不标含推广');
     assert.ok(txt.includes('想请行政书士看一下在留期间更新的材料') && txt.includes('<b>不是标签</b>'), '卡片上应当原样显示摘要');
     assert.equal(await p.locator('#chat .draft img, #chat .draft b').count(), 0, '名字和摘要里的标签不应当被当成 HTML');
     assert.equal(await p.evaluate(() => window.__xss), undefined, '不应当执行注入的脚本');
@@ -178,6 +183,19 @@ async function step(name, fn) {
     assert.equal(gotA.length, 2, '两家都应当收到');
     assert.equal(await card.locator('.draft-send').count(), 0, '发出以后不能再点一次');
     await p.screenshot({ path: '/tmp/e2e-draft.png' });
+    await p.evaluate(() => closeDrawer());
+  });
+
+  await step('助手的咨询草稿：非士业的服务商在卡片上标“含推广”', async () => {
+    chat = (body) => ({ body: { text: '草稿准备好了。', category: null, toolCalls: [{ name: 'create_inquiry', ok: true }], history: turn(body, '草稿准备好了'),
+      draft: { category: 'edu', nodeId: null, summary: '想了解在职读硕士的课程。', providerIds: ['00000000-0000-4000-8000-000000000001'], providers: [{ id: '00000000-0000-4000-8000-000000000001', name: '某学校<i>x</i>' }] } } });
+    await p.evaluate(() => openDrawer()); await ask('帮我问问学校');
+    const card = p.locator('#chat .draft:not(.sent)');
+    assert.equal(await card.count(), 1);
+    assert.equal(await card.locator('.draft-promo').innerText(), '含推广');
+    assert.ok((await card.innerText()).includes('某学校<i>x</i>'), '名字原样显示');
+    assert.equal(await card.locator('i').count(), 0);
+    await card.locator('.draft-drop').click();
     await p.evaluate(() => closeDrawer());
   });
 
@@ -540,6 +558,175 @@ async function step(name, fn) {
     assert.equal((await fetch(`${base}/api/users/${acct.id}`, { headers: h })).status, 401, '服务器上的账号应当已经删除');
     assert.equal((await provInq(provA)).length, 0, '发给服务商的咨询也应当一并删除');
     assert.equal(await p.evaluate(() => localStorage.getItem('zairyu-account')), null, '删除后没有再同意之前不应当新建账号');
+  });
+
+  await step('更换邮箱：先输入发到原来邮箱的验证码，再输入发到新邮箱的验证码（两个都从发件箱读）；原来的邮箱收到告知；解除也要原来邮箱的验证码', async () => {
+    // 新开一个“设备”建一个新账号（注册时的设备没有 24 小时的冷静期）
+    const ctx6 = await b.newContext({ viewport: { width: 390, height: 844 } }); const p6 = await ctx6.newPage(); p6.on('pageerror', (e) => errs.push(e.message));
+    const d6 = []; p6.on('dialog', (d) => { d6.push(d.message()); return d.accept(); });
+    await p6.goto(base + '/'); await p6.waitForSelector('#consent-ok', { timeout: 5000 }); await p6.click('#consent-ok'); await apiReady(p6);
+    const a6 = await p6.evaluate(() => JSON.parse(localStorage.getItem('zairyu-account')));
+    const h6 = { authorization: 'Bearer ' + a6.token };
+    const OLD = 'e2e.change.old@example.com', NEW = 'e2e.change.new@example.com';
+    await p6.evaluate(() => { location.hash = '#route'; }); await p6.evaluate(() => { document.getElementById('prof').open = true; });
+    await p6.waitForSelector('#em-addr', { timeout: 5000 });
+    await p6.fill('#em-addr', OLD); await p6.check('#em-ok'); await p6.click('#em-send');
+    await p6.waitForSelector('#em-code', { timeout: 5000 });
+    const first = await mailCode(OLD);
+    await p6.fill('#em-code', first.code); await p6.click('#em-verify');
+    await p6.waitForFunction(() => /已绑定邮箱：e\*\*\*@example\.com/.test(document.getElementById('em-state').textContent), null, { timeout: 5000 });
+    // 绑着邮箱时没有直接填新邮箱的输入框；有“更换邮箱”“解除绑定”和原邮箱收不到信时的说明
+    assert.equal(await p6.isVisible('#em-addr'), false, '没验证原来的邮箱之前不能填新邮箱');
+    assert.match(await p6.innerText('#em-lost'), /没有别的办法绕过/);
+    await p6.click('#em-change');
+    await p6.waitForSelector('#em-old-code', { timeout: 5000 });
+    assert.match(await p6.innerText('#em-msg'), /验证码已经发到现在绑定的邮箱（e\*\*\*@example\.com）/);
+    const oldMail = await mailCode(OLD, [first.id]);
+    // 填错：说明原因，还停在这一步
+    await p6.fill('#em-old-code', oldMail.code === '000000' ? '111111' : '000000'); await p6.click('#em-old-verify');
+    await p6.waitForFunction(() => /验证码没有通过：验证码不对或已过期/.test(document.getElementById('em-msg').textContent), null, { timeout: 5000 });
+    assert.equal(await p6.isVisible('#em-addr'), false);
+    await p6.fill('#em-old-code', oldMail.code); await p6.click('#em-old-verify');
+    await p6.waitForSelector('#em-addr', { timeout: 5000 });
+    assert.match(await p6.innerText('#em-msg'), /原来的邮箱已确认/);
+    await p6.fill('#em-addr', NEW); await p6.check('#em-ok'); await p6.click('#em-send');
+    await p6.waitForSelector('#em-code', { timeout: 5000 });
+    const newMail = await mailCode(NEW);
+    await p6.fill('#em-code', newMail.code); await p6.click('#em-verify');
+    await p6.waitForFunction(() => /邮箱已更换/.test(document.getElementById('em-msg').textContent), null, { timeout: 5000 });
+    assert.deepEqual(await json(`/api/users/${a6.id}/email`, { headers: h6 }), { email: 'e***@example.com', verified: true, remindOptIn: false });
+    // 原来的邮箱收到“已经更换”的告知（发出后记录里不留地址）
+    const t0 = Date.now(); let bye = [];
+    while (Date.now() - t0 < 5000 && !bye.length) { bye = (await json('/api/admin/outbox', { headers: adm })).filter((r) => r.kind === 'last' && /已经更换/.test(r.subject) && r.status === 'sent'); if (!bye.length) await p6.waitForTimeout(100); }
+    assert.equal(bye.length, 1, '原来的邮箱应当收到告知'); assert.equal(bye[0].to, '', '告知发出后不留地址');
+    await p6.screenshot({ path: '/tmp/e2e-change-email.png', fullPage: true });
+    // 解除：先确认，再输入发到现在这个邮箱（NEW）的验证码
+    await p6.click('#em-remove');
+    await p6.waitForSelector('#em-old-code', { timeout: 5000 });
+    assert.equal(d6.length, 1); assert.match(d6[0], /解除之前要先输入发到这个邮箱的验证码/);
+    const rmMail = await mailCode(NEW, [newMail.id]);
+    await p6.fill('#em-old-code', rmMail.code); await p6.click('#em-old-verify');
+    await p6.waitForFunction(() => /还没有绑定邮箱/.test(document.getElementById('em-state').textContent), null, { timeout: 5000 });
+    assert.match(await p6.innerText('#em-msg'), /已解除绑定/);
+    assert.deepEqual(await json(`/api/users/${a6.id}/email`, { headers: h6 }), { email: null, verified: false, remindOptIn: false });
+    assert.ok(!(await p6.innerText('#acct-box')).includes('e2e.change'), '页面上不显示完整的邮箱');
+    await ctx6.close();
+  });
+
+  await step('服务商入驻：申请页填写（验证码从发件箱读）→ 管理后台批准（要填核对方式）→ 工作台用联系邮箱领取令牌 → 付款确认前不展示 → 标记已付款后展示 → 用户发咨询 → 通知邮件里没有咨询内容 → 工作台回复 → 关掉通知 → 下架后 401', async () => {
+    const PE = 'e2e.office@example.jp', PNAME = '端到端中文行政书士事务所<b>不是标签</b>', SUM = '想咨询经营管理签证的更新，公司第二年。';
+    const reviewer = { authorization: 'Bearer ' + REVIEWER, 'content-type': 'application/json' };
+    const code = async (to, after) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 5000) {
+        const rows = (await json('/api/admin/outbox?to=' + encodeURIComponent(to), { headers: reviewer })).filter((r) => r.kind === 'code' && !(after || []).includes(r.id));
+        if (rows.length) { const r = rows[rows.length - 1]; return { id: r.id, code: /验证码：(\d{6})/.exec(r.body)[1] }; }
+        await p.waitForTimeout(100);
+      }
+      throw new Error('发件箱里没有发给 ' + to + ' 的验证码邮件');
+    };
+    const page = async (path) => { const x = await ctx.newPage(); x.on('pageerror', (e) => errs.push(e.message)); x.on('dialog', (d) => d.accept()); await x.goto(base + path); return x; };
+    // 1. 申请页：验证码从发件箱读；没勾条款、收费说明里有保证类用语都被拦下并显示服务器的说明
+    const pa = await page('/provider-apply.html');
+    await pa.waitForFunction(() => document.querySelectorAll('#ap-cat option').length > 3, null, { timeout: 5000 });
+    await pa.fill('#ap-email', PE); await pa.click('#ap-send');
+    await pa.waitForFunction(() => /已发出/.test(document.getElementById('ap-send-msg').textContent), null, { timeout: 5000 });
+    const c1 = await code(PE);
+    await pa.fill('#ap-code', c1.code); await pa.selectOption('#ap-cat', 'gyosei');
+    assert.equal(await pa.isVisible('#ap-body'), true, '士业要填所属会');
+    await pa.fill('#ap-name', PNAME); await pa.fill('#ap-address', '大阪府大阪市中央区本町1-1-1'); await pa.fill('#ap-lic', '第１２３４５６７８号'); await pa.fill('#ap-body', '大阪府行政書士会');
+    await pa.fill('#ap-fee', '首次咨询30分钟5,500日元，包过'); await pa.fill('#ap-area', '大阪'); await pa.fill('#ap-langs', '中文、日语');
+    await pa.click('#ap-submit'); assert.match(await pa.innerText('#ap-msg'), /同意服务商条款/);
+    await pa.check('#ap-agree'); await pa.click('#ap-submit');
+    await pa.waitForFunction(() => /保证类/.test(document.getElementById('ap-msg').textContent), null, { timeout: 5000 });
+    await pa.fill('#ap-fee', '首次咨询30分钟5,500日元'); await pa.click('#ap-submit');
+    await pa.waitForSelector('#ap-done:not([hidden])', { timeout: 5000 });
+    const ref = await pa.evaluate(() => document.getElementById('ap-done').dataset.ref);
+    assert.match(ref, /^A[0-9A-Z]{7}$/); assert.match(await pa.innerText('#ap-done'), new RegExp(ref));
+    await pa.screenshot({ path: '/tmp/e2e-provider-apply.png', fullPage: true }); await pa.close();
+    // 2. 管理后台：不选核对方式批准不了；选了才批准，记下核对人
+    const pad = await page('/admin.html');
+    await pad.fill('#adm-token', REVIEWER); await pad.click('#adm-go');
+    const card = pad.locator('#apps .card', { hasText: ref });
+    await card.waitFor({ timeout: 5000 });
+    assert.equal(await pad.locator('#apps b').evaluateAll((l) => l.filter((x) => x.textContent === '不是标签').length), 0, '名称里的标签不应当被当成 HTML');
+    assert.match(await card.innerText(), /e\*\*\*@example\.jp/, '管理员看到的邮箱是打码的');
+    await card.locator('button.approve').click();
+    await pad.waitForFunction((r) => /核对/.test(document.querySelector('#apps .card[data-ref="' + r + '"] [role=status]').textContent), ref, { timeout: 5000 });
+    await card.locator('select.chk-method').selectOption('association_search'); await card.locator('input.chk-note').fill('会员检索一致');
+    await card.locator('button.approve').click();
+    await pad.waitForFunction((r) => !document.querySelector('#apps .card[data-ref="' + r + '"]'), ref, { timeout: 5000 });
+    const app = (await json('/api/admin/applications?status=approved', { headers: reviewer })).find((x) => x.ref === ref);
+    assert.equal(app.licenseCheck.checkedBy, 'e2e', '核对人是用哪个管理员令牌批准的');
+    // 3. 工作台：用联系邮箱领取令牌（验证码从发件箱读），令牌只显示一次；批准邮件里没有令牌
+    const pw = await page('/provider.html');
+    await pw.click('#claim-box summary'); await pw.fill('#cl-email', PE); await pw.click('#cl-send');
+    await pw.waitForFunction(() => /验证码已经发出/.test(document.getElementById('cl-send-msg').textContent), null, { timeout: 5000 });
+    const c2 = await code(PE, [c1.id]);
+    await pw.fill('#cl-code', c2.code); await pw.click('#cl-go');
+    await pw.waitForSelector('#cl-out:not([hidden])', { timeout: 5000 });
+    const ptok = await pw.innerText('#cl-token');
+    assert.ok(ptok.length >= 40, '应当显示新令牌');
+    const pmails = await json('/api/admin/outbox?to=' + encodeURIComponent(PE), { headers: reviewer });
+    assert.ok(pmails.some((m) => /已批准/.test(m.subject)), '应当有批准邮件'); assert.ok(pmails.every((m) => !m.body.includes(ptok)), '任何邮件里都没有令牌');
+    await pw.click('#cl-use');
+    await pw.waitForSelector('#listing', { timeout: 5000 });
+    assert.match(await pw.innerText('#listing'), /不在名单上展示/, '付款确认前不展示');
+    await pw.waitForFunction(() => /待付款/.test(document.getElementById('billing').innerText), null, { timeout: 5000 });
+    assert.match(await pw.innerText('#billing'), /ZN\d{4}-/);
+    // 4. 付款确认前：首页名单上没有
+    const pid = app.providerId;
+    assert.ok(!(await json('/api/providers?category=gyosei')).some((x) => x.id === pid), '付款确认前不在名单上');
+    // 5. 管理后台标记已付款
+    await pad.click('#tab-invoices');
+    const icard = pad.locator('#invoices .card', { hasText: PNAME });
+    await icard.waitFor({ timeout: 5000 }); await icard.locator('button.mark-paid').click();
+    await pad.waitForFunction((n) => ![...document.querySelectorAll('#invoices .card')].some((c) => c.textContent.includes(n)), PNAME, { timeout: 5000 });
+    // 6. 用户（新设备）在首页看到这家：名单上方写着展示费；所属会和事务所地址
+    const cu = await b.newContext({ viewport: { width: 390, height: 844 } }); const pu = await cu.newPage(); pu.on('pageerror', (e) => errs.push(e.message));
+    await pu.goto(base + '/'); await pu.waitForSelector('#consent-ok', { timeout: 5000 }); await pu.click('#consent-ok'); await apiReady(pu);
+    await pu.evaluate(() => { location.hash = '#providers'; }); await pu.selectOption('#pv-cat', 'zeirishi'); await pu.selectOption('#pv-cat', 'gyosei');
+    const pcard = pu.locator('#pv-list .card', { hasText: '端到端中文行政书士事务所' });
+    await pcard.waitFor({ timeout: 5000 });
+    assert.equal(await pu.isVisible('#pv-fee'), true); assert.match(await pu.innerText('#pv-fee'), /支付固定的展示费；士业不按成交或咨询数付费；排列按入驻先后/);
+    const ptext = await pcard.innerText();
+    assert.match(ptext, /所属会：大阪府行政書士会/); assert.match(ptext, /事务所地址：大阪府大阪市中央区本町1-1-1/); assert.match(ptext, /登录番号 12345678/);
+    assert.equal(await pcard.locator('b b').count(), 0, '名称里的标签不应当被当成 HTML');
+    assert.ok(!ptext.includes('@'), '联系邮箱不公开');
+    // 7. 用户发咨询
+    await pcard.locator('input[type=checkbox]').check(); await pu.fill('#pv-msg', SUM); await pu.check('#pv-ok'); await pu.click('#pv-send');
+    await pu.waitForFunction(() => document.getElementById('inq-list').innerText.includes('端到端中文行政书士事务所'), null, { timeout: 5000 });
+    // 8. 跑一轮：联系邮箱收到新咨询通知，里面没有咨询内容
+    const run = await json('/api/admin/billing/run', { method: 'POST', headers: reviewer });
+    assert.equal(run.notices, 1, '跑一轮应当排一封新咨询通知：' + JSON.stringify(run));
+    const note = (await json('/api/admin/outbox?to=' + encodeURIComponent(PE), { headers: reviewer })).filter((m) => m.kind === 'pnotice');
+    assert.equal(note.length, 1); assert.match(note[0].subject, /有 1 条新咨询/); assert.match(note[0].body, /类别：行政书士/);
+    const uacct = await pu.evaluate(() => JSON.parse(localStorage.getItem('zairyu-account')));
+    for (const bad of [SUM, '经营管理', uacct.id]) assert.ok(!note[0].body.includes(bad), '通知邮件里不应当有：' + bad);
+    // 9. 工作台回复
+    await pw.evaluate(() => load()); await pw.waitForSelector('#list textarea', { timeout: 5000 });
+    assert.match(await pw.innerText('#list'), /经营管理签证的更新/);
+    await pw.locator('#list textarea').first().fill('可以办理。请准备决算书和纳税证明，报酬8万日元起。');
+    await pw.locator('#list .card').first().locator('button', { hasText: '发送回复' }).click();
+    await pw.waitForFunction(() => document.getElementById('list').innerText.includes('你的回复'), null, { timeout: 5000 });
+    await pu.reload(); await apiReady(pu); await pu.evaluate(() => { location.hash = '#providers'; });
+    await pu.waitForFunction(() => document.getElementById('inq-list').innerText.includes('报酬8万日元起'), null, { timeout: 5000 });
+    // 10. 关掉新咨询通知
+    await pw.reload(); await pw.fill('#tok', ptok); await pw.click('#go'); await pw.waitForSelector('#notify', { timeout: 5000 });
+    assert.equal(await pw.isChecked('#notify'), true);
+    await pw.uncheck('#notify'); await pw.waitForTimeout(400);
+    assert.equal((await json('/api/provider/me', { headers: { authorization: 'Bearer ' + ptok } })).notify, false);
+    await pw.screenshot({ path: '/tmp/e2e-provider-onboard.png', fullPage: true });
+    // 11. 管理后台下架：工作台马上 401
+    await pad.click('#tab-providers');
+    const prow = pad.locator('#providers .card', { hasText: '端到端中文行政书士事务所' });
+    await prow.waitFor({ timeout: 5000 }); await prow.locator('button.deactivate').click();
+    await pad.waitForFunction(() => /已下架/.test(document.getElementById('providers').innerText), null, { timeout: 5000 });
+    await pw.evaluate(() => load());
+    await pw.waitForFunction(() => /令牌不对/.test(document.getElementById('list-msg').textContent), null, { timeout: 5000 });
+    assert.ok(!(await json('/api/providers?category=gyosei')).some((x) => x.id === pid), '下架后不在名单上');
+    await pad.screenshot({ path: '/tmp/e2e-admin.png', fullPage: true });
+    await pad.close(); await pw.close(); await cu.close();
   });
 
   await step('页面没有脚本错误', async () => { assert.deepEqual(errs, [], '页面不应有脚本错误'); });

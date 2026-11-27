@@ -5,7 +5,7 @@ const { createApp } = require('../src/server');
 
 const V = '2026-11-27';
 async function start(opts) {
-  const app = createApp(Object.assign({ now: '2026-11-26', adminToken: 'adm' }, opts));
+  const app = createApp(Object.assign({ now: '2026-11-26', adminToken: 'adm', allowDirectProvider: true }, opts));
   await new Promise((ok) => app.server.listen(0, '127.0.0.1', ok));
   const base = 'http://127.0.0.1:' + app.server.address().port;
   const call = async (method, path, body, token) => {
@@ -14,7 +14,7 @@ async function start(opts) {
     return { status: r.status, headers: r.headers, body: text ? JSON.parse(text) : null };
   };
   const newUser = async () => (await call('POST', '/api/users', { accept: V })).body;
-  const newProvider = async (name) => (await call('POST', '/api/admin/providers', { name, category: 'gyosei', licenseNo: '第1号' }, 'adm')).body;
+  const newProvider = async (name) => (await call('POST', '/api/admin/providers', { name, category: 'gyosei', licenseNo: '第12345678号', licenseBody: '大阪府行政書士会' }, 'adm')).body;
   return { app, call, newUser, newProvider, stop: () => { app.server.close(); app.store.close(); } };
 }
 const say = (text) => ({ stop_reason: 'end_turn', content: [{ type: 'text', text }] });
@@ -30,7 +30,7 @@ test('助手接口：create_inquiry 只返回草稿，服务商收不到；用�
     const r = await s.call('POST', `/api/users/${u.id}/chat`, { message: '帮我问问行政书士', history: [] }, u.token);
     assert.equal(r.status, 200);
     assert.deepEqual(r.body.toolCalls, [{ name: 'create_inquiry', ok: true }]);
-    assert.deepEqual(r.body.draft, { category: 'gyosei', nodeId: '4-1', summary: '在留期间更新，想请行政书士看一下材料。', providerIds: [p.id], providers: [{ id: p.id, name: '草稿测试行政书士事务所' }] });
+    assert.deepEqual(r.body.draft, { category: 'gyosei', nodeId: '4-1', summary: '在留期间更新，想请行政书士看一下材料。', providerIds: [p.id], providers: [{ id: p.id, name: '草稿测试行政书士事务所', promoted: false }], disclosure: '以下服务商向在留导航支付固定的展示费（不按咨询数或成交付费），排列按入驻先后，平台不推荐某一家。' });
     assert.equal((await s.call('GET', '/api/provider/inquiries', null, p.token)).body.length, 0, '没有用户确认，服务商什么都收不到');
     assert.equal((await s.call('GET', `/api/users/${u.id}/inquiries`, null, u.token)).body.length, 0);
     // 网页端把草稿显示给用户，用户同意后原样发出

@@ -46,11 +46,24 @@ async function start(opts) {
       if (profile) assert.equal((await call('PATCH', `/api/users/${u.id}/profile`, profile, u.token)).status, 200);
       return u;
     },
-    bind: async (u, email, extra) => {
-      const r = await call('POST', `/api/users/${u.id}/email`, { email, consent: true }, u.token);
+    // 更换、解除之前验证原来的邮箱，返回确认 proof
+    proveOld: async (u, action) => {
+      const old = app.store.getEmail(u.id).email;
+      const r = await call('POST', `/api/users/${u.id}/email/old`, { action }, u.token);
       assert.equal(r.status, 202, JSON.stringify(r.body));
       await app.deliver();
-      return call('POST', `/api/users/${u.id}/email/verify`, Object.assign({ challengeId: r.body.challengeId, code: codeTo(email) }, extra || {}), u.token);
+      const v = await call('POST', `/api/users/${u.id}/email/old/verify`, { action, challengeId: r.body.challengeId, code: codeTo(old) }, u.token);
+      assert.equal(v.status, 200, JSON.stringify(v.body));
+      return v.body.proof;
+    },
+    unbind: async (u) => call('DELETE', `/api/users/${u.id}/email`, app.store.getEmail(u.id) ? { proof: await s.proveOld(u, 'remove') } : null, u.token),
+    // 绑定；账号上已经绑着邮箱时先验证原来的邮箱（换绑）
+    bind: async (u, email, extra) => {
+      const proof = app.store.getEmail(u.id) ? await s.proveOld(u, 'change') : undefined;
+      const r = await call('POST', `/api/users/${u.id}/email`, { email, consent: true, proof }, u.token);
+      assert.equal(r.status, 202, JSON.stringify(r.body));
+      await app.deliver();
+      return call('POST', `/api/users/${u.id}/email/verify`, Object.assign({ challengeId: r.body.challengeId, code: codeTo(email), proof }, extra || {}), u.token);
     },
     recover: async (email, headers) => {
       const r = await call('POST', '/api/auth/recover', { email }, null, headers);
@@ -180,7 +193,8 @@ test('告知邮件一直发不出去：放弃时也清掉旧地址和正文', as
   try {
     const st = s.app.store, u = st.createUser(s.app.termsVersion);
     st.bindEmail(u.id, 'gone@example.com', s.app.termsVersion);
-    assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, null, u.token)).status, 204);
+    const proof = st.createProof(u.id, 'gone@example.com', 'remove', 60 * 1000); // 这个发件方式不留邮件，确认直接在库里发
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, { proof }, u.token)).status, 204);
     for (const waitMin of [0, 1, 5, 30, 120, 720, 720]) { s.advance(waitMin * MIN + 1000); await s.app.deliver(); }
     const rows = st.listOutbox().filter((m) => m.kind === 'last');
     assert.deepEqual(rows.map((m) => [m.status, m.to, m.body]), [['failed', '', '']]);
@@ -200,6 +214,10 @@ test('刚用邮箱找回登录的设备 24 小时内不能换绑或解除邮箱�
     assert.equal(req.status, 403); assert.match(req.body.error, /刚用邮箱找回登录的，24 小时内不能更换或解除绑定的邮箱/); assert.match(req.body.error, /请在24小时后再试/);
     assert.equal((await s.call('POST', E + '/verify', { challengeId: 'x', code: '123456' }, d2)).status, 403);
     assert.equal((await s.call('DELETE', E, null, d2)).status, 403);
+    // 验证原来的邮箱这一步也拦下（不给原来的邮箱发验证码）
+    assert.equal((await s.call('POST', E + '/old', { action: 'change' }, d2)).status, 403);
+    assert.equal((await s.call('POST', E + '/old', { action: 'remove' }, d2)).status, 403);
+    assert.equal((await s.call('POST', E + '/old/verify', { action: 'remove', challengeId: 'x', code: '123456' }, d2)).status, 403);
     await s.app.deliver();
     assert.equal(s.app.store.getEmail(u.id).email, 'owner@example.com'); assert.equal(s.sent.length, n);
     // 看邮箱、开关提醒、看设备不受限
@@ -218,15 +236,18 @@ test('刚用邮箱找回登录的设备 24 小时内不能换绑或解除邮箱�
     assert.equal(s.app.store.getEmail(u.id).email, 'owner@example.com', '24 小时内邮箱始终换不掉');
     // 差一分钟到 24 小时还不行；过了就可以
     s.advance(DAY - MIN);
-    const soon = await s.call('DELETE', E, null, d4);
+    const soon = await s.call('POST', E + '/old', { action: 'remove' }, d4);
     assert.equal(soon.status, 403); assert.match(soon.body.error, /请在1分钟后再试/);
     s.advance(2 * MIN);
-    assert.equal((await s.bind({ id: u.id, token: d4 }, 'owner2@example.com')).status, 200);
-    assert.equal((await s.call('DELETE', E, null, d4)).status, 204);
-    // 账号上没有绑着邮箱时，刚找回的设备可以绑（没有可以被换掉的东西）；注册时的设备从不受限
+    // 过了 24 小时：和别的设备一样，先验证原来的邮箱再换绑、解除
+    const d4u = { id: u.id, token: d4 };
+    assert.equal((await s.call('DELETE', E, null, d4)).status, 403, '冷静期过了也要先验证原来的邮箱');
+    assert.equal((await s.bind(d4u, 'owner2@example.com')).status, 200);
+    assert.equal((await s.unbind(d4u)).status, 204);
+    // 账号上没有绑着邮箱时，刚找回的设备可以绑（没有可以被换掉的东西）；注册时的设备没有冷静期（换绑、解除照样要验证原来的邮箱）
     const v = await s.newUser(); assert.equal((await s.bind(v, 'v@example.com')).status, 200);
     assert.equal((await s.bind(v, 'v2@example.com')).status, 200);
-    assert.equal((await s.call('DELETE', `/api/users/${v.id}/email`, null, v.token)).status, 204);
+    assert.equal((await s.unbind(v)).status, 204);
   } finally { await s.stop(); }
 });
 
@@ -497,7 +518,7 @@ test('解除邮箱、删除账号之后，库文件的字节里找不到邮箱�
     s.app.remind(); await s.app.deliver();
     assert.ok(has('first-addr@example.com') && has(u.id) && has('搬到练马区的备注XYZZY') && has('住民登记：定下住所后14天内到区役所办理'), '删除之前都在文件里');
     // 解除邮箱：地址立即从文件里消失（最后一封告知发出之后）
-    assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, null, u.token)).status, 204);
+    assert.equal((await s.unbind(u)).status, 204);
     await s.app.deliver();
     assert.equal(has('first-addr@example.com'), false, '解除后库文件里没有这个地址');
     // 删除账号

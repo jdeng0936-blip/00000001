@@ -23,11 +23,22 @@ button{padding:8px 14px;border-radius:8px;border:1px solid #0f5f5a;background:#0
 <h1>服务商工作台</h1>
 <p class="muted">查看发给你的咨询并回复。你看到的只有咨询内容，看不到用户的账号信息。</p>
 <div class="card" id="login">
-  <label for="tok">入驻时拿到的令牌</label>
+  <label for="tok">工作台的令牌</label>
   <input id="tok" type="password" autocomplete="off">
   <p><button type="button" id="go">进入</button> <span id="msg" role="status"></span></p>
+  <details id="claim-box"><summary>第一次使用或令牌丢了：用联系邮箱领取</summary>
+    <p class="muted">填入驻申请时验证过的联系邮箱，收验证码后领取新令牌。领取后原来的令牌立即失效。我们不会用邮件发送令牌，也不会向你要令牌。</p>
+    <label for="cl-email">联系邮箱</label><input id="cl-email" type="email" autocomplete="email">
+    <p><button type="button" class="ghost" id="cl-send">发送验证码</button> <span id="cl-send-msg" role="status"></span></p>
+    <label for="cl-code">邮件里的 6 位验证码</label><input id="cl-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+    <p><button type="button" id="cl-go">领取令牌</button> <span id="cl-msg" role="status"></span></p>
+    <div id="cl-out" hidden><p class="draft">新令牌只显示这一次，请马上保存到密码管理器之类安全的地方：</p><p><code id="cl-token" style="word-break:break-all"></code></p><p><button type="button" id="cl-use">用这个令牌进入</button></p></div>
+  </details>
+  <p class="muted">还没有入驻？<a href="/provider-apply.html">服务商入驻申请</a>　<a href="/provider-terms.html">服务商条款</a></p>
 </div>
 <div id="me" hidden></div>
+<div id="billing" hidden></div>
+<h2 id="list-h" hidden>咨询</h2>
 <p class="draft" id="list-msg" role="status" hidden></p>
 <div id="list"></div>
 </main>
@@ -51,7 +62,7 @@ function render(l){
   l.forEach(function(q){var c=el("div","card");c.appendChild(el("b",null,(NAME[q.status]||"")+"　"+String(q.createdAt).slice(0,10)));
     var pre=el("p",null,q.summary);pre.style.whiteSpace="pre-wrap";c.appendChild(pre);
     (q.replies||[]).forEach(function(r){var d=el("p","muted","你的回复（"+String(r.createdAt).slice(0,10)+"）："+r.text);d.style.whiteSpace="pre-wrap";c.appendChild(d)});
-    if(q.status!=="closed"){var ta=el("textarea");ta.rows=3;ta.setAttribute("aria-label","回复内容");ta.value=DRAFT[q.id]||"";ta.oninput=function(){DRAFT[q.id]=ta.value};c.appendChild(ta);
+    if(q.status!=="closed"){var ta=el("textarea");ta.rows=3;ta.setAttribute("aria-label","回复内容");ta.value=DRAFT[q.id]||"";ta.oninput=function(){DRAFT[q.id]=ta.value};c.appendChild(ta);c.appendChild(el("p","muted reply-tip","回复里不能写个人编号、护照号、银行账号，也不能写“包过”“保证获批”这类保证结果的话（写“不能保证结果”这样的提醒可以）。"));
       var row=el("p"),s=el("button",null,"发送回复"),x=el("button","ghost","结束这条咨询"),note=el("span");note.setAttribute("role","status");s.type=x.type="button";
       s.onclick=function(){s.disabled=true;note.textContent="";api("POST","/provider/inquiries/"+q.id+"/reply",{text:ta.value}).then(function(){delete DRAFT[q.id];return load()}).catch(function(e){s.disabled=false;note.textContent=" 没有发出去："+why(e)})};
       x.onclick=function(){x.disabled=true;note.textContent="";api("PUT","/provider/inquiries/"+q.id+"/status",{status:"closed"}).then(function(){return load()}).catch(function(e){x.disabled=false;note.textContent=" 没有结束成功："+why(e)})};
@@ -65,13 +76,36 @@ function load(){
     var m=$("list-msg");m.hidden=false;m.textContent="";m.appendChild(document.createTextNode("咨询名单没有读出来："+why(e)+" "));
     var b=el("button","ghost","重试");b.type="button";b.id="list-retry";b.onclick=function(){load()};m.appendChild(b)});
 }
-$("go").onclick=function(){
-  T=$("tok").value.trim();if(!T){$("msg").textContent="请先填令牌。";return}
+// 展示状态、账单、新咨询通知的开关
+function showMe(p){
+  var m=$("me");m.hidden=false;m.textContent="";m.appendChild(el("p",null,p.name+(p.licenseNo?"（登录番号 "+p.licenseNo+"）":"")));
+  var st=el("p",null,p.listed?"名单上展示中"+(p.listedUntil?"，展示到 "+p.listedUntil+"（按时付下一期的展示费会延续）":""):"现在不在名单上展示：展示费付款确认后才会展示。工作台照常能用。");st.id="listing";m.appendChild(st);
+  if(p.contact){var lb=el("label"),cb=el("input"),ns=el("span");cb.type="checkbox";cb.id="notify";cb.checked=!!p.notify;cb.style.width="auto";ns.setAttribute("role","status");
+    cb.onchange=function(){cb.disabled=true;ns.textContent="";api("PUT","/provider/me/notify",{on:cb.checked}).then(function(r){cb.disabled=false;cb.checked=r.notify},function(e){cb.disabled=false;cb.checked=!cb.checked;ns.textContent=" 没有改成："+why(e)})};
+    lb.appendChild(cb);lb.appendChild(document.createTextNode(" 有新咨询时发邮件通知到 "+p.contact+"（邮件里只有数量，不写咨询内容）"));lb.appendChild(ns);m.appendChild(lb)}
+  m.appendChild(el("p","muted","回复时请不要作“保证获批”一类的承诺；报酬和范围请写清楚。请不要在回复里写银行账号、护照号这类号码，系统会拦下。"));
+}
+var INV={issued:"待付款",paid:"已付款",void:"已作废"};
+function loadInvoices(){return api("GET","/provider/invoices").then(function(l){var b=$("billing");b.hidden=false;b.textContent="";b.appendChild(el("h2",null,"展示费账单"));
+  if(!l.length)b.appendChild(el("p","muted","还没有账单。"));
+  l.forEach(function(i){var c=el("div","card");c.appendChild(el("b",null,i.refCode+"　"+(INV[i.status]||i.status)));
+    c.appendChild(el("p",null,"期间 "+i.periodStart+" 至 "+i.periodEnd+"　金额 "+i.amountYen+" 日元（含税）"+(i.taxYen!=null?"，其中消费税 "+i.taxYen+" 日元（登记号 "+i.regNo+"）":"")+"　付款期限 "+i.dueDate+(i.paidOn?"　入账日 "+i.paidOn:"")));
+    if(i.payText){var t=el("p","muted",i.payText);t.style.whiteSpace="pre-wrap";c.appendChild(t)}
+    b.appendChild(c)})},function(e){var b=$("billing");b.hidden=false;b.textContent="账单没有读出来："+why(e)})}
+function enter(){
   $("go").disabled=true;$("msg").textContent="";
-  api("GET","/provider/me").then(function(p){$("go").disabled=false;$("login").hidden=true;var m=$("me");m.hidden=false;m.textContent="";m.appendChild(el("p",null,p.name+(p.licenseNo?"（登录番号 "+p.licenseNo+"）":"")));
-    m.appendChild(el("p","muted","回复时请不要作“保证获批”一类的承诺；报酬和范围请写清楚。请不要在回复里写银行账号、护照号这类号码，系统会拦下。"));return load()},
+  api("GET","/provider/me").then(function(p){$("go").disabled=false;$("login").hidden=true;$("list-h").hidden=false;showMe(p);loadInvoices();return load()},
   function(e){$("go").disabled=false;$("msg").textContent=why(e)});
-};
+}
+$("go").onclick=function(){T=$("tok").value.trim();if(!T){$("msg").textContent="请先填令牌。";return}enter()};
+// 用联系邮箱领取令牌。令牌只显示一次，不存进浏览器。
+var CLAIM=null;
+function plain(m,p,b){return fetch("/api"+p,{method:m,headers:{"content-type":"application/json"},body:JSON.stringify(b)}).then(function(r){return r.json().catch(function(){return {}}).then(function(j){if(!r.ok){var e=new Error(j&&typeof j.error==="string"?j.error:"服务器出了点问题（"+r.status+"）");e.status=r.status;throw e}return j})},function(){var e=new Error("连不上服务器，请检查网络后再试。");e.status=0;throw e})}
+$("cl-send").onclick=function(){var em=$("cl-email").value.trim(),m=$("cl-send-msg");if(!em){m.textContent="请先填邮箱。";return}m.textContent="";
+  plain("POST","/provider-claim/code",{email:em}).then(function(r){CLAIM=r.challengeId;m.textContent="如果这是在架服务商的联系邮箱，验证码已经发出（10 分钟内有效）。"},function(e){m.textContent=e.message})};
+$("cl-go").onclick=function(){var m=$("cl-msg");m.textContent="";if(!CLAIM){m.textContent="请先发送验证码。";return}
+  plain("POST","/provider-claim",{challengeId:CLAIM,code:$("cl-code").value.trim()}).then(function(r){CLAIM=null;$("cl-out").hidden=false;$("cl-token").textContent=r.token;$("cl-code").value=""},function(e){m.textContent=e.message})};
+$("cl-use").onclick=function(){T=$("cl-token").textContent;$("cl-token").textContent="";$("cl-out").hidden=true;enter()};
 </script>
 </body>
 </html>

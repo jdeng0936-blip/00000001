@@ -6,7 +6,9 @@ let base, app;
 const tokens = {};
 const V = '2026-11-27';
 const adminCall = (method, path, body) => call(method, path, body, 'adm-secret');
-const newProvider = async (over) => (await adminCall('POST', '/api/admin/providers', Object.assign({ name: '示例行政书士事务所', category: 'gyosei', area: '大阪', langs: '中文、日语', feeNote: '首次咨询30分钟5,500日元', licenseNo: '第00000000号' }, over))).body;
+// 登录番号和所属会按类别取一份格式正确的（直接入驻和入驻申请用同一套格式检查）
+const LIC = { gyosei: { licenseNo: '第00000000号', licenseBody: '大阪府行政書士会' }, zeirishi: { licenseNo: '第123456号', licenseBody: '近畿税理士会' } };
+const newProvider = async (over) => (await adminCall('POST', '/api/admin/providers', Object.assign({ name: '示例行政书士事务所', category: 'gyosei', area: '大阪', langs: '中文、日语', feeNote: '首次咨询30分钟5,500日元' }, LIC[(over && over.category) || 'gyosei'], over))).body;
 const call = async (method, path, body, token) => {
   if (method === 'POST' && path === '/api/users' && !body) body = { accept: V };
   const id = (/\/api\/users\/([^/]+)/.exec(path) || [])[1];
@@ -20,7 +22,7 @@ const call = async (method, path, body, token) => {
 };
 
 test.before(async () => {
-  app = createApp({ now: '2026-11-26', adminToken: 'adm-secret', signupLimit: { max: 1000, windowMs: 3600000 } });
+  app = createApp({ now: '2026-11-26', adminToken: 'adm-secret', allowDirectProvider: true, signupLimit: { max: 1000, windowMs: 3600000 } });
   await new Promise((ok) => app.server.listen(0, '127.0.0.1', ok));
   base = 'http://127.0.0.1:' + app.server.address().port;
 });
@@ -173,9 +175,16 @@ test('事件：记录换工作后，提醒里出现14天期限；孩子出生有
 
 test('服务商入驻：士业不能按成交抽成、必须有登录番号；收费说明不能有保证类用语', async () => {
   assert.equal((await call('POST', '/api/admin/providers', { name: '某事务所', category: 'gyosei', licenseNo: '1' }, 'wrong')).status, 401);
-  assert.equal((await adminCall('POST', '/api/admin/providers', { name: '某事务所', category: 'gyosei', licenseNo: '第1号', feeModel: 'affiliate_disclosed' })).status, 422);
+  const G = { name: '某事务所', category: 'gyosei', licenseNo: '第12345678号', licenseBody: '大阪府行政書士会' };
+  assert.equal((await adminCall('POST', '/api/admin/providers', Object.assign({}, G, { feeModel: 'affiliate_disclosed' }))).status, 422);
   assert.equal((await adminCall('POST', '/api/admin/providers', { name: '某事务所', category: 'gyosei' })).status, 422);
-  assert.equal((await adminCall('POST', '/api/admin/providers', { name: '某事务所', category: 'gyosei', licenseNo: '第1号', feeNote: '永驻包过' })).status, 422);
+  assert.equal((await adminCall('POST', '/api/admin/providers', Object.assign({}, G, { feeNote: '永驻包过' }))).status, 422);
+  // 和入驻申请同一套检查：登录番号的格式、所属会，区域、语言、地址也不能有保证类用语
+  assert.equal((await adminCall('POST', '/api/admin/providers', Object.assign({}, G, { licenseNo: '第1号' }))).status, 422, '行政书士的登录番号是 8 位');
+  assert.equal((await adminCall('POST', '/api/admin/providers', Object.assign({}, G, { licenseBody: '' }))).status, 422, '士业要有所属会');
+  for (const k of ['area', 'langs', 'address']) assert.equal((await adminCall('POST', '/api/admin/providers', Object.assign({}, G, { [k]: '保證合格' }))).status, 422, k);
+  // 非士业不能指定 fixed_listing 来躲开“含推广”的标识
+  assert.equal((await adminCall('POST', '/api/admin/providers', { name: '某学校', category: 'edu', feeModel: 'fixed_listing' })).status, 422);
   const school = (await adminCall('POST', '/api/admin/providers', { name: '某日语学校', category: 'edu' })).body;
   assert.equal(school.feeModel, 'affiliate_disclosed');
   const pub = (await call('GET', '/api/providers?category=edu')).body.find((x) => x.id === school.id);
