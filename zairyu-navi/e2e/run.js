@@ -9,7 +9,8 @@ const { createApp } = require('../src/server');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zairyu-e2e-'));
 const adminToken = process.env.ADMIN_TOKEN || 'e2e-admin';
-const app = createApp({ dbFile: path.join(dir, 'e2e.db'), adminToken });
+// appUrl：提醒邮件里的链接指向这个临时服务器（端口在 listen 之后才知道，所以传函数）
+const app = createApp({ dbFile: path.join(dir, 'e2e.db'), adminToken, appUrl: () => 'http://127.0.0.1:' + app.server.address().port });
 const finish = (code) => {
   app.server.close(); app.server.closeAllConnections();
   try { app.store.close(); } catch (e) { /* 已经关了 */ }

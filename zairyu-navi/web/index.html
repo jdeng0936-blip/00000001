@@ -42,7 +42,7 @@ h2{font-size:16px;margin:0 0 10px;font-weight:700}
 form.q{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:flex-end}
 label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute)}
 label.check{flex-direction:row;align-items:center;gap:6px;color:var(--ink);font-size:14px}
-select,input[type=date],textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+select,input[type=date],input[type=email],input[inputmode=numeric],textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 details summary{cursor:pointer;font-weight:700}
 details[open] summary{margin-bottom:12px}
@@ -199,6 +199,7 @@ ul.rem time{color:var(--mute);font-variant-numeric:tabular-nums;white-space:nowr
         <button type="button" class="ghost" id="fresh">从零开始</button>
         <button type="button" class="ghost" id="del-account" hidden>删除我的账号和全部数据</button>
       </form>
+      <div id="acct-box" hidden></div>
     </details>
   </section>
 </div>
@@ -267,13 +268,14 @@ ul.rem time{color:var(--mute);font-variant-numeric:tabular-nums;white-space:nowr
     <h2>我的提醒</h2>
     <p class="lead">按你的情况和已完成的任务自动生成，按日期排序。</p>
     <ul class="rem" id="rem"></ul>
+    <div id="rm-mail" hidden></div>
   </section>
   <section class="panel">
     <h2>授权自动获取</h2>
     <p class="lead">授权后，系统自己去读信息、整理期限和金额、生成提醒，不用你一条条录入。随时可以关闭，关闭后停止读取。</p>
     <label class="check" for="au-mail"><input type="checkbox" id="au-mail">邮箱（只读）：识别入管、市役所、年金、税务、运营商、银行、房东的来信</label>
     <label class="check" for="au-cal"><input type="checkbox" id="au-cal">日历：把期限写进你的日历</label>
-    <label class="check" for="au-push"><input type="checkbox" id="au-push">推送通知：期限前 30 天、7 天、当天提醒</label>
+    <label class="check" for="au-push" id="au-push-row"><input type="checkbox" id="au-push">邮件提醒（演示，不连服务器时不会真的发信）：期限前 7 天、前 1 天和当天各发一封，写明是哪件事、哪一天</label>
     <table style="margin-top:14px"><thead><tr><th>系统能做到哪一步</th><th>内容</th></tr></thead><tbody>
       <tr><td>自动做</td><td>读取来信、提取期限和金额、建提醒、写日历、把附件存进“我的资料”</td></tr>
       <tr><td>你点确认后做</td><td>回复邮件、预约窗口、提交运营商或驾校的报名表、付款</td></tr>
@@ -617,14 +619,17 @@ function renderDetail(R){
 
 /* ---------- 提醒 ---------- */
 var EVENTS=[];
+// mail、msrc：提醒邮件里用的说明和依据。邮件要经过邮件服务商，写法不分在留资格（从文字和链接看不出收件人是哪一种）；没有 mail 的规则，txt 本身就不分在留资格。
+var JOB_MAIL="工作、学校等所属机关有变动（离开或加入）：自变动之日起14天内，向入管提交所属机关的届出（契约机关或活动机关，按自己的情况交其中一种）；离开和加入各申报一次，各有14天";
+var JOB_MSRC={law:"入管法第19条の16",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]};
 var EVRULES={job_change:["换工作或离职",[
-  {n:14,st:{work:1,ssw:1},txt:"换工作或离职：自离职（合同结束）或入职（签新合同）之日起14天内，向入管提交所属机关（契约机关）的届出；离职和入职各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html"}},
-  {n:14,st:{student:1,biz:1},txt:"离开或转到别的学校、机构：自离开（退学、毕业、离任）或转入之日起14天内，向入管提交所属机关（活动机关）的届出；离开和转入各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号",title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}},
-  {n:14,st:{hsp:1},txt:"换工作或离职：自离职或入职之日起14天内，向入管提交所属机关的届出；高度专门职1号イ、ロ交契约机关的届出，1号ハ交活动机关的届出，离职和入职各申报一次（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号・第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出（1号ハ）",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]}}]],
+  {n:14,st:{work:1,ssw:1},mail:JOB_MAIL,msrc:JOB_MSRC,txt:"换工作或离职：自离职（合同结束）或入职（签新合同）之日起14天内，向入管提交所属机关（契约机关）的届出；离职和入职各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html"}},
+  {n:14,st:{student:1,biz:1},mail:JOB_MAIL,msrc:JOB_MSRC,txt:"离开或转到别的学校、机构：自离开（退学、毕业、离任）或转入之日起14天内，向入管提交所属机关（活动机关）的届出；离开和转入各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号",title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}},
+  {n:14,st:{hsp:1},mail:JOB_MAIL,msrc:JOB_MSRC,txt:"换工作或离职：自离职或入职之日起14天内，向入管提交所属机关的届出；高度专门职1号イ、ロ交契约机关的届出，1号ハ交活动机关的届出，离职和入职各申报一次（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号・第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出（1号ハ）",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]}}]],
  move:["搬家",[
   {n:14,txt:"搬家：搬进新住址后14天内，带在留卡到新住址的区役所办转入或转居，在留卡上的住址当场一并变更（搬到别的市区町村的，先在原住址办转出）",src:{law:"入管法第19条の9第1項",title:"入管厅：住居地的变更届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00023.html"}}]],
  divorce:["离婚或配偶去世",[
-  {n:14,st:{spouse:1,family:1},txt:"离婚或配偶去世：14天内向入管提交配偶者的届出",alt:{family:"如果你是以配偶身份持有家族滞在：离婚或配偶去世后14天内向入管提交配偶者的届出（以子女身份持有的没有这项届出）"},src:{law:"入管法第19条の16第3号",title:"入管厅：配偶者的届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00016.html"}}]],
+  {n:14,st:{spouse:1,family:1},txt:"离婚或配偶去世：14天内向入管提交配偶者的届出",alt:{family:"如果你是以配偶身份持有家族滞在：离婚或配偶去世后14天内向入管提交配偶者的届出（以子女身份持有的没有这项届出）"},mail:"离婚或配偶去世：14天内向入管提交配偶者的届出（以配偶身份在留的人要办）",src:{law:"入管法第19条の16第3号",title:"入管厅：配偶者的届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00016.html"}}]],
  birth:["孩子出生",[
   {n:13,any:1,txt:"孩子出生：14天内到区役所办出生届，出生当天算第1天",src:{law:"戸籍法第49条",title:"法务省：出生届",url:"https://www.moj.go.jp/ONLINE/FAMILYREGISTER/5-1.html"}},
   {n:30,any:1,txt:"孩子出生：30天内向入管申请在留资格取得（孩子有日本国籍的、出生后60天内离开日本的不用办）",src:{law:"入管法第22条の2・第22条の3",title:"入管厅：在留资格取得许可申请",url:"https://www.moj.go.jp/isa/applications/procedures/16-10.html"}}]]};
@@ -632,17 +637,18 @@ var EVRULES={job_change:["换工作或离职",[
 function evDue(ev){
   var r=Object.prototype.hasOwnProperty.call(EVRULES,ev.type)?EVRULES[ev.type]:null,d=D(ev.date),s=P.status,out=[];
   if(!r||!d||s==="none")return out;
-  r[1].forEach(function(x){if(s==="short"?!x.any:(x.st&&!x.st[s]))return;out.push({d:addDays(d,x.n),txt:(x.alt&&x.alt[s])||x.txt,src:x.src})});
+  r[1].forEach(function(x){if(s==="short"?!x.any:(x.st&&!x.st[s]))return;out.push({d:addDays(d,x.n),txt:(x.alt&&x.alt[s])||x.txt,src:x.src,mail:x.mail||null,msrc:x.msrc||null})});
   return out;
 }
 function reminders(){
   var R=compute(),L=[],t=today(),Y=t.getUTCFullYear(),M=t.getUTCMonth(),card=P.status!=="none"&&P.status!=="short";
-  function add(d,txt,tag,src){if(d&&!isNaN(d.getTime()))L.push({d:d,date:iso(d),txt:txt,tag:tag||"",src:src||null})}
-  function evs(){EVENTS.forEach(function(ev){evDue(ev).forEach(function(x){add(x.d,x.txt,"事件",x.src)})})}
+  // x：{dl:1 是真正的期限（其余是该留意、该开始准备的日子）, mail, msrc 提醒邮件里用的不分在留资格的说明和依据}
+  function add(d,txt,tag,src,x){if(d&&!isNaN(d.getTime()))L.push({d:d,date:iso(d),txt:txt,tag:tag||"",src:src||null,dl:!!(x&&x.dl),mail:(x&&x.mail)||null,msrc:(x&&x.msrc)||null})}
+  function evs(){EVENTS.forEach(function(ev){evDue(ev).forEach(function(x){add(x.d,x.txt,"事件",x.src,{dl:1,mail:x.mail,msrc:x.msrc})})})}
   if(!card){add(t,"先完成第0关：选定路线并申请在留资格认定证明书","路线");evs();L.sort(function(a,b){return a.d-b.d});return L}
-  if(R["1-1"].state==="todo")add(R["1-1"].due,"住民登记：定下住所后14天内到区役所办理","法定期限");
-  if(R["1-3"].state==="todo")add(R["1-3"].due,"国民健康保险：成为对象后14天内加入","法定期限");
-  if(R["4-1"].state==="todo"&&D(P.exp)){var e=D(P.exp);[[4,"在留更新：开始准备材料"],[3,"在留更新：确认可以开始申请的时期"],[1,"在留更新：尽快递交"]].forEach(function(x){add(addMonths(e,-x[0]),x[1],"在留")});add(e,"在留期满日","在留")}
+  if(R["1-1"].state==="todo")add(R["1-1"].due,"住民登记：定下住所后14天内到区役所办理","法定期限",null,{dl:1});
+  if(R["1-3"].state==="todo")add(R["1-3"].due,"国民健康保险：成为对象后14天内加入","法定期限",null,{dl:1});
+  if(R["4-1"].state==="todo"&&D(P.exp)){var e=D(P.exp);[[4,"在留更新：开始准备材料"],[3,"在留更新：确认可以开始申请的时期"],[1,"在留更新：尽快递交"]].forEach(function(x){add(addMonths(e,-x[0]),x[1],"在留")});add(e,"在留期满日","在留",null,{dl:1})}
   if(P.entry)add(addMonths(D(P.entry),6),"入境满6个月：去银行办理账户的居住者变更","银行");
   if(R["1-4"].state==="todo"||R["1-4"].state==="done")add(ymd(Y,M+1,1),"国民年金：本月保险料缴纳","每月");
   var june=ymd(Y,5,1);if(june<t)june=ymd(Y+1,5,1);
@@ -651,7 +657,7 @@ function reminders(){
   add(nov,"年末调整：按公司通知提交扶养控除等申告书；有海外扶养亲属的备齐亲属关系文件和汇款凭证","每年");
   if(M>=10)add(t,"现在是年末调整的时期：公司发来的申告书请按期交回，12月的工资里会结算全年所得税","每年");
   var kk=ymd(Y,2,15);if(kk<t)kk=ymd(Y+1,2,15);
-  add(kk,"确定申告截止（需要申告的人）：2月16日起受理，纳税期限同日","每年");
+  add(kk,"确定申告截止（需要申告的人）：2月16日起受理，纳税期限同日","每年",null,{dl:1});
   if(P.pr&&P.status!=="pr")add(t,"永驻目标：每次缴纳住民税和年金后拍照存档收据","习惯");
   if(AUTH.mail){add(addDays(t,9),"示例：邮箱里识别到国民健康保险料纳付通知，纳期限已提取"+(AUTH.cal?"，已写入日历":""),"邮箱示例");add(addDays(t,3),"示例：运营商账单邮件，本月金额已记入，待你确认是否换套餐","邮箱示例")}
   PLT.forEach(function(x){if(PL.subs[x[0]])add(t,"已订阅“"+x[1]+"”的方案变动提醒：正式版每天联网复核，价格或条件变化时推送","方案")});
@@ -818,13 +824,13 @@ var SYS="你是「在留导航」里随时可以呼出的助手，帮助在日�
 "5. 回答涉及税或在留时，最后一行写：AI 回答不构成税务或法律意见。\n"+
 "6. 用户说明自己的情况时，用 update_profile 记录，只记录明确说过的内容。用户说某件事办完了，用 mark_done 记录。用户提到出国和回国日期，用 add_trip 记录。用户提到换工作或离职、搬家、离婚或配偶去世、孩子出生并说了具体日期时，用 add_event 记录，并告诉他工具返回的期限和依据（法条、官方页面）；工具没有返回这件事的期限时，只说本工具没有登记到对应的期限，这不代表没有其他手续，请他以入管厅或区役所的说明为准，不要下“没有法定届出”“不用办”的结论。\n"+
 "7. 用户问该办什么、进度如何时，用 get_plan 取结果再回答，不自己编排，不自己计算期限。\n"+
-"8. C、D、E 类问题或用户想找人帮忙时，用 suggest_providers 列出对应类别；这里的服务商是示例占位，要告诉用户。\n"+
+"8. C、D、E 类问题或用户想找人帮忙时，用 suggest_providers 列出对应类别的服务商，由用户自己选，不推荐某一家；工具的结果里说明是示例或还没有服务商入驻时，照实告诉用户。\n"+
 "10. 用户问来日本走哪条路、怎么取得学历、高度人才还差几分和怎么加分、电话卡套餐、驾照怎么拿、驾校、开公司费用、第一年要准备多少钱这类需要做选择的问题时，先用 get_options 取方案再回答：按返回的顺序介绍前两三套，说明价格、适合谁、注意什么，并说明价格的核对日期和哪些是待实测。不自己补充价格。提到日元金额时同时给出工具返回的人民币折算。路线的排序和积分的计算是按用户所填条件得出的参考，要说明这不是能否获批的判断，积分以入管审查为准；不说“一定能批”“保证加分”。预算是估算，要说明没有算进去的项目；税和社保的金额仍按C类不计算。\n"+
 "11. 用户表达着急、害怕、沮丧或孤单时，先用一两句话回应他的感受，再给出下一步具体怎么做。不说空泛的安慰话，不对审查结果做任何保证，不夸大风险吓人。用户完成任务时给一句具体的肯定。\n"+
 "14. 不记录、不复述用户的个人编号（My Number）、护照号、银行账号；用户主动发来时提醒他不要发送。\n"+
 "12. 用户问找工作时：说明他的在留资格能做哪类工作、留学和家族滞在打工的时间限制，可以指给他“同城”的招聘板块；不替用户挑选或推荐具体企业，不保证能被录用，换工作是否符合在留资格的个别判断转给行政书士。\n"+
 "13. 用户问学历时只讲正规途径。学位必须来自所在国政府或其认可的认证机构承认的大学；自称大学但官网写明不是大学的机构（例如 Academy Europe 欧洲开放大学）发的证书不是学位，不算高度人才学历分，不要建议用户把它写成学位。问到买学历、代办假毕业证、挂名学校的，明确拒绝，并说明这是虚假申请、会导致不许可和取消在留资格。\n"+
-"9. 用户请你整理清单、窗口话术、给专业人士的咨询摘要等辅助资料时，写好后用 save_document 保存，并告诉用户可以在“我的资料”里查看和下载。递交给官方的申请书、届出书、理由书等文书不制作，也不保存。\n\n【节点资料】\n";
+"9. 用户请你整理清单、窗口话术、给专业人士的咨询摘要等辅助资料时，直接写在回答里。递交给官方的申请书、届出书、理由书等文书不制作。\n\n【节点资料】\n";
 var STATUS_NAME={none:"尚无签证（人在中国）",short:"短期滞在（旅游签）",student:"留学",work:"技术·人文知识·国际业务",hsp:"高度专门职",family:"家族滞在",spouse:"日本人或永住者的配偶",ssw:"特定技能",biz:"经营·管理",pr:"永住者"};
 function profileText(){return "身份="+(STATUS_NAME[P.status]||"未知")+"；入境日="+(P.entry||"未填")+"；定下住所日="+(P.addr||"未填")+"；在留期满日="+(P.exp||"未填")+"；公司社保="+(P.ins?"是":"否")+"；20至59岁="+(P.age?"是":"否")+"；有符合条件的中国驾照="+(P.lic?"是":"否")+"；永驻目标="+(P.pr?"是":"否")}
 function planData(){var R=compute();return NODES.map(function(n){var r=R[n.id];return {id:n.id,title:n.t,state:r.state,note:r.note,due:r.due?fmt(r.due):"",cost:n.cost}}).filter(function(x){return x.state!=="na"})}
@@ -853,6 +859,8 @@ var TOOLS=[
 ];
 function providerCard(c){var m=el("div","msg a");m.appendChild(el("span","cls",c[1]+"（示例占位）"));m.appendChild(el("span",null,c[2]+"。"));
   var b=el("button","ghost","查看并申请咨询");b.type="button";b.style.display="block";b.style.marginTop="8px";b.onclick=function(){$("pv-cat").value=c[0];renderPV();closeDrawer();location.hash="#providers"};m.appendChild(b);$("chat").appendChild(m)}
+// 只在本地演示（不连服务器、在 claude.ai 里打开）时追加的规则：save_document 只有这里的 TOOLS 里有，服务器上的助手没有这个工具。
+var DEMO_RULES="\n\n【补充规则】\n15. 整理好的清单、窗口话术、咨询摘要可以用 save_document 保存，并告诉用户可以在“我的资料”里查看和下载；递交给官方的文书不保存。";
 var sample=null, HIST=[], busy=false;
 var HELLO="我在这儿。问我某个任务怎么办、要花多少钱，或者直接说“这个我办完了”。也可以拍照给我看，或让我整理一份清单存到“我的资料”。";
 function pushMsg(role,text){var m=el("div","msg "+role);if(role==="a"){m.appendChild(el("span","cls",""));m.appendChild(el("span","body",text))}else m.textContent=text;$("chat").appendChild(m);$("chat").scrollTop=$("chat").scrollHeight;return m}
@@ -863,7 +871,7 @@ function ask(q){
   if(!sample){$("ask-state").textContent="助手在当前视图不可用。请在 claude.ai 中打开此页面后再试。";return}
   busy=true;$("ask-b").disabled=true;pushMsg("u",q);
   var ctx="（用户正在看的任务："+SEL+" "+nodeOf(SEL).t+"）";
-  HIST.push({role:"user",content:HIST.length?ctx+q:SYS+kb()+"\n\n【用户概况】\n"+profileText()+"\n今天是"+fmt(today())+"。\n\n"+ctx+"用户说："+q});
+  HIST.push({role:"user",content:HIST.length?ctx+q:SYS+kb()+DEMO_RULES+"\n\n【用户概况】\n"+profileText()+"\n今天是"+fmt(today())+"。\n\n"+ctx+"用户说："+q});
   var m=pushMsg("a","…");
   sample(HIST,{cache:false,tools:TOOLS,onText:function(x){setAns(m,x.text)}}).then(function(r){setAns(m,r.text);HIST.push({role:"assistant",content:r.text})})
     .catch(function(e){HIST.pop();setAns(m,errText(e))}).then(function(){busy=false;$("ask-b").disabled=false});
@@ -1213,10 +1221,10 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
       if(!r.ok){return r.json().catch(function(){return {}}).then(function(j){var e=new Error(j&&typeof j.error==="string"?j.error:String(r.status));e.status=r.status;e.said=!!(j&&typeof j.error==="string");throw e})}
       return r.status===204?null:r.json()},function(){var e=new Error("连不上服务器");e.status=0;throw e});
   }
-  // 给用户看的失败原因。422（内容没通过检查，例如疑似含有护照号、银行账号）、429（太频繁）等直接用服务器的说明
+  // 给用户看的失败原因。422（内容没通过检查，例如疑似含有护照号、银行账号）、429（太频繁）、403（刚找回的设备暂时不能换绑邮箱）等直接用服务器的说明
   function why(e){
     if(e.status===0)return "连不上服务器，请检查网络后再试。";
-    if(e.said&&(e.status===422||e.status===429||e.status===409||e.status===413||e.status===400))return e.message;
+    if(e.said&&(e.status===422||e.status===429||e.status===409||e.status===403||e.status===413||e.status===400))return e.message;
     if(e.status===401)return "登录已失效，请刷新页面。";
     return "服务器出了点问题，请稍后再试。";
   }
@@ -1268,11 +1276,11 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
     return new Promise(function(ok){
       var w=el("div");w.id="consent";w.setAttribute("role","dialog");w.setAttribute("aria-modal","true");w.setAttribute("aria-labelledby","consent-h");
       w.style.cssText="position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px";
-      var c=el("div","panel");c.style.cssText="max-width:440px;width:100%;margin:0";
+      var c=el("div","panel");c.style.cssText="max-width:440px;width:100%;margin:0;max-height:100%;overflow:auto;box-sizing:border-box";
       var h=el("h2",null,"开始之前");h.id="consent-h";c.appendChild(h);
-      if(gone)c.appendChild(el("p","notice","这台设备上保存的账号已经失效（可能已被删除），需要重新开始。"));
+      if(gone)c.appendChild(el("p","notice","这台设备上保存的登录已经失效（账号可能已被删除，或在别的设备上被退出了登录）。绑定过邮箱的话，可以用下面的“用邮箱找回”回到原来的账号；否则需要重新开始。"));
       c.appendChild(el("p","lead","在留导航提供手续信息、提醒和找专业人士的渠道，不代办官方文书，也不替你判断个别的在留或税务问题。"));
-      var ul=el("ul");["你填的情况和办事进度会存在我们的服务器上，用来生成你的路线和提醒。","和助手的对话会发给提供 AI 模型的公司（Anthropic，在美国）处理。","助手不能替你发咨询。只有你自己核对内容、勾选同意并点了发送，咨询内容才会发给你选的服务商。","我们不收集个人编号、护照号、银行账号和卡号，请不要发给助手或写进咨询；看起来像这类号码的内容会被拦下。","你可以随时在“我的情况”里删除自己的账号和全部数据。"].forEach(function(t){ul.appendChild(el("li",null,t))});c.appendChild(ul);
+      var ul=el("ul");["你填的情况和办事进度会存在我们的服务器上，用来生成你的路线和提醒。","和助手的对话会发给提供 AI 模型的公司（Anthropic，在美国）处理。","助手不能替你发咨询。只有你自己核对内容、勾选同意并点了发送，咨询内容才会发给你选的服务商。","我们不收集个人编号、护照号、银行账号和卡号，请不要发给助手或写进咨询；看起来像这类号码的内容会被拦下。","账号只记在这台设备的浏览器里。你可以自愿绑定一个邮箱，换设备或清空浏览器后用它找回账号；绑定后我们会保存这个邮箱地址，并通过邮件服务商给它发验证码和新设备登录通知。绑定后可以另外打开“邮件提醒”（默认关闭），打开后期限前 7 天、前 1 天和当天各发一封邮件，随时可以关掉或退订。","你可以随时在“我的情况”里删除自己的账号和全部数据。"].forEach(function(t){ul.appendChild(el("li",null,t))});c.appendChild(ul);
       var pp=el("p");var a1=el("a",null,"使用条款");a1.href="/terms.html";a1.target="_blank";var a2=el("a",null,"隐私政策");a2.href="/privacy.html";a2.target="_blank";pp.appendChild(a1);pp.appendChild(document.createTextNode(" 和 "));pp.appendChild(a2);c.appendChild(pp);
       var bt=el("button","act","同意并开始");bt.type="button";bt.id="consent-ok";
       var msg=el("p","lead");msg.id="consent-msg";msg.setAttribute("role","status");
@@ -1282,8 +1290,166 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
         .catch(function(e){bt.disabled=false;msg.textContent="账号没有建成："+why(e)});
       };
       c.appendChild(bt);c.appendChild(msg);
+      c.appendChild(recoverUi(function(u){unsaved=false;gone=false;w.remove();ok(u)}));
       w.appendChild(c);document.body.appendChild(w);bt.focus();
     });
+  }
+  // 六位验证码的输入框
+  function codeInput(id){var i=el("input");i.id=id;i.type="text";i.setAttribute("inputmode","numeric");i.setAttribute("autocomplete","one-time-code");i.maxLength=6;i.setAttribute("aria-label","邮件里的 6 位验证码");i.placeholder="6 位验证码";i.style.cssText="flex:1 1 120px;min-width:0;max-width:180px";return i}
+  // 用邮箱找回账号（在同意对话框里）。不管邮箱有没有绑定过，服务器的回答都一样，这里的提示也一样。
+  // 找回成功后拿到的是这台设备自己的新令牌，原来的设备不受影响。
+  function recoverUi(done){
+    var box=el("div");box.id="recover";box.style.cssText="margin-top:14px;border-top:1px solid var(--line);padding-top:10px";
+    var open=el("button","ghost","已有账号？用邮箱找回");open.type="button";open.id="recover-open";box.appendChild(open);
+    var form=el("div");form.hidden=true;
+    form.appendChild(el("p","lead","填绑定过的邮箱，我们发一个验证码过去。只有绑定过邮箱的账号才能这样找回。"));
+    var addr=el("input");addr.type="email";addr.id="rc-addr";addr.setAttribute("autocomplete","email");addr.setAttribute("aria-label","绑定过的邮箱");addr.placeholder="绑定过的邮箱";addr.style.cssText="flex:1 1 180px;min-width:0";
+    var sendB=el("button","act","发送验证码");sendB.type="button";sendB.id="rc-send";
+    var r1=el("div","row");r1.appendChild(addr);r1.appendChild(sendB);form.appendChild(r1);
+    var code=codeInput("rc-code"),ver=el("button","act","找回账号");ver.type="button";ver.id="rc-verify";
+    var r2=el("div","row");r2.style.display="none";r2.appendChild(code);r2.appendChild(ver);form.appendChild(r2);
+    var msg=el("p","lead");msg.id="rc-msg";msg.setAttribute("role","status");form.appendChild(msg);
+    box.appendChild(form);
+    var cid=null;
+    open.onclick=function(){form.hidden=!form.hidden;if(!form.hidden)addr.focus()};
+    sendB.onclick=function(){
+      var v=addr.value.trim();if(!v){msg.textContent="请先填邮箱。";return}
+      sendB.disabled=true;msg.textContent="";
+      api("POST","/auth/recover",{email:v}).then(function(r){
+        cid=r.challengeId;r2.style.display="";code.value="";code.focus();
+        msg.textContent="如果这个邮箱绑定过账号，验证码已经发过去了，10 分钟内有效。没收到的话，看看垃圾邮件，或者确认是不是绑定时用的那个邮箱。";
+      },function(e){msg.textContent="验证码没有发出去："+why(e)}).then(function(){sendB.disabled=false});
+    };
+    ver.onclick=function(){
+      var v=code.value.trim();if(!cid||!/^\d{6}$/.test(v)){msg.textContent="请填邮件里的 6 位验证码。";return}
+      ver.disabled=true;msg.textContent="";
+      api("POST","/auth/recover/verify",{challengeId:cid,code:v}).then(function(r){
+        // 换成找回的账号：本机缓存的概况和“未保存”标记是别的账号的，不能带过来
+        acct={id:r.id,token:r.token};lsSet(AK,JSON.stringify(acct));lsDel(DK);lsDel(OK);
+        return api("GET","/users/"+acct.id).then(done);
+      }).catch(function(e){ver.disabled=false;msg.textContent="没有找回："+why(e)});
+    };
+    return box;
+  }
+  // 条款改版后的重新同意：老用户同意的版本和当前版本不一样时，先弹出这个对话框。
+  // 同意之前服务器只让读取和删除，所以这里只有两个选择：同意并继续，或者删除账号。
+  function reconsent(u,terms){
+    if(!u||u.consentVersion===terms.version)return Promise.resolve(u);
+    return new Promise(function(ok){
+      var w=el("div");w.id="reconsent";w.setAttribute("role","dialog");w.setAttribute("aria-modal","true");w.setAttribute("aria-labelledby","reconsent-h");
+      w.style.cssText="position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px";
+      var c=el("div","panel");c.style.cssText="max-width:440px;width:100%;margin:0;max-height:100%;overflow:auto;box-sizing:border-box";
+      var h=el("h2",null,"条款有更新");h.id="reconsent-h";c.appendChild(h);
+      c.appendChild(el("p","lead","使用条款和隐私政策更新了（版本 "+terms.version+"）。继续使用之前，请看一下并重新确认。"));
+      if(typeof terms.changes==="string"&&terms.changes)c.appendChild(el("p",null,"这次的主要变化："+terms.changes));
+      var pp=el("p");var a1=el("a",null,"使用条款");a1.href="/terms.html";a1.target="_blank";var a2=el("a",null,"隐私政策");a2.href="/privacy.html";a2.target="_blank";pp.appendChild(a1);pp.appendChild(document.createTextNode(" 和 "));pp.appendChild(a2);c.appendChild(pp);
+      var bt=el("button","act","同意并继续");bt.type="button";bt.id="reconsent-ok";
+      var del=el("button","ghost","不同意，删除我的账号和全部数据");del.type="button";del.id="reconsent-del";
+      var msg=el("p","lead");msg.id="reconsent-msg";msg.setAttribute("role","status");
+      bt.onclick=function(){
+        bt.disabled=true;msg.textContent="";
+        api("POST","/users/"+acct.id+"/consent",{accept:terms.version}).then(function(nu){w.remove();ok(nu)})
+        .catch(function(e){bt.disabled=false;msg.textContent="没有记录成功："+why(e)});
+      };
+      del.onclick=function(){
+        if(!window.confirm(DEL_ASK))return;
+        del.disabled=true;removeAccount().catch(function(e){del.disabled=false;msg.textContent="账号没有删除成功，数据还在服务器上。"+why(e)});
+      };
+      var br=el("div","row");br.appendChild(bt);br.appendChild(del);c.appendChild(br);c.appendChild(msg);
+      w.appendChild(c);document.body.appendChild(w);bt.focus();
+    });
+  }
+  // “我的情况”里的“账号和邮箱”：绑定邮箱、解除绑定、看有几台设备登录着、让其他设备退出。
+  // 邮箱只显示服务器返回的打码地址；所有文字都用 textContent 放进去。
+  var EM={state:null,sessions:[],cid:null,addr:"",msg:"",rmsg:"",err:""};
+  function loadAcct(){
+    return Promise.all([api("GET","/users/"+acct.id+"/email"),api("GET","/users/"+acct.id+"/sessions")]).then(function(r){EM.state=r[0];EM.sessions=Array.isArray(r[1])?r[1]:[];EM.err="";renderAcct()},
+      function(e){EM.err="邮箱和登录设备的情况没有读出来："+why(e);renderAcct()});
+  }
+  // 邮件提醒的开关（真的会发信）：默认关，绑定了邮箱才能开。“账号和邮箱”和“提醒”页各放一个，是同一个设置。
+  var REMIND_TEXT="邮件提醒：期限前 7 天、前 1 天和当天各发一封到绑定的邮箱，邮件里写明是哪件事、哪一天，有官方页面的会带上链接，每封都带退订的链接。默认关闭；随时可以在这里关掉，也可以点邮件里的退订链接（不用登录）";
+  function remindToggle(id){
+    var lb=el("label","check"),cb=el("input");cb.type="checkbox";cb.id=id;lb.setAttribute("for",id);cb.checked=!!(EM.state&&EM.state.remindOptIn);
+    lb.appendChild(cb);lb.appendChild(document.createTextNode(REMIND_TEXT));
+    cb.onchange=function(){
+      var on=cb.checked;cb.disabled=true;
+      api("PUT","/users/"+acct.id+"/email/reminders",{on:on}).then(function(r){EM.state.remindOptIn=!!r.remindOptIn;EM.rmsg=r.remindOptIn?"邮件提醒已打开。":"邮件提醒已关闭，不会再发。";renderAcct()},
+        function(e){EM.rmsg="邮件提醒的设置没有改成："+why(e);renderAcct()});
+    };
+    return lb;
+  }
+  // “提醒”页里的邮件提醒：没绑定邮箱时说明去哪里绑定，绑定了就是开关
+  function renderRemMail(){
+    var box=$("rm-mail");box.textContent="";box.hidden=!acct||!started||!EM.state;
+    $("au-push-row").style.display=acct&&started?"none":""; // 连着服务器时不显示演示用的那个勾，免得和真的开关混在一起
+    if(box.hidden)return;
+    box.style.cssText="margin-top:14px;border-top:1px solid var(--line);padding-top:12px";
+    var h=el("h3",null,"邮件提醒");h.style.cssText="margin:0 0 6px;font-size:15px";box.appendChild(h);
+    if(!EM.state.email){var p0=el("p","lead","现在只能打开这一页看提醒。想让期限前 7 天、前 1 天和当天各收到一封邮件，先在“闯关”页“我的情况”里的“账号和邮箱”绑定邮箱，再回到这里打开。");p0.id="rm-mail-state";box.appendChild(p0);return}
+    var p1=el("p","lead",EM.state.remindOptIn?"已打开，发到 "+EM.state.email+"。":"还没有打开。绑定的邮箱是 "+EM.state.email+"。");p1.id="rm-mail-state";box.appendChild(p1);
+    box.appendChild(remindToggle("rm-mail-on"));
+    var m=el("p","lead",EM.rmsg||"");m.id="rm-mail-msg";m.setAttribute("role","status");box.appendChild(m);
+  }
+  function renderAcct(){
+    renderRemMail();
+    var box=$("acct-box");box.textContent="";box.hidden=!acct||!started;if(box.hidden)return;
+    box.style.cssText="margin-top:14px;border-top:1px solid var(--line);padding:12px 0 56px";
+    var h=el("h3",null,"账号和邮箱");h.style.cssText="margin:0 0 6px;font-size:15px";box.appendChild(h);
+    if(EM.err){var er=el("p","lead",EM.err+" ");var rb=el("button","ghost","重试");rb.type="button";rb.id="em-reload";rb.onclick=function(){loadAcct()};er.appendChild(rb);box.appendChild(er)}
+    if(!EM.state)return;
+    var bound=!!EM.state.email;
+    var st=el("p","lead",bound?"已绑定邮箱："+EM.state.email+"。换设备或清空浏览器后，在“开始之前”的窗口里点“已有账号？用邮箱找回”，就能回到这个账号。":"还没有绑定邮箱。账号只记在这台设备的浏览器里：换设备或清空浏览器后就找不回来了。绑定邮箱后可以用邮箱找回。");st.id="em-state";box.appendChild(st);
+    var addr=el("input");addr.type="email";addr.id="em-addr";addr.setAttribute("autocomplete","email");addr.setAttribute("aria-label",bound?"换一个邮箱":"邮箱地址");addr.placeholder=bound?"换一个邮箱":"邮箱地址";addr.style.cssText="flex:1 1 180px;min-width:0";addr.value=EM.addr;addr.oninput=function(){EM.addr=addr.value};
+    var lb=el("label","check"),cb=el("input");cb.type="checkbox";cb.id="em-ok";lb.setAttribute("for","em-ok");lb.appendChild(cb);lb.appendChild(document.createTextNode("同意保存这个邮箱地址，用于找回账号、发送验证码和新设备登录通知"));
+    var sendB=el("button","act","发送验证码");sendB.type="button";sendB.id="em-send";
+    var msg=el("p","lead",EM.msg);msg.id="em-msg";msg.setAttribute("role","status");
+    function say(t){EM.msg=t;msg.textContent=t}
+    sendB.onclick=function(){
+      var v=addr.value.trim();if(!v){say("请先填邮箱。");return}
+      if(!cb.checked){say("请先勾选同意。");return}
+      sendB.disabled=true;say("");
+      api("POST","/users/"+acct.id+"/email",{email:v,consent:true}).then(function(r){
+        EM.cid=r.challengeId;EM.msg="验证码已经发到这个邮箱，10 分钟内有效。没收到的话看看垃圾邮件；这个邮箱如果已经绑定在别的账号上，收到的会是一封说明而不是验证码。";renderAcct();var c=$("em-code");if(c)c.focus();
+      },function(e){sendB.disabled=false;say("验证码没有发出去："+why(e))});
+    };
+    var r1=el("div","row");r1.appendChild(addr);r1.appendChild(sendB);box.appendChild(r1);box.appendChild(lb);
+    if(EM.cid){
+      var code=codeInput("em-code"),ver=el("button","act","确认绑定");ver.type="button";ver.id="em-verify";
+      ver.onclick=function(){
+        var v=code.value.trim();if(!/^\d{6}$/.test(v)){say("请填邮件里的 6 位验证码。");return}
+        ver.disabled=true;say("");
+        api("POST","/users/"+acct.id+"/email/verify",{challengeId:EM.cid,code:v}).then(function(r){
+          EM.cid=null;EM.addr="";EM.state=r;EM.rmsg="";EM.msg="邮箱已绑定。想在期限前收到邮件，可以在下面打开“邮件提醒”。";renderAcct();
+        },function(e){ver.disabled=false;say("没有绑定成功："+why(e))});
+      };
+      var r2=el("div","row");r2.appendChild(code);r2.appendChild(ver);box.appendChild(r2);
+    }
+    if(bound){
+      var rm=el("button","ghost","解除绑定");rm.type="button";rm.id="em-remove";
+      rm.onclick=function(){
+        if(!window.confirm("解除后，我们会删掉保存的邮箱地址，之后不能再用它找回这个账号。确定解除吗？"))return;
+        rm.disabled=true;
+        api("DELETE","/users/"+acct.id+"/email").then(function(){EM.state={email:null,verified:false,remindOptIn:false};EM.cid=null;EM.rmsg="";EM.msg="已解除绑定，邮箱地址已删除。";renderAcct()},function(e){rm.disabled=false;say("没有解除成功："+why(e))});
+      };
+      var r3=el("div","row");r3.appendChild(rm);box.appendChild(r3);
+      box.appendChild(remindToggle("em-remind"));
+      var rmsg=el("p","lead",EM.rmsg||"");rmsg.id="em-remind-msg";rmsg.setAttribute("role","status");box.appendChild(rmsg);
+    }
+    box.appendChild(msg);
+    // 登录着的设备
+    var h2=el("h3",null,"登录着的设备");h2.style.cssText="margin:14px 0 6px;font-size:15px";box.appendChild(h2);
+    var ul=el("ul","rem");ul.id="ses-list";
+    EM.sessions.forEach(function(x){var li=el("li");li.appendChild(el("span",null,(x.via==="recover"?"用邮箱找回登录的设备":"注册时的设备")+(x.current?"（这台设备）":"")));li.appendChild(el("time",null,String(x.createdAt||"").slice(0,10)));ul.appendChild(li)});
+    box.appendChild(ul);
+    if(EM.sessions.length>1){
+      var out=el("button","ghost","让其他设备退出登录");out.type="button";out.id="ses-revoke";
+      out.onclick=function(){
+        if(!window.confirm("其他设备会立刻退出登录，要再用得重新用邮箱找回。这台设备不受影响。确定吗？"))return;
+        out.disabled=true;
+        api("DELETE","/users/"+acct.id+"/sessions").then(function(){toast("其他设备已退出登录");return loadAcct()},function(e){out.disabled=false;say("没有操作成功："+why(e))});
+      };
+      var r4=el("div","row");r4.appendChild(out);box.appendChild(r4);
+    }
   }
   // 提醒页：记录会产生期限的事
   function renderEv(list){
@@ -1403,21 +1569,25 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
   // 有账号时不提供“恢复示例”：它会用示例人物覆盖真实的概况。示例只在没有账号的本地演示里用。
   function accountUi(){$("reset").hidden=!!acct;$("del-account").hidden=!acct;if(acct)ask=serverAsk}
   var reset0=$("reset").onclick;$("reset").onclick=function(){if(!acct)reset0.call(this)};
-  // 删除账号和全部数据：服务器上删掉，本机保存的账号、缓存和未保存标记一并清空
+  // 删除账号和全部数据：服务器上删掉（绑定的邮箱、别的设备的登录也一并删掉），本机保存的账号、缓存和未保存标记一并清空
+  var DEL_ASK="删除后，服务器上你的情况、进度、事件、咨询和收到的回复、绑定的邮箱会全部删掉，其他设备也会退出登录，这台设备上保存的内容也会清空，不能恢复。确定删除吗？";
+  function removeAccount(){
+    clearTimeout(timer);timer=null;clearTimeout(retryT);retryT=null;
+    return api("DELETE","/users/"+acct.id).catch(function(e){if(e.status===401||e.status===404)return null;throw e}) // 服务器上已经没有这个账号，也算删完
+    .then(function(){started=false;acct=null;[AK,DK,OK,KEY].forEach(lsDel);location.hash="";location.reload()});
+  }
   $("del-account").onclick=function(){
     if(!acct)return;
-    if(!window.confirm("删除后，服务器上你的情况、进度、事件、咨询和收到的回复会全部删掉，这台设备上保存的内容也会清空，不能恢复。确定删除吗？"))return;
-    var bt=$("del-account");bt.disabled=true;clearTimeout(timer);timer=null;clearTimeout(retryT);retryT=null;
-    api("DELETE","/users/"+acct.id).catch(function(e){if(e.status===401||e.status===404)return null;throw e}) // 服务器上已经没有这个账号，也算删完
-    .then(function(){started=false;acct=null;[AK,DK,OK,KEY].forEach(lsDel);location.hash="";location.reload()},
-      function(e){bt.disabled=false;note("账号没有删除成功，数据还在服务器上。"+why(e))});
+    if(!window.confirm(DEL_ASK))return;
+    var bt=$("del-account");bt.disabled=true;
+    removeAccount().catch(function(e){bt.disabled=false;note("账号没有删除成功，数据还在服务器上。"+why(e))});
   };
   function start(u){
     started=true;bootN=0;install();accountUi();$("ask-state").textContent="";
     if(dirty()&&owned()){bind();renderAll();send()} // 上次的修改没存上：以本机的内容为准发给服务器，不拿服务器的旧内容覆盖
     else{setDirty(false);adopt(u);note("")}
     window.ZAIRYU_API=true;
-    return Promise.all([loadEvents(),loadInq(),loadProv()]).catch(function(e){toast("有些内容没有读出来："+why(e))});
+    return Promise.all([loadEvents(),loadInq(),loadProv(),loadAcct()]).catch(function(e){toast("有些内容没有读出来："+why(e))});
   }
   function boot(){
     if(booting||started)return;booting=true;clearTimeout(bootT);
@@ -1427,7 +1597,8 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
       if(!acct)return null;
       // 只有服务器明确回答 401 或 404（没有这个账号或令牌不对）才丢掉本机保存的账号；连不上、5xx、429 都留着账号等重试
       return api("GET","/users/"+acct.id).catch(function(e){if(e.status!==401&&e.status!==404)throw e;acct=null;gone=true;unsaved=false;[AK,DK,OK].forEach(lsDel);accountUi();return null})})
-    .then(function(u){if(u)return u;note("");return api("GET","/terms").then(function(t){return consent(t.version)})})
+    // 没有账号：同意后新建，或用邮箱找回。有账号（含刚找回的）：同意的条款版本旧了就先重新同意。
+    .then(function(u){return api("GET","/terms").then(function(t){if(u)return reconsent(u,t);note("");return consent(t.version).then(function(nu){return reconsent(nu,t)})})})
     .then(function(u){booting=false;return start(u)})
     .catch(function(e){
       booting=false;if(started)return;

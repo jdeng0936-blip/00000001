@@ -262,3 +262,19 @@ test('敏感号码过滤：服务器自己产生的工具结果（路线、方�
     for (const t of historyTexts(history)) assert.equal(findSensitive(t), null, status + '：' + t.slice(0, 200));
   }
 });
+
+test('提示词：只提到服务器上真有的工具；不再说服务商是示例占位', () => {
+  const { systemPrompt } = require('../src/assistant');
+  const sys = systemPrompt(createEngine({}), '2026-11-27');
+  const names = new Set(TOOL_DEFS.map((t) => t.name));
+  const mentioned = sys.match(/\b[a-z]+_[a-z_]+\b/g) || [];
+  assert.ok(mentioned.includes('suggest_providers') && mentioned.includes('create_inquiry'));
+  for (const n of mentioned) assert.ok(names.has(n), '提示词提到了没有的工具：' + n);
+  assert.doesNotMatch(sys, /save_document/); assert.doesNotMatch(createEngine({}).SYS, /我的资料/);
+  assert.doesNotMatch(sys, /示例占位/);
+  assert.match(sys, /9\. 用户请你整理清单[^\n]*直接写在回答里。递交给官方的申请书、届出书、理由书等文书不制作。/);
+  // 网页本地演示里的 save_document 规则只在演示自己的补充规则里，不在和引擎共用的提示词里
+  const html = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'web', 'index.html'), 'utf8');
+  assert.match(html, /var DEMO_RULES="[^"]*save_document/); assert.match(html, /\{name:"save_document"/);
+  assert.match(html, /SYS\+kb\(\)\+DEMO_RULES/);
+});

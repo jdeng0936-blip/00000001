@@ -9,11 +9,18 @@ const EMPTY_PROFILE = { status: 'none', entry: '', addr: '', exp: '', ins: false
 // 验证码错几次作废、每个账号最多留几个找回登录、邮件发送失败后隔多久重试（分钟）
 const MAX_ATTEMPTS = 5, MAX_SESSIONS = 10, BACKOFF_MIN = [1, 5, 30, 120, 720];
 const DAY = 24 * 60 * 60 * 1000;
+// 验证码 10 分钟失效。验证码邮件过了这个时间还没发出去就不再发（发出去也用不了）。
+const CODE_TTL_MS = 10 * 60 * 1000;
 
 // opts.clock：返回毫秒时间的函数，测试里用它拨时间（验证码过期、限流窗口）。
 function createStore(file, opts) {
   const clock = (opts && opts.clock) || (() => Date.now());
   const db = new DatabaseSync(file || ':memory:');
+  // 这两项要在建表之前设好。
+  // busy_timeout：定时提醒可以由另一个进程跑（npm run remind），对方正在写的时候等一等，不直接报“数据库忙”（建表那一步也要读库，同样会撞上）。
+  // secure_delete：删掉的行（邮箱、备注、邮件正文）在文件里用零盖掉，不留在空闲页里。备份文件不归这里管，要按同样的期限清理。
+  db.exec('PRAGMA busy_timeout = 10000');
+  db.exec('PRAGMA secure_delete = ON');
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at TEXT NOT NULL, consent_version TEXT NOT NULL, consent_at TEXT NOT NULL, profile TEXT NOT NULL, done TEXT NOT NULL, plan TEXT NOT NULL, auth TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL, date TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
@@ -26,15 +33,23 @@ function createStore(file, opts) {
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL, last_used_at TEXT, via TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
     -- user_emails：只放验证过的邮箱，明文（发信要用），一个账号一个邮箱、一个邮箱一个账号。
-    -- remind_opt_in_at、unsub_token、bounced_at 是邮件提醒用的，现在只建列，还没有用到。
+    -- remind_opt_in_at：同意收提醒邮件的时间，空着就不发；unsub_token：退订链接里的令牌（每个邮箱一个，猜不到）；bounced_at：退信后停发（现在只能人工填）。
     CREATE TABLE IF NOT EXISTS user_emails (user_id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, verified_at TEXT NOT NULL, consent_version TEXT NOT NULL, remind_opt_in_at TEXT, unsub_token TEXT NOT NULL UNIQUE, bounced_at TEXT);
     -- email_challenges：验证码。只存 sha256(id:验证码)；purpose 是 bind 或 recover；找回时邮箱没绑定过也存一行（user_id 为空），两种情况走同样的路。
     CREATE TABLE IF NOT EXISTS email_challenges (id TEXT PRIMARY KEY, purpose TEXT NOT NULL, user_id TEXT, email TEXT NOT NULL, code_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL);
     -- rate_events：限流的滑动窗口。bucket 里是来源地址、邮箱、账号的哈希，不放原文。
     CREATE TABLE IF NOT EXISTS rate_events (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, at INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS rate_bucket ON rate_events (bucket, at);
-    -- outbox：所有要发出去的邮件先进这里。kind：code 验证码、notice 通知；status：queued、sent、failed。
+    -- outbox：所有要发出去的邮件先进这里。kind：code 验证码、notice 通知、reminder 期限提醒、
+    -- last 发给已经换掉或解除的邮箱的最后一封通知（发出或放弃后立即清掉地址和正文）、pad 不是邮件（见 enqueuePad）；
+    -- status：queued、sent、failed、dropped（发之前发现不该发了）。
     CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, user_id TEXT, kind TEXT NOT NULL, to_addr TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL, headers TEXT, status TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, next_try_at TEXT, last_error TEXT, created_at TEXT NOT NULL, sent_at TEXT);
+    -- reminder_sends：提醒邮件的去重账本。一行是“这个账号的这条提醒（rkey = sha256(标签|文字)）、这个到期日、这一档（7、1、0 天前）已经处理过”。
+    -- 主键保证同一档只会有一行：重启、两轮同时跑、两个进程一起跑，都只有先写进去的那一个发邮件。
+    -- status：queued 已排进发件箱、sent 已发出、failed 重试到上限仍没发出、dropped 发之前已办完或已退订、skipped 错过了这一档（只记账不发）。
+    CREATE TABLE IF NOT EXISTS reminder_sends (user_id TEXT NOT NULL, rkey TEXT NOT NULL, due TEXT NOT NULL, stage INTEGER NOT NULL, status TEXT NOT NULL, outbox_id TEXT, created_at TEXT NOT NULL, PRIMARY KEY (user_id, rkey, due, stage));
+    CREATE INDEX IF NOT EXISTS reminder_outbox ON reminder_sends (outbox_id);
+    CREATE INDEX IF NOT EXISTS outbox_due ON outbox (status, next_try_at);
   `);
   const now = () => new Date(clock()).toISOString();
   const isoOf = (ms) => new Date(ms).toISOString();
@@ -44,6 +59,8 @@ function createStore(file, opts) {
   const row = (u) => u && { id: u.id, createdAt: u.created_at, consentVersion: u.consent_version, profile: JSON.parse(u.profile), done: JSON.parse(u.done), plan: JSON.parse(u.plan), auth: JSON.parse(u.auth) };
   const prow = (p) => p && { id: p.id, name: p.name, category: p.category, area: p.area || '', langs: p.langs || '', feeNote: p.fee_note || '', licenseNo: p.license_no || '', feeModel: p.fee_model, active: !!p.active };
   const log = (userId, action, detail) => db.prepare('INSERT INTO audit (at,user_id,action,detail) VALUES (?,?,?,?)').run(now(), userId || null, action, detail ? JSON.stringify(detail) : null);
+  // 限流记录里按这个值（账号、邮箱）记的全部删掉。bucket 是“前缀:哈希”或“前缀:哈希:哈希”
+  const dropRate = (v) => db.prepare("DELETE FROM rate_events WHERE bucket LIKE '%:' || ? || '%'").run(hash(v));
   const repliesOf = (id) => db.prepare('SELECT text, created_at AS createdAt FROM replies WHERE inquiry_id=? ORDER BY created_at').all(id);
 
   return {
@@ -93,10 +110,16 @@ function createStore(file, opts) {
         const em = db.prepare('SELECT email FROM user_emails WHERE user_id=?').get(id);
         const addr = em ? em.email : '';
         db.prepare('DELETE FROM sessions WHERE user_id=?').run(id);
-        db.prepare('DELETE FROM email_challenges WHERE user_id=? OR email=?').run(id, addr);
-        db.prepare('DELETE FROM outbox WHERE user_id=? OR to_addr=?').run(id, addr);
+        db.prepare('DELETE FROM email_challenges WHERE user_id=?').run(id);
+        db.prepare('DELETE FROM outbox WHERE user_id=?').run(id);
+        // 按地址删的只在有地址时做：发完或不用发的邮件记录地址是空的，不能因为这个账号没绑邮箱就把别人的记录一起删掉
+        if (addr) {
+          db.prepare('DELETE FROM email_challenges WHERE email=?').run(addr);
+          db.prepare('DELETE FROM outbox WHERE to_addr=?').run(addr);
+        }
         db.prepare('DELETE FROM user_emails WHERE user_id=?').run(id);
-        for (const v of [id].concat(addr ? [addr] : [])) db.prepare("DELETE FROM rate_events WHERE bucket LIKE '%:' || ?").run(hash(v));
+        db.prepare('DELETE FROM reminder_sends WHERE user_id=?').run(id);
+        for (const v of [id].concat(addr ? [addr] : [])) dropRate(v);
         db.prepare('DELETE FROM users WHERE id=?').run(id);
         db.prepare('UPDATE audit SET user_id=NULL, detail=NULL WHERE user_id=?').run(id);
         log(null, 'user.delete');
@@ -123,6 +146,15 @@ function createStore(file, opts) {
       db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?)').run(userId, userId, MAX_SESSIONS);
       log(userId, 'session.recover');
       return token;
+    },
+    // 发请求的这个令牌是怎么来的：{ via: 'signup' 或 'recover', createdAt }。对不上返回 null。
+    sessionOf(userId, token) {
+      const u = db.prepare('SELECT token_hash, created_at FROM users WHERE id=?').get(userId);
+      if (!u || typeof token !== 'string') return null;
+      const h = hash(token);
+      if (same(u.token_hash, h)) return { via: 'signup', createdAt: u.created_at };
+      const s = db.prepare('SELECT via, created_at FROM sessions WHERE token_hash=? AND user_id=?').get(h, userId);
+      return s ? { via: s.via, createdAt: s.created_at } : null;
     },
     // 列出这个账号的登录。current 标出发请求的这一个。不返回令牌和哈希。
     listSessions(userId, token) {
@@ -153,15 +185,13 @@ function createStore(file, opts) {
     },
     userByEmail(email) { const r = db.prepare('SELECT user_id FROM user_emails WHERE email=?').get(email); return r ? r.user_id : null; },
     // 绑定（换绑时替换原来的）。邮箱已经绑在别的账号上时返回 false，什么都不改。留痕里不写邮箱。
-    bindEmail(userId, email, consentVersion) {
+    // notice：{ subject, body }，换了邮箱时发给原来那个邮箱的告知（不传就不发）。
+    bindEmail(userId, email, consentVersion, notice) {
       const owner = this.userByEmail(email);
       if (owner && owner !== userId) return false;
       this.tx(() => {
         const old = db.prepare('SELECT email FROM user_emails WHERE user_id=?').get(userId);
-        if (old && old.email !== email) { // 换了邮箱：旧邮箱的验证码和还没处理完的邮件不留
-          db.prepare('DELETE FROM email_challenges WHERE email=?').run(old.email);
-          db.prepare('DELETE FROM outbox WHERE to_addr=?').run(old.email);
-        }
+        if (old && old.email !== email) this.forgetAddress(userId, old.email, notice);
         if (old && old.email === email) db.prepare('UPDATE user_emails SET verified_at=?, consent_version=? WHERE user_id=?').run(now(), consentVersion, userId); // 同一个邮箱再验证一次：其他设置不动
         else {
           db.prepare('DELETE FROM user_emails WHERE user_id=?').run(userId);
@@ -171,32 +201,94 @@ function createStore(file, opts) {
       });
       return true;
     },
-    // 解除绑定：邮箱、没用完的验证码、发给这个邮箱的邮件一并删掉。账号还在。
-    removeEmail(userId) {
+    // 一个邮箱不再属于这个账号（换绑、解除）时清理：验证码、发完的邮件记录、按它记的限流次数都删掉，排着队的提醒邮件不发。
+    // 还没发出去的通知（例如“有新设备登录”）照发，再加一封 notice 告知“邮箱已更换或解除”：
+    // 这几封记为 last，发出或放弃后立即清掉地址和正文。原来的邮箱因此一定会收到消息，不会被人悄悄换掉。
+    forgetAddress(userId, addr, notice) {
+      db.prepare('DELETE FROM email_challenges WHERE email=?').run(addr);
+      this.dropReminderMails(userId, '邮箱已更换或解除');
+      db.prepare("DELETE FROM outbox WHERE to_addr=? AND (status<>'queued' OR kind='code')").run(addr);
+      db.prepare("UPDATE outbox SET kind='last' WHERE to_addr=? AND status='queued'").run(addr);
+      if (notice) {
+        db.prepare('INSERT INTO outbox (id,user_id,kind,to_addr,subject,body,headers,status,tries,next_try_at,last_error,created_at,sent_at) VALUES (?,?,?,?,?,?,NULL,?,0,?,NULL,?,NULL)')
+          .run(crypto.randomUUID(), userId, 'last', addr, notice.subject, notice.body, 'queued', now(), now());
+      }
+      dropRate(addr);
+    },
+    // 解除绑定：邮箱、没用完的验证码、发给这个邮箱的邮件记录一并删掉（最后一封告知发出后也清掉）。账号还在。
+    removeEmail(userId, notice) {
       return this.tx(() => {
         const old = db.prepare('SELECT email FROM user_emails WHERE user_id=?').get(userId);
-        db.prepare('DELETE FROM email_challenges WHERE user_id=? OR email=?').run(userId, old ? old.email : '');
-        db.prepare('DELETE FROM outbox WHERE user_id=? OR to_addr=?').run(userId, old ? old.email : '');
+        db.prepare('DELETE FROM email_challenges WHERE user_id=?').run(userId); // 这个账号正在绑定别的邮箱的验证码也作废
         if (!old) return false;
+        this.forgetAddress(userId, old.email, notice);
+        db.prepare("DELETE FROM outbox WHERE user_id=? AND kind='code'").run(userId);
         db.prepare('DELETE FROM user_emails WHERE user_id=?').run(userId);
         log(userId, 'email.remove');
         return true;
       });
     },
+    // ---- 提醒邮件：开关、退订、去重账本 ----
+    // 打开或关掉提醒邮件。没有绑定邮箱时返回 false。
+    setRemindOptIn(userId, on) {
+      const r = db.prepare('UPDATE user_emails SET remind_opt_in_at=? WHERE user_id=?').run(on ? now() : null, userId);
+      if (r.changes !== 1) return false;
+      // 关掉时，还在排队的提醒邮件不再发
+      if (!on) this.dropReminderMails(userId, '已关闭提醒');
+      log(userId, 'email.remind', { on: !!on });
+      return true;
+    },
+    // 凭邮件里的退订令牌关掉提醒，不用登录。令牌不存在、已经关掉的，什么都不改；返回有没有改动（接口不把它告诉对方）。
+    unsubscribeByToken(token) {
+      const r = typeof token === 'string' && token ? db.prepare('SELECT user_id FROM user_emails WHERE unsub_token=? AND remind_opt_in_at IS NOT NULL').get(token) : null;
+      if (!r) return false;
+      return this.tx(() => {
+        db.prepare('UPDATE user_emails SET remind_opt_in_at=NULL WHERE user_id=?').run(r.user_id);
+        this.dropReminderMails(r.user_id, '已退订');
+        log(r.user_id, 'email.unsubscribe');
+        return true;
+      });
+    },
+    // 定时任务用：同意收提醒、邮箱没有退信的账号
+    remindableUsers() { return db.prepare('SELECT user_id FROM user_emails WHERE remind_opt_in_at IS NOT NULL AND bounced_at IS NULL').all().map((r) => r.user_id); },
+    // 发提醒邮件要用的收件信息。没开提醒、退信了的返回 null。
+    remindTarget(userId) {
+      const r = db.prepare('SELECT email, unsub_token FROM user_emails WHERE user_id=? AND remind_opt_in_at IS NOT NULL AND bounced_at IS NULL').get(userId);
+      return r ? { email: r.email, unsubToken: r.unsub_token } : null;
+    },
+    // 占下“这条提醒、这个到期日、这一档”。占到了返回 true（只有这一次会是 true），已经有人占过返回 false。
+    claimReminder(userId, rkey, due, stage, status) {
+      return db.prepare('INSERT OR IGNORE INTO reminder_sends (user_id,rkey,due,stage,status,outbox_id,created_at) VALUES (?,?,?,?,?,NULL,?)').run(userId, rkey, due, stage, status, now()).changes === 1;
+    },
+    // 把刚占下的几条记到同一封邮件名下
+    attachReminders(userId, items, outboxId) {
+      for (const it of items) db.prepare("UPDATE reminder_sends SET outbox_id=? WHERE user_id=? AND rkey=? AND due=? AND stage=?").run(outboxId, userId, it.rkey, it.due, it.stage);
+    },
+    // 一封提醒邮件里有哪几条
+    remindersOfMail(outboxId) { return db.prepare('SELECT rkey, due, stage FROM reminder_sends WHERE outbox_id=?').all(outboxId); },
+    // 账本（测试和排查用）
+    listReminderSends(userId) { return db.prepare('SELECT rkey, due, stage, status, outbox_id AS outboxId FROM reminder_sends WHERE user_id=? ORDER BY due, stage DESC, rkey').all(userId); },
+    // 用户关掉提醒、退订、换掉或解除邮箱：还在排队的提醒邮件不发了，清掉正文和地址，记为 dropped。
+    // 账本里这几条（从没发出去过）直接删掉，不记成 dropped：用户马上又打开提醒的话，这一档还能重新排上，不会白白少一封。
+    dropReminderMails(userId, why) {
+      for (const r of db.prepare("SELECT id FROM outbox WHERE user_id=? AND kind='reminder' AND status='queued'").all(userId)) {
+        db.prepare("DELETE FROM reminder_sends WHERE outbox_id=? AND status='queued'").run(r.id);
+        this.dropMail(r.id, why);
+      }
+    },
     // ---- 验证码 ----
     // code 为空时存一个谁也猜不到的哈希：这行验证码永远验不过（邮箱没绑定过、或已绑在别的账号上时用）。
-    // 同一用途、同一邮箱（绑定时还有同一账号）之前没用掉的验证码同时作废。
+    // 重新发送时作废旧验证码，只限“同一个账号发起的绑定”。找回是不登录的，谁都能对着一个邮箱点“发送”：
+    // 要是新的一发就作废旧的，知道邮箱的人就能让本人手里的验证码一直失效。所以找回的验证码各自有效到过期或用掉（一个邮箱能同时有几个，由发送的限流管住）。
     createChallenge(c, ttlMs) {
       const id = crypto.randomUUID(), t = clock();
-      db.prepare('UPDATE email_challenges SET used_at=? WHERE used_at IS NULL AND purpose=? AND (email=? OR (purpose=\'bind\' AND user_id=?))').run(isoOf(t), c.purpose, c.email, c.userId || '');
+      if (c.purpose === 'bind' && c.userId) db.prepare("UPDATE email_challenges SET used_at=? WHERE used_at IS NULL AND purpose='bind' AND user_id=?").run(isoOf(t), c.userId);
       db.prepare('INSERT INTO email_challenges (id,purpose,user_id,email,code_hash,attempts,expires_at,used_at,created_at) VALUES (?,?,?,?,?,0,?,NULL,?)')
         .run(id, c.purpose, c.userId || null, c.email, hash(id + ':' + (c.code || newToken())), isoOf(t + ttlMs), isoOf(t));
       return id;
     },
-    // 限流要按邮箱计数，先查这行验证码是发给哪个邮箱的（没有这一行返回 null）
-    challengeEmail(id) { const r = db.prepare('SELECT email FROM email_challenges WHERE id=?').get(String(id)); return r ? r.email : null; },
     // 核对验证码。对了返回 { userId, email } 并作废这一行；其余情况（没有这一行、用途不对、不是这个账号的、过期、用过、错满次数、验证码不对）一律返回 null。
-    // 每次核对先记一次尝试，再比较，所以同时发来的多个请求也超不过次数。
+    // 每次核对先记一次尝试，再比较，所以同时发来的多个请求也超不过次数。次数记在这一行验证码上：别人不知道这一行的 id，耗不掉它的次数。
     verifyChallenge(id, purpose, code, userId) {
       const t = isoOf(clock());
       const hit = db.prepare('UPDATE email_challenges SET attempts=attempts+1 WHERE id=? AND purpose=? AND used_at IS NULL AND expires_at>? AND attempts<?').run(String(id), purpose, t, MAX_ATTEMPTS).changes === 1;
@@ -206,6 +298,8 @@ function createStore(file, opts) {
       if (!hit || !c || !ok) return null;
       if (purpose === 'bind' && c.user_id !== userId) return null;
       if (db.prepare('UPDATE email_challenges SET used_at=? WHERE id=? AND used_at IS NULL').run(t, String(id)).changes !== 1) return null;
+      // 用掉一个之后，同一用途、同一邮箱（绑定时还要同一账号）其余没用的一并作废
+      db.prepare("UPDATE email_challenges SET used_at=? WHERE used_at IS NULL AND purpose=? AND email=? AND (purpose='recover' OR user_id=?)").run(t, purpose, c.email, c.user_id || '');
       return { userId: c.user_id, email: c.email };
     },
     // ---- 限流 ----
@@ -221,7 +315,8 @@ function createStore(file, opts) {
       for (const k of new Set(rules.map((r) => r.key))) db.prepare('INSERT INTO rate_events (bucket, at) VALUES (?,?)').run(k, t);
       return 0;
     },
-    rateKey(prefix, value) { return prefix + ':' + hash(String(value)); },
+    // 几个值各自哈希后用冒号连起来（例如 来源地址 + 邮箱）；删除账号、解除邮箱时按其中一段找出来删掉
+    rateKey(prefix, ...values) { return prefix + ':' + values.map((v) => hash(String(v))).join(':'); },
     // ---- 发件箱 ----
     enqueueMail(m) {
       const id = crypto.randomUUID();
@@ -229,37 +324,77 @@ function createStore(file, opts) {
         .run(id, m.userId || null, m.kind, m.to, m.subject, m.body, m.headers ? JSON.stringify(m.headers) : null, 'queued', now(), now());
       return id;
     },
-    // 取出到时间该发的邮件，并把下次重试时间先推后 10 分钟：同时跑的两轮发送不会把同一封发两次，发到一半进程退出的也会再试。
-    claimOutbox() {
-      const t = now(), later = isoOf(clock() + 10 * 60 * 1000), out = [];
-      for (const r of db.prepare("SELECT id, user_id AS userId, kind, to_addr AS \"to\", subject, body, headers FROM outbox WHERE status='queued' AND next_try_at<=? ORDER BY created_at, rowid").all(t)) {
-        if (db.prepare("UPDATE outbox SET next_try_at=? WHERE id=? AND status='queued' AND next_try_at<=?").run(later, r.id, t).changes === 1) out.push(Object.assign(r, { headers: r.headers ? JSON.parse(r.headers) : null }));
+    // 不是邮件的占位行。找回账号时邮箱没绑定过就不发邮件，但发邮件那一步要写几次库、会占住进程几毫秒，
+    // 外面的人紧跟着再发一个请求就能量出来“这个邮箱绑定过”。所以没绑定过时也排一行占位，发送那一步对它做同样多的读写，然后删掉。
+    enqueuePad() {
+      const id = crypto.randomUUID();
+      db.prepare('INSERT INTO outbox (id,user_id,kind,to_addr,subject,body,headers,status,tries,next_try_at,last_error,created_at,sent_at) VALUES (?,?,?,?,?,?,?,?,0,?,NULL,?,NULL)')
+        .run(id, null, 'pad', '', '', '', null, 'queued', now(), now());
+      return id;
+    },
+    finishPad(id) {
+      this.tx(() => {
+        db.prepare('SELECT kind FROM outbox WHERE id=?').get(id);
+        db.prepare("DELETE FROM outbox WHERE id=? AND kind='pad'").run(id);
+        db.prepare("UPDATE reminder_sends SET status='sent' WHERE outbox_id=?").run(id);
+      });
+    },
+    // 验证码过期以后，还没发出去的验证码邮件不再发：记为 dropped，清掉正文和地址
+    dropStaleCodes() {
+      db.prepare("UPDATE outbox SET status='dropped', next_try_at=NULL, body='', to_addr='', headers=NULL, last_error='验证码已过期' WHERE kind='code' AND status='queued' AND created_at<=?").run(isoOf(clock() - CODE_TTL_MS));
+    },
+    // 取出一封到时间该发的邮件（没有就返回 null），并把它的下次重试时间先推后 leaseMs（默认 10 分钟，要比发一封最慢的情况长）。
+    // 一封一封地占：占下之后马上就发，所以这一轮发得再久，排在后面的邮件也不会因为“占得太久”被另一个进程再发一遍；
+    // 发到一半进程退出的，过了这段时间会再试。
+    claimNext(leaseMs) {
+      this.dropStaleCodes();
+      const t = now(), later = isoOf(clock() + (leaseMs || 10 * 60 * 1000));
+      for (;;) {
+        const r = db.prepare("SELECT id, user_id AS userId, kind, to_addr AS \"to\", subject, body, headers FROM outbox WHERE status='queued' AND next_try_at<=? ORDER BY next_try_at, created_at, rowid LIMIT 1").get(t);
+        if (!r) return null;
+        // 别的进程刚好先占了这一封：再取下一封
+        if (db.prepare("UPDATE outbox SET next_try_at=? WHERE id=? AND status='queued' AND next_try_at<=?").run(later, r.id, t).changes === 1) return Object.assign(r, { headers: r.headers ? JSON.parse(r.headers) : null });
       }
-      return out;
     },
-    // blank：发完就把正文和收件地址清掉（真实发信时验证码邮件用）
-    markSent(id, blank) {
-      db.prepare("UPDATE outbox SET status='sent', sent_at=?, tries=tries+1, next_try_at=NULL, last_error=NULL" + (blank ? ", body='', to_addr=''" : '') + ' WHERE id=?').run(now(), id);
+    // blankCode：真实发信时，验证码邮件发完就把正文和收件地址清掉。发给已换掉的邮箱的最后一封（last）不管哪种发件方式都清。
+    markSent(id, blankCode) {
+      this.tx(() => {
+        const r = db.prepare('SELECT kind FROM outbox WHERE id=?').get(id);
+        const blank = r && (r.kind === 'last' || (blankCode && r.kind === 'code'));
+        db.prepare("UPDATE outbox SET status='sent', sent_at=?, tries=tries+1, next_try_at=NULL, last_error=NULL" + (blank ? ", body='', to_addr=''" : '') + ' WHERE id=?').run(now(), id);
+        db.prepare("UPDATE reminder_sends SET status='sent' WHERE outbox_id=?").run(id);
+      });
     },
+    // 发之前发现不该发了（已办完、已退订、邮箱换了）：不发，清掉正文和地址，只留一条记录
+    dropMail(id, why) {
+      db.prepare("UPDATE outbox SET status='dropped', next_try_at=NULL, body='', to_addr='', headers=NULL, last_error=? WHERE id=? AND status='queued'").run(String(why || '').slice(0, 300), id);
+      db.prepare("UPDATE reminder_sends SET status='dropped' WHERE outbox_id=? AND status='queued'").run(id);
+    },
+    // 发之前按最新情况重写了标题和正文
+    updateMail(id, m) { db.prepare('UPDATE outbox SET subject=?, body=?, headers=? WHERE id=?').run(m.subject, m.body, m.headers ? JSON.stringify(m.headers) : null, id); },
     // 发送失败：1 分钟、5 分钟、30 分钟、2 小时、12 小时后各重试一次，第 5 次重试还失败就记为 failed，不再发
     markFailed(id, err) {
-      const r = db.prepare('SELECT tries FROM outbox WHERE id=?').get(id); if (!r) return;
+      const r = db.prepare('SELECT tries, kind FROM outbox WHERE id=?').get(id); if (!r) return;
       const tries = r.tries + 1, giveUp = tries > BACKOFF_MIN.length;
       db.prepare('UPDATE outbox SET status=?, tries=?, next_try_at=?, last_error=? WHERE id=?').run(giveUp ? 'failed' : 'queued', tries, giveUp ? null : isoOf(clock() + BACKOFF_MIN[tries - 1] * 60 * 1000), String(err).slice(0, 300), id);
+      if (giveUp) db.prepare("UPDATE reminder_sends SET status='failed' WHERE outbox_id=?").run(id);
+      // 放弃的验证码邮件、发给已换掉的邮箱的最后一封：地址和正文不留
+      if (giveUp && (r.kind === 'code' || r.kind === 'last')) db.prepare("UPDATE outbox SET body='', to_addr='', headers=NULL WHERE id=?").run(id);
     },
     // 测试、本地开发和运维排查用。f：{ status, to }
     listOutbox(f) {
       f = f || {};
-      return db.prepare('SELECT id, user_id AS userId, kind, to_addr AS "to", subject, body, headers, status, tries, next_try_at AS nextTryAt, last_error AS lastError, created_at AS createdAt, sent_at AS sentAt FROM outbox ORDER BY created_at, rowid').all()
+      return db.prepare('SELECT id, user_id AS userId, kind, to_addr AS "to", subject, body, headers, status, tries, next_try_at AS nextTryAt, last_error AS lastError, created_at AS createdAt, sent_at AS sentAt FROM outbox WHERE kind<>\'pad\' ORDER BY created_at, rowid').all()
         .filter((r) => (!f.status || r.status === f.status) && (!f.to || r.to === f.to)).map((r) => Object.assign(r, { headers: r.headers ? JSON.parse(r.headers) : null }));
     },
-    // 定期清理：验证码过期 24 小时后删掉；限流记录留 24 小时；验证码邮件的正文 1 小时后清空；
+    // 定期清理：验证码过期 24 小时后删掉；限流记录留 24 小时；验证码邮件的正文 1 小时后清空（还在排队的不清空，过期就整封不发了）；
     // 发完或失败的邮件 30 天后清掉正文和收件地址，只留“发过一封什么类型的邮件”。
     purgeExpired() {
       const t = clock();
       db.prepare('DELETE FROM email_challenges WHERE expires_at<?').run(isoOf(t - DAY));
       db.prepare('DELETE FROM rate_events WHERE at<?').run(t - DAY);
-      db.prepare("UPDATE outbox SET body='' WHERE kind='code' AND body<>'' AND created_at<?").run(isoOf(t - 60 * 60 * 1000));
+      this.dropStaleCodes();
+      db.prepare("UPDATE outbox SET body='' WHERE kind='code' AND status<>'queued' AND body<>'' AND created_at<?").run(isoOf(t - 60 * 60 * 1000));
       db.prepare("UPDATE outbox SET body='', to_addr='', headers=NULL WHERE status<>'queued' AND to_addr<>'' AND created_at<?").run(isoOf(t - 30 * DAY));
     },
     // 测试用：每张新表里和这个账号、这个邮箱有关的行数
@@ -270,7 +405,8 @@ function createStore(file, opts) {
         emails: n('SELECT COUNT(*) AS n FROM user_emails WHERE user_id=? OR email=?', userId, email || ''),
         challenges: n('SELECT COUNT(*) AS n FROM email_challenges WHERE user_id=? OR email=?', userId, email || ''),
         outbox: n('SELECT COUNT(*) AS n FROM outbox WHERE user_id=? OR to_addr=?', userId, email || ''),
-        rate: n("SELECT COUNT(*) AS n FROM rate_events WHERE bucket LIKE '%:' || ? OR bucket LIKE '%:' || ?", hash(userId), hash(email || '\0'))
+        reminders: n('SELECT COUNT(*) AS n FROM reminder_sends WHERE user_id=?', userId),
+        rate: n("SELECT COUNT(*) AS n FROM rate_events WHERE bucket LIKE '%:' || ? || '%' OR bucket LIKE '%:' || ? || '%'", hash(userId), hash(email || '\0'))
       };
     },
     // ---- 事件 ----
@@ -325,4 +461,4 @@ function createStore(file, opts) {
     close() { db.close(); }
   };
 }
-module.exports = { createStore, EMPTY_PROFILE, MAX_ATTEMPTS };
+module.exports = { createStore, EMPTY_PROFILE, MAX_ATTEMPTS, CODE_TTL_MS };

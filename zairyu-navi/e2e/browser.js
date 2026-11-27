@@ -314,6 +314,200 @@ async function step(name, fn) {
     assert.equal(await p.evaluate(() => P.status), 'hsp');
   });
 
+  // 发到某个邮箱的最后一封验证码邮件里的验证码（本地发件方式下，邮件留在发件箱里，从管理接口读）
+  const mailCode = async (to, after) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000) {
+      const rows = (await json('/api/admin/outbox?to=' + encodeURIComponent(to), { headers: adm })).filter((r) => r.kind === 'code' && !(after || []).includes(r.id));
+      if (rows.length) { const r = rows[rows.length - 1]; return { id: r.id, code: /验证码：(\d{6})/.exec(r.body)[1] }; }
+      await p.waitForTimeout(100);
+    }
+    throw new Error('发件箱里没有发给 ' + to + ' 的验证码邮件');
+  };
+  const MAIL = 'e2e.user@example.com';
+  let bindMail;
+
+  await step('绑定邮箱：不勾同意不发；填验证码后绑定，页面只显示打码的地址；能看到登录着的设备', async () => {
+    await go('#route'); await p.evaluate(() => { document.getElementById('prof').open = true; });
+    await p.waitForSelector('#em-addr', { timeout: 5000 });
+    assert.match(await p.innerText('#em-state'), /还没有绑定邮箱/);
+    assert.equal(await p.locator('#ses-list li').count(), 1); assert.match(await p.innerText('#ses-list'), /注册时的设备（这台设备）/);
+    assert.equal(await p.isVisible('#ses-revoke'), false, '只有一台设备时没有“让其他设备退出登录”');
+    await p.fill('#em-addr', ' E2E.User@Example.com ');
+    await p.click('#em-send');
+    assert.match(await p.innerText('#em-msg'), /请先勾选同意/);
+    assert.equal((await json('/api/admin/outbox', { headers: adm })).length, 0, '没勾同意时不应当发邮件');
+    await p.check('#em-ok'); await p.click('#em-send');
+    await p.waitForSelector('#em-code', { timeout: 5000 });
+    bindMail = await mailCode(MAIL);
+    // 填错：说明原因，输入框还在
+    await p.fill('#em-code', bindMail.code === '000000' ? '111111' : '000000'); await p.click('#em-verify');
+    await p.waitForFunction(() => /验证码不对或已过期/.test(document.getElementById('em-msg').textContent), null, { timeout: 5000 });
+    assert.equal((await json(`/api/users/${acct.id}/email`, { headers: h })).email, null, '验证码不对时不应当绑定');
+    await p.fill('#em-code', bindMail.code); await p.click('#em-verify');
+    await p.waitForFunction(() => /已绑定邮箱：e\*\*\*@example\.com/.test(document.getElementById('em-state').textContent), null, { timeout: 5000 });
+    assert.deepEqual(await json(`/api/users/${acct.id}/email`, { headers: h }), { email: 'e***@example.com', verified: true, remindOptIn: false });
+    assert.ok(!(await p.innerText('#acct-box')).includes('e2e.user'), '页面上不显示完整的邮箱');
+    assert.equal(await p.isVisible('#em-remove'), true);
+    await p.screenshot({ path: '/tmp/e2e-email.png', fullPage: true });
+  });
+
+  await step('清空浏览器后用邮箱找回：验证码从发件箱读；回到同一个账号，内容读回来；原来的令牌还能用；收到新设备登录的通知', async () => {
+    const want = await get();
+    const old = { id: acct.id, token: acct.token };
+    await p.evaluate(() => localStorage.clear());
+    await p.reload();
+    await p.waitForSelector('#consent-ok', { timeout: 5000 });
+    assert.equal(await p.evaluate(() => localStorage.getItem('zairyu-account')), null);
+    assert.equal(await p.isVisible('#rc-addr'), false, '找回的表单点了才展开');
+    await p.click('#recover-open');
+    // 没绑定过的邮箱：页面的提示和绑定过的一样，不说“没有这个账号”
+    await p.fill('#rc-addr', 'nobody.e2e@example.com'); await p.click('#rc-send');
+    await p.waitForSelector('#rc-code', { state: 'visible', timeout: 5000 });
+    const unknownMsg = await p.innerText('#rc-msg');
+    assert.match(unknownMsg, /如果这个邮箱绑定过账号/);
+    await p.fill('#rc-code', '123456'); await p.click('#rc-verify');
+    await p.waitForFunction(() => /没有找回：验证码不对或已过期/.test(document.getElementById('rc-msg').textContent), null, { timeout: 5000 });
+    assert.equal(await p.evaluate(() => localStorage.getItem('zairyu-account')), null, '验证码不对时不应当登录');
+    // 绑定过的邮箱
+    await p.fill('#rc-addr', MAIL); await p.click('#rc-send');
+    await p.waitForFunction((m) => document.getElementById('rc-msg').textContent === m, unknownMsg, { timeout: 5000 });
+    const m = await mailCode(MAIL, [bindMail.id]);
+    await p.screenshot({ path: '/tmp/e2e-recover.png' });
+    await p.fill('#rc-code', m.code); await p.click('#rc-verify');
+    await apiReady(p);
+    acct = await p.evaluate(() => JSON.parse(localStorage.getItem('zairyu-account')));
+    assert.equal(acct.id, old.id, '应当回到原来的账号'); assert.notEqual(acct.token, old.token, '这台设备拿到的是新令牌');
+    h = { authorization: 'Bearer ' + acct.token, 'content-type': 'application/json' };
+    assert.equal(await p.isVisible('#consent'), false);
+    assert.equal(await p.evaluate(() => P.status), want.profile.status, '概况应当从服务器读回来');
+    assert.deepEqual(await p.evaluate(() => DONE), want.done);
+    assert.equal((await fetch(`${base}/api/users/${old.id}`, { headers: { authorization: 'Bearer ' + old.token } })).status, 200, '原来的设备不掉线');
+    const notice = (await json('/api/admin/outbox?to=' + encodeURIComponent(MAIL), { headers: adm })).filter((r) => r.kind === 'notice');
+    assert.equal(notice.length, 1); assert.match(notice[0].subject, /新设备/);
+    // 找回之后改的内容照常存到服务器
+    await go('#route'); await p.evaluate(() => { document.getElementById('prof').open = true; });
+    await p.check('#f-lic'); await p.waitForTimeout(800);
+    assert.equal((await get()).profile.lic, true);
+    await p.uncheck('#f-lic'); await p.waitForTimeout(800);
+    // 刚用邮箱找回登录的设备不能马上解除邮箱：页面显示服务器的说明，邮箱还绑着
+    await p.waitForSelector('#em-remove', { timeout: 5000 });
+    await p.click('#em-remove');
+    await p.waitForFunction(() => /没有解除成功：这台设备是刚用邮箱找回登录的，24 小时内不能更换或解除绑定的邮箱/.test(document.getElementById('em-msg').textContent), null, { timeout: 5000 });
+    assert.equal((await json(`/api/users/${acct.id}/email`, { headers: h })).email, 'e***@example.com');
+
+    // 让其他设备退出登录：原来的令牌失效，这台设备还在
+    await p.waitForSelector('#ses-revoke', { timeout: 5000 });
+    assert.equal(await p.locator('#ses-list li').count(), 2);
+    assert.match(await p.innerText('#ses-list'), /用邮箱找回登录的设备（这台设备）/);
+    dialogs = [];
+    await p.click('#ses-revoke');
+    await p.waitForFunction(() => document.querySelectorAll('#ses-list li').length === 1, null, { timeout: 5000 });
+    assert.equal(dialogs.length, 1, '退出其他设备之前先确认');
+    assert.equal((await fetch(`${base}/api/users/${old.id}`, { headers: { authorization: 'Bearer ' + old.token } })).status, 401, '原来的令牌应当失效');
+    assert.equal((await get()).profile.status, want.profile.status, '这台设备还登录着');
+    // 被退出的设备再打开：提示登录失效，并能用邮箱找回
+    const ctx4 = await b.newContext(); const p4 = await ctx4.newPage(); p4.on('pageerror', (e) => errs.push(e.message));
+    await p4.addInitScript((a) => { if (!sessionStorage.getItem('seeded')) { sessionStorage.setItem('seeded', '1'); localStorage.setItem('zairyu-account', JSON.stringify(a)); } }, old);
+    await p4.goto(base + '/'); await p4.waitForSelector('#consent-ok', { timeout: 5000 });
+    assert.match(await p4.innerText('#consent'), /已经失效/); assert.match(await p4.innerText('#consent'), /用邮箱找回/);
+    await ctx4.close();
+  });
+
+  await step('邮件提醒：默认关；在“提醒”页打开后，跑一轮定时任务，发件箱里有提醒邮件（全文、依据、应用和退订链接），再跑不重发；打开退订链接点“退订”，服务器和页面上都变成关的', async () => {
+    const E = `/api/users/${acct.id}/email`;
+    // 记一件 10 天前的“换工作”：14 天的期限还剩 4 天（按日本时间的今天算）
+    const jstDay = (offset) => new Date(Math.floor((Date.now() + 9 * 3600000) / 86400000) * 86400000 + offset * 86400000).toISOString().slice(0, 10);
+    const made = await (await fetch(`${base}/api/users/${acct.id}/events`, { method: 'POST', headers: h, body: JSON.stringify({ type: 'job_change', date: jstDay(-10) }) })).json();
+    const due = (await json(`/api/users/${acct.id}/reminders`, { headers: h })).filter((r) => r.tag === '事件' && r.date === jstDay(4));
+    assert.equal(due.length, 1, '应当有一条 4 天后到期的事件期限');
+    await p.reload(); await apiReady(p); await go('#reminders');
+    await p.waitForSelector('#rm-mail-on', { timeout: 5000 });
+    assert.equal(await p.isChecked('#rm-mail-on'), false, '默认是关的');
+    assert.match(await p.innerText('#rm-mail'), /期限前 7 天、前 1 天和当天各发一封/);
+    assert.match(await p.innerText('#rm-mail-state'), /还没有打开。绑定的邮箱是 e\*\*\*@example\.com/);
+    assert.equal(await p.isVisible('#au-push-row'), false, '连着服务器时不显示演示用的“邮件提醒”');
+    assert.equal((await json(E, { headers: h })).remindOptIn, false);
+    // 没打开时跑定时任务：不发
+    const run = async () => (await fetch(base + '/api/admin/reminders/run', { method: 'POST', headers: adm })).json();
+    const reminderMails = async () => (await json('/api/admin/outbox?to=' + encodeURIComponent(MAIL), { headers: adm })).filter((r) => r.kind === 'reminder');
+    assert.deepEqual([(await run()).mails, (await reminderMails()).length], [0, 0]);
+    // 打开
+    await p.check('#rm-mail-on');
+    await p.waitForFunction(() => /邮件提醒已打开/.test((document.getElementById('rm-mail-msg') || {}).textContent || ''), null, { timeout: 5000 });
+    assert.equal((await json(E, { headers: h })).remindOptIn, true);
+    assert.equal(await p.isChecked('#rm-mail-on'), true);
+    await go('#route'); await p.evaluate(() => { document.getElementById('prof').open = true; });
+    assert.equal(await p.isChecked('#em-remind'), true, '“账号和邮箱”里的开关是同一个设置');
+    await go('#reminders');
+    await p.screenshot({ path: '/tmp/e2e-remind.png', fullPage: true });
+    // 跑一轮：发出一封；再跑一轮：不重发
+    const first = await run();
+    assert.deepEqual([first.users, first.mails, first.sent, first.failed], [1, 1, 1, 0]);
+    assert.ok(first.items >= 1);
+    const again = await run();
+    assert.deepEqual([again.mails, again.sent], [0, 0], '同一档只发一次');
+    const mails = await reminderMails();
+    assert.equal(mails.length, 1); assert.equal(mails[0].status, 'sent');
+    const body = mails[0].body;
+    assert.match(mails[0].subject, /^【在留导航】有 \d+ 件事/);
+    // 事件期限在邮件里用不分在留资格的写法（页面上的那句按身份写，邮件要经过邮件服务商）
+    assert.match(body, /所属机关有变动（离开或加入）：自变动之日起14天内，向入管提交所属机关的届出/, '邮件里写明是哪件事');
+    assert.doesNotMatch(body, /高度专门职|技术·人文知识|留学|家族滞在|特定技能|经营·管理/, '邮件里不出现在留资格的名称');
+    assert.match(body, /（还有 4 天）/);
+    assert.ok(body.includes(due[0].src.url), '带官方页面的链接');
+    assert.match(body, /https?:\/\/[^\s]+\/#reminders/, '带打开应用的链接');
+    assert.ok(!body.includes(MAIL) && !body.includes(acct.id) && !body.includes(acct.token), '邮件里没有邮箱、账号编号和令牌');
+    const link = /(https?:\/\/[^\s/]+)(\/api\/unsubscribe\?t=[\w-]+)/.exec(body);
+    assert.ok(link, '带退订链接');
+    // 退订：另开一个没有登录的浏览器打开邮件里的链接
+    const ctx5 = await b.newContext(); const p5 = await ctx5.newPage(); p5.on('pageerror', (e) => errs.push(e.message));
+    await p5.goto(base + link[2]);
+    await p5.waitForSelector('#unsub-go', { timeout: 5000 });
+    assert.equal(await p5.evaluate(() => localStorage.getItem('zairyu-account')), null, '退订不用登录');
+    assert.equal((await json(E, { headers: h })).remindOptIn, true, '只是打开链接不会退订');
+    await p5.screenshot({ path: '/tmp/e2e-unsub.png' });
+    await p5.click('#unsub-go');
+    await p5.waitForSelector('#unsub-done', { timeout: 5000 });
+    assert.match(await p5.innerText('body'), /已退订/);
+    await ctx5.close();
+    assert.equal((await json(E, { headers: h })).remindOptIn, false, '服务器上已经关掉');
+    await p.reload(); await apiReady(p); await go('#reminders');
+    await p.waitForSelector('#rm-mail-on', { timeout: 5000 });
+    assert.equal(await p.isChecked('#rm-mail-on'), false, '页面上也是关的');
+    assert.match(await p.innerText('#rm-mail-state'), /还没有打开/);
+    assert.deepEqual([(await run()).users, (await reminderMails()).length], [0, 1], '退订后不再发');
+    // 收尾：删掉这件事，后面的步骤不受影响
+    assert.equal((await fetch(`${base}/api/users/${acct.id}/events/${made.id}`, { method: 'DELETE', headers: h })).status, 204);
+  });
+
+  await step('条款改版：同意的是旧版本的账号再打开时先弹出重新同意，同意后才进入；服务器记下新版本', async () => {
+    // 服务器上的版本改不了，这里把读取账号的返回改成“同意的是旧版本”，对话框和之后的请求都是真的
+    const me = '**/api/users/' + acct.id; let faked = 0;
+    await p.route(me, async (r) => {
+      if (r.request().method() !== 'GET') return r.continue();
+      const res = await r.fetch(); const j = await res.json(); j.consentVersion = '2020-01-01'; faked++;
+      return r.fulfill({ response: res, json: j });
+    });
+    await p.reload();
+    await p.waitForSelector('#reconsent-ok', { timeout: 5000 });
+    assert.ok(faked >= 1);
+    assert.match(await p.innerText('#reconsent'), /条款有更新/); assert.match(await p.innerText('#reconsent'), /主要变化/);
+    assert.equal(await p.evaluate(() => window.ZAIRYU_API === true), false, '重新同意之前不进入');
+    assert.equal(await p.isVisible('#reconsent-del'), true, '不同意的人可以直接删除账号');
+    await p.screenshot({ path: '/tmp/e2e-reconsent.png' });
+    await p.unroute(me);
+    let posted = null;
+    p.on('request', (q) => { if (q.method() === 'POST' && /\/consent$/.test(q.url())) posted = q.postDataJSON(); });
+    await p.click('#reconsent-ok');
+    await apiReady(p);
+    assert.equal(await p.isVisible('#reconsent'), false);
+    const terms = await json('/api/terms');
+    assert.deepEqual(posted, { accept: terms.version }, '同意时带的是当前版本');
+    assert.equal((await get()).consentVersion, terms.version);
+    assert.ok(await p.evaluate(() => localStorage.getItem('zairyu-account')), '账号还在');
+  });
+
   await step('本机保存的账号在服务器上不存在（401）：才丢掉账号，重新走同意流程', async () => {
     const ctx3 = await b.newContext(); const p3 = await ctx3.newPage(); p3.on('pageerror', (e) => errs.push(e.message));
     await p3.addInitScript(() => { if (!sessionStorage.getItem('seeded')) { sessionStorage.setItem('seeded', '1'); localStorage.setItem('zairyu-account', JSON.stringify({ id: 'no-such-account', token: 'x' })); } });

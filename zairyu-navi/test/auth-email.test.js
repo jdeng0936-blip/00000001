@@ -7,7 +7,7 @@ const { findSensitive } = require('../src/validate');
 
 const WIDE = { max: 100000, windowMs: 3600000 };
 // 不测限流的用例把限流放宽；验证码错 5 次作废这一条不受影响
-const LOOSE = { reqEmail: [WIDE], reqIp: [WIDE], reqUser: [WIDE], verIp: [WIDE], verEmail: [WIDE], verUser: [WIDE] };
+const LOOSE = { reqEmail: [WIDE], reqEmailAll: [WIDE], reqIp: [WIDE], reqUser: [WIDE], verIp: [WIDE], verUser: [WIDE] };
 async function start(opts) {
   let t = Date.parse('2026-11-27T03:00:00Z');
   const clock = () => t;
@@ -49,7 +49,7 @@ test('绑定邮箱：要先同意；验证码发到邮箱，输对了才绑定�
     assert.equal(noConsent.status, 422); assert.match(noConsent.body.error, /同意/);
     assert.equal(s.app.store.listOutbox().length, 0, '没同意就不发邮件');
     // 写法：大小写和首尾空白不影响；写法不对的拒绝
-    for (const bad of ['', 'abc', 'a@b', 'a b@example.com', 'a@@example.com', 'a..b@example.com', 'a@example..com', '<a>@example.com', 'a@example.com\nbcc: x@y.z', 'x'.repeat(250) + '@example.com', 123, null]) {
+    for (const bad of ['', 'abc', 'a@b', 'a b@example.com', 'a@@example.com', 'a@example..com', '<a>@example.com', 'a@example.com\nbcc: x@y.z', 'x'.repeat(250) + '@example.com', 123, null]) {
       assert.equal((await s.call('POST', E, { email: bad, consent: true }, u.token)).status, 422, JSON.stringify(bad));
     }
     const r = await s.call('POST', E, { email: '  Li.Hua+jp@Example.COM ', consent: true }, u.token);
@@ -211,32 +211,51 @@ test('绑定别人已经绑定的邮箱：响应一样，发过去的是说明�
     const late = await s.call('POST', `/api/users/${u1.id}/email/verify`, { challengeId: q1.body.challengeId, code: c1 }, u1.token);
     assert.equal(late.status, 422); assert.match(late.body.error, /验证码不对或已过期/);
     assert.equal(s.app.store.getEmail(u1.id), null); assert.equal(s.app.store.userByEmail('race@example.com'), u2.id);
+    // 存储层自己也守着“一个邮箱一个账号”：验证码对了、邮箱却刚被别人绑走时，不改任何东西
+    assert.equal(s.app.store.bindEmail(u1.id, 'race@example.com', V), false);
+    assert.equal(s.app.store.userByEmail('race@example.com'), u2.id); assert.equal(s.app.store.getEmail(u1.id), null);
   } finally { await s.stop(); }
 });
 
-test('限流：发验证码按邮箱（1 分钟 1 次、1 小时 5 次）、按账号、按来源地址；没绑定过的邮箱一样受限；被限的请求不发邮件', async () => {
+test('限流：发验证码按（来源地址，邮箱）1 分钟 1 次、1 小时 5 次，每个邮箱合计 1 小时 12 次，另按账号、按来源地址；没绑定过的邮箱一样受限；被限的请求不发邮件', async () => {
   const s = await start({ emailLimits: {}, trustProxy: true });
   const from = (ip) => ({ 'x-forwarded-for': '203.0.113.9, ' + ip });
   try {
-    // 按邮箱：60 秒内第二次是 429，带 retry-after
+    // 同一个来源地址对同一个邮箱：60 秒内第二次是 429，带 retry-after
     const first = await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.1'));
     assert.equal(first.status, 202);
-    const second = await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.2'));
+    const second = await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.1'));
     assert.equal(second.status, 429); assert.equal(second.headers.get('retry-after'), '60'); assert.match(second.body.error, /太频繁/);
+    // 别的来源地址对同一个邮箱各算各的：别人刚点过“发送”，不耽误本人马上再发
+    assert.equal((await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.2'))).status, 202);
     // 绑定过的邮箱也是同样的限制、同样的响应
     const u = await s.newUser(); await s.bind(u, 'known@example.com');
     assert.equal((await s.call('POST', '/api/auth/recover', { email: 'known@example.com' }, null, from('10.0.0.3'))).status, 202);
+    await s.app.deliver();
     const n = s.app.store.listOutbox().length;
-    const k2 = await s.call('POST', '/api/auth/recover', { email: 'known@example.com' }, null, from('10.0.0.4'));
+    const k2 = await s.call('POST', '/api/auth/recover', { email: 'known@example.com' }, null, from('10.0.0.3'));
     assert.equal(k2.status, 429); assert.deepEqual(k2.body, second.body);
+    await s.app.deliver();
     assert.equal(s.app.store.listOutbox().length, n, '被限流的请求不发邮件');
     // 1 小时 5 次：每次隔 61 秒，第 6 次被拒
-    for (let i = 0; i < 4; i++) { s.advance(61 * 1000); assert.equal((await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.1.' + i))).status, 202, '第 ' + (i + 2) + ' 次'); }
+    for (let i = 0; i < 4; i++) { s.advance(61 * 1000); assert.equal((await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.1'))).status, 202, '第 ' + (i + 2) + ' 次'); }
     s.advance(61 * 1000);
-    const sixth = await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.2.1'));
+    const sixth = await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.1'));
     assert.equal(sixth.status, 429); assert.ok(+sixth.headers.get('retry-after') > 3000, '要等到一小时窗口过去');
+    assert.equal((await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.7'))).status, 202, '这个来源地址满了，不影响别的来源地址');
     s.advance(60 * MIN);
-    assert.equal((await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.2.2'))).status, 202, '窗口过去后恢复');
+    assert.equal((await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' }, null, from('10.0.0.1'))).status, 202, '窗口过去后恢复');
+    // 每个邮箱合计 1 小时 12 次：换多少个来源地址，发到同一个邮箱的邮件也有上限
+    s.advance(61 * MIN);
+    for (let i = 0; i < 12; i++) assert.equal((await s.call('POST', '/api/auth/recover', { email: 'known@example.com' }, null, from('10.3.0.' + i))).status, 202, '合计第 ' + (i + 1) + ' 次');
+    const over = await s.call('POST', '/api/auth/recover', { email: 'known@example.com' }, null, from('10.3.0.99'));
+    assert.equal(over.status, 429); assert.match(over.body.error, /太频繁/);
+    assert.equal((await s.call('POST', '/api/auth/recover', { email: 'other@example.com' }, null, from('10.3.0.99'))).status, 202, '别的邮箱不受影响');
+    // 绑定按（账号，邮箱）算：同一个账号对同一个邮箱 60 秒内第二次是 429；别的账号对同一个邮箱不受影响
+    const x = await s.newUser(), y = await s.newUser();
+    assert.equal((await s.call('POST', `/api/users/${x.id}/email`, { email: 'same@example.com', consent: true }, x.token, from('10.4.0.1'))).status, 202);
+    assert.equal((await s.call('POST', `/api/users/${x.id}/email`, { email: 'same@example.com', consent: true }, x.token, from('10.4.0.2'))).status, 429);
+    assert.equal((await s.call('POST', `/api/users/${y.id}/email`, { email: 'same@example.com', consent: true }, y.token, from('10.4.0.3'))).status, 202);
     // 按来源地址：同一个地址 1 小时 10 次，换邮箱也没用；别的地址不受影响
     for (let i = 0; i < 10; i++) assert.equal((await s.call('POST', '/api/auth/recover', { email: `p${i}@example.com` }, null, from('10.9.9.9'))).status, 202);
     assert.equal((await s.call('POST', '/api/auth/recover', { email: 'p10@example.com' }, null, from('10.9.9.9'))).status, 429);
@@ -251,7 +270,7 @@ test('限流：发验证码按邮箱（1 分钟 1 次、1 小时 5 次）、按�
   } finally { await s.stop(); }
 });
 
-test('限流：核对验证码按来源地址、按邮箱、按账号；不开 TRUST_PROXY 时不看 X-Forwarded-For', async () => {
+test('限流：核对验证码按来源地址、按账号；不开 TRUST_PROXY 时不看 X-Forwarded-For', async () => {
   const tight = { max: 3, windowMs: 3600000 };
   // 按来源地址
   let s = await start({ emailLimits: Object.assign({}, LOOSE, { verIp: [tight] }), trustProxy: true });
@@ -263,19 +282,6 @@ test('限流：核对验证码按来源地址、按邮箱、按账号；不开 T
     assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: 'c9', code: '123456' }, null, { 'x-forwarded-for': '10.1.1.2' })).status, 422, '别的地址不受影响');
     const u = await s.newUser();
     assert.equal((await s.call('POST', `/api/users/${u.id}/email/verify`, { challengeId: 'c9', code: '123456' }, u.token, hdr)).status, 429, '绑定的核对也按来源地址限');
-  } finally { await s.stop(); }
-  // 按邮箱：同一个邮箱的验证码（哪怕重新发了新的）合计只能试 3 次
-  s = await start({ emailLimits: Object.assign({}, LOOSE, { verEmail: [tight] }) });
-  try {
-    const u = await s.newUser(); await s.bind(u, 'li@example.com'); // 绑定时核对过 1 次
-    const a = await s.call('POST', '/api/auth/recover', { email: 'li@example.com' });
-    for (let i = 0; i < 2; i++) assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: a.body.challengeId, code: '000001' })).status, 422);
-    const b = await s.call('POST', '/api/auth/recover', { email: 'li@example.com' });
-    assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: b.body.challengeId, code: s.codeIn(s.lastMail('li@example.com')) })).status, 429, '换一个新验证码也不能接着试');
-    // 没绑定过的邮箱同样受限
-    const c = await s.call('POST', '/api/auth/recover', { email: 'nobody@example.com' });
-    for (let i = 0; i < 3; i++) assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: c.body.challengeId, code: '000001' })).status, 422);
-    assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: c.body.challengeId, code: '000001' })).status, 429);
   } finally { await s.stop(); }
   // 按账号；并且没开 TRUST_PROXY 时伪造 X-Forwarded-For 不起作用
   s = await start({ emailLimits: Object.assign({}, LOOSE, { verUser: [tight], verIp: [{ max: 5, windowMs: 3600000 }] }) });
@@ -330,11 +336,20 @@ test('登录的设备：能看到几台、哪台是自己；让其他设备退�
     assert.equal((await s.call('GET', `/api/users/${v.id}`, null, d2)).status, 401);
     // 退出之后还能再找回
     assert.equal((await s.recover('wang@example.com')).status, 200);
+    // 一个账号最多留 10 个找回登录：再多就把最早的挤掉
+    const toks = [];
+    for (let i = 0; i < 12; i++) toks.push((await s.recover('wang@example.com')).body.token);
+    const live = (await s.call('GET', `/api/users/${v.id}/sessions`, null, toks[11])).body;
+    assert.equal(live.filter((x) => x.via === 'recover').length, 10);
+    assert.equal((await s.call('GET', `/api/users/${v.id}`, null, toks[0])).status, 401, '最早的被挤掉');
+    assert.equal((await s.call('GET', `/api/users/${v.id}`, null, toks[11])).status, 200);
+    assert.equal((await s.call('GET', `/api/users/${v.id}`, null, v.token)).status, 200, '注册时的设备不受影响');
   } finally { await s.stop(); }
 });
 
-test('解除绑定：邮箱、没用完的验证码、发给它的邮件都删掉；之后找回不了；账号和已有的登录还在', async () => {
-  const s = await start();
+test('解除绑定：邮箱、没用完的验证码、发给它的邮件都删掉；原来的邮箱收到一封告知，发出后记录里不留地址；之后找回不了；账号和已有的登录还在', async () => {
+  const got = [];
+  const s = await start({ sender: { name: 'cap', dev: true, send: async (m) => { got.push(m); return {}; } } });
   try {
     const u = await s.newUser(), E = `/api/users/${u.id}/email`;
     await s.bind(u, 'li@example.com');
@@ -343,14 +358,23 @@ test('解除绑定：邮箱、没用完的验证码、发给它的邮件都删�
     const code = s.codeIn(s.lastMail('li@example.com'));
     assert.equal((await s.call('DELETE', E, null, u.token)).status, 204);
     assert.deepEqual((await s.call('GET', E, null, u.token)).body, { email: null, verified: false, remindOptIn: false });
+    await s.app.deliver();
     const fp = s.app.store.emailFootprint(u.id, 'li@example.com');
-    assert.equal(fp.emails, 0); assert.equal(fp.challenges, 0); assert.equal(fp.outbox, 0);
+    assert.equal(fp.emails, 0); assert.equal(fp.challenges, 0); assert.equal(s.app.store.emailFootprint('no-such-user', 'li@example.com').rate, 0, '按这个邮箱记的限流次数也删掉');
+    // 最后一封告知发到了原来的邮箱；发出之后发件箱里哪一行都不带这个地址
+    const bye = got.filter((m) => /已经解除/.test(m.subject));
+    assert.equal(bye.length, 1); assert.equal(bye[0].to, 'li@example.com'); assert.match(bye[0].text, /让其他设备退出登录/); assert.doesNotMatch(bye[0].text, /https?:\/\//);
+    assert.ok(!JSON.stringify(s.app.store.listOutbox()).includes('li@example.com'), '发件箱里不留地址');
+    const last = s.app.store.listOutbox().filter((m) => m.kind === 'last');
+    assert.deepEqual(last.map((m) => [m.status, m.to, m.body]), [['sent', '', '']]);
     assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: pending.body.challengeId, code })).status, 422, '解除之前发的验证码作废');
     const r = await s.call('POST', '/api/auth/recover', { email: 'li@example.com' });
-    assert.equal(r.status, 202); assert.equal(s.app.store.listOutbox({ to: 'li@example.com' }).length, 0, '解除后不再给它发邮件');
+    await s.app.deliver();
+    assert.equal(r.status, 202); assert.equal(s.app.store.listOutbox({ to: 'li@example.com' }).length, 0, '解除后不再给它发邮件'); assert.equal(got.filter((m) => m.to === 'li@example.com').pop(), bye[0], '告知是发给它的最后一封');
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 200);
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, d2)).status, 200, '已经登录的设备不受影响');
     assert.equal((await s.call('DELETE', E, null, u.token)).status, 204, '没有邮箱时再解除也不报错');
+    await s.app.deliver(); assert.equal(got.filter((m) => /已经解除/.test(m.subject)).length, 1, '没有邮箱时不发告知');
     // 解除后别的账号可以绑这个邮箱
     const v = await s.newUser(); assert.equal((await s.bind(v, 'li@example.com')).email, 'l***@example.com');
   } finally { await s.stop(); }
@@ -370,7 +394,7 @@ test('删除账号：邮箱、验证码、别的设备的登录、发件箱、�
     const before = s.app.store.emailFootprint(u.id, 'li@example.com');
     for (const k of ['sessions', 'emails', 'challenges', 'outbox', 'rate']) assert.ok(before[k] > 0, '删除之前 ' + k + ' 里有记录');
     assert.equal((await s.call('DELETE', `/api/users/${u.id}`, null, d2)).status, 204, '用找回的设备也能删除账号');
-    assert.deepEqual(s.app.store.emailFootprint(u.id, 'li@example.com'), { sessions: 0, emails: 0, challenges: 0, outbox: 0, rate: 0 });
+    assert.deepEqual(s.app.store.emailFootprint(u.id, 'li@example.com'), { sessions: 0, emails: 0, challenges: 0, outbox: 0, reminders: 0, rate: 0 });
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 401);
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, d2)).status, 401);
     // 整个库里不再出现这个邮箱（发件箱、留痕）
@@ -409,7 +433,8 @@ test('留痕：绑定、找回、退出、解除、删除都有记录，但不�
     };
     const acts = check();
     for (const a of ['email.bind', 'session.recover', 'session.revoke']) assert.ok(acts.includes(a), a);
-    await s.call('DELETE', `/api/users/${u.id}/email`, null, d2);
+    s.advance(25 * 60 * MIN); // 刚找回的设备 24 小时内不能解除邮箱
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, null, d2)).status, 204);
     assert.ok(check().includes('email.remove'));
     await s.call('DELETE', `/api/users/${u.id}`, null, d2);
     const rows = s.app.store.auditRows(); check();
@@ -478,7 +503,7 @@ test('发件箱接口：没配 ADMIN_TOKEN 是 503，令牌不对是 401；本�
   } finally { await s.stop(); }
 });
 
-test('发送失败：接口照常返回；按 1 分钟、5 分钟…重试；一直失败最后记为 failed；恢复后能发出去', async () => {
+test('发送失败：接口照常返回；按 1 分钟、5 分钟…重试；恢复后能发出去；验证码邮件过了 10 分钟不再发，通知邮件一直失败最后记为 failed', async () => {
   let fail = true; const got = [];
   const s = await start({ sender: { name: 'flaky', dev: true, send: async (m) => { if (fail) throw new Error('对方服务器 500'); got.push(m); return {}; } } });
   try {
@@ -492,11 +517,31 @@ test('发送失败：接口照常返回；按 1 分钟、5 分钟…重试；一
     s.advance(61 * 1000); fail = false; await s.app.deliver();
     row = s.lastMail('li@example.com'); assert.equal(row.status, 'sent'); assert.equal(got.length, 1);
     await s.app.deliver(); assert.equal(got.length, 1, '发过的不再发');
-    // 一直失败：第 1 次加 5 次重试之后是 failed
+    // 验证码邮件一直失败：1 分钟、5 分钟后各重试一次；验证码 10 分钟就过期了，之后不再发（发出去也用不了），记为 dropped，地址和正文清掉
     fail = true; s.advance(61 * 1000);
     await s.call('POST', `/api/users/${u.id}/email`, { email: 'li@example.com', consent: true }, u.token);
+    await s.app.deliver();
+    const codeRow = s.lastMail('li@example.com').id, find = (id) => s.app.store.listOutbox().find((m) => m.id === id);
+    for (const waitMin of [1, 5]) { s.advance(waitMin * MIN + 1000); await s.app.deliver(); }
+    assert.deepEqual([find(codeRow).status, find(codeRow).tries], ['queued', 3]);
+    s.advance(30 * MIN + 1000); fail = false; await s.app.deliver();
+    assert.deepEqual([find(codeRow).status, find(codeRow).to, find(codeRow).body, find(codeRow).lastError], ['dropped', '', '', '验证码已过期']);
+    assert.equal(got.length, 1, '过期的验证码没有发出去');
+    // 清理也不会把还在排队的验证码邮件清成空信再发：过期就整封不发
+    fail = true;
+    await s.call('POST', `/api/users/${u.id}/email`, { email: 'li@example.com', consent: true }, u.token);
+    await s.app.deliver();
+    const row2 = s.lastMail('li@example.com').id;
+    s.advance(61 * MIN); s.app.purge(); fail = false; await s.app.deliver();
+    assert.equal(find(row2).status, 'dropped'); assert.equal(got.length, 1); assert.ok(got.every((m) => m.text), '没有发出过空白的邮件');
+    // 通知邮件一直失败：第 1 次加 5 次重试之后是 failed
+    const v = await s.newUser(); await s.bind(v, 'wang@example.com');
+    const q = await s.call('POST', '/api/auth/recover', { email: 'wang@example.com' });
+    await s.app.deliver();
+    fail = true;
+    assert.equal((await s.call('POST', '/api/auth/recover/verify', { challengeId: q.body.challengeId, code: s.codeIn(s.lastMail('wang@example.com')) })).status, 200);
     for (const waitMin of [0, 1, 5, 30, 120, 720, 720]) { s.advance(waitMin * MIN + 1000); await s.app.deliver(); }
-    row = s.lastMail('li@example.com'); assert.equal(row.status, 'failed'); assert.equal(row.tries, 6);
+    row = s.lastMail('wang@example.com'); assert.equal(row.kind, 'notice'); assert.equal(row.status, 'failed'); assert.equal(row.tries, 6);
   } finally { await s.stop(); }
 });
 
@@ -545,7 +590,7 @@ test('条款改版：老用户重新同意之前只能读取和删除自己的�
     assert.equal(me.status, 200); assert.equal(me.body.consentVersion, '2026-11-26'); assert.equal(me.body.profile.status, 'work');
     // 重新同意之前：写入、助手、咨询、绑定邮箱都拦下
     for (const [m, p, b] of [['PATCH', '/profile', { status: 'hsp' }], ['PUT', '/state', { profile: {}, done: {} }], ['POST', '/chat', { message: '你好', history: [] }], ['GET', '/plan'], ['GET', '/reminders'],
-      ['POST', '/events', { type: 'move', date: '2026-11-20' }], ['GET', '/inquiries'], ['POST', '/email', { email: 'a@example.com', consent: true }], ['GET', '/email'], ['GET', '/sessions']]) {
+      ['POST', '/events', { type: 'move', date: '2026-11-20' }], ['GET', '/inquiries'], ['POST', '/email', { email: 'a@example.com', consent: true }], ['PUT', '/email/reminders', { on: true }], ['GET', '/sessions']]) {
       const r = await s.call(m, `/api/users/${u.id}${p}`, b, u.token);
       assert.equal(r.status, 409, m + ' ' + p); assert.match(r.body.error, /已更新/);
     }
@@ -567,6 +612,15 @@ test('条款改版：老用户重新同意之前只能读取和删除自己的�
     assert.equal((await s.call('PATCH', `/api/users/${old2.id}/profile`, { status: 'work' }, old2.token)).status, 409);
     assert.equal((await s.call('DELETE', `/api/users/${old2.id}`, null, old2.token)).status, 204);
     assert.equal(store.getUser(old2.id), undefined);
+    // 不同意的人也能“收回”：查看绑定的邮箱、关掉邮件提醒、解除邮箱。不然条款一改，邮件照发而他关不掉
+    const old4 = store.createUser('2026-11-26'); store.bindEmail(old4.id, 'old4@example.com', '2026-11-26'); store.setRemindOptIn(old4.id, true);
+    const E4 = `/api/users/${old4.id}/email`;
+    assert.deepEqual((await s.call('GET', E4, null, old4.token)).body, { email: 'o***@example.com', verified: true, remindOptIn: true });
+    assert.equal((await s.call('PUT', E4 + '/reminders', { on: true }, old4.token)).status, 409, '打开不行');
+    const off = await s.call('PUT', E4 + '/reminders', { on: false }, old4.token);
+    assert.equal(off.status, 200); assert.deepEqual(off.body, { remindOptIn: false }); assert.equal(store.remindTarget(old4.id), null);
+    assert.equal((await s.call('DELETE', E4, null, old4.token)).status, 204); assert.equal(store.getEmail(old4.id), null);
+    assert.equal((await s.call('GET', `/api/users/${old4.id}/plan`, null, old4.token)).status, 409, '其余照旧要先同意');
     // 用邮箱找回的老用户也一样要先重新同意
     const old3 = store.createUser('2026-11-26'); store.bindEmail(old3.id, 'old3@example.com', '2026-11-26');
     const rec = await s.recover('old3@example.com');

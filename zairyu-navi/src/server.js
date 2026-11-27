@@ -3,29 +3,59 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const createEngine = require('./engine');
-const { createStore } = require('./store');
+const { createStore, CODE_TTL_MS } = require('./store');
 
 const { validateProfilePatch, validateInquiry, isDate, assertNoSensitive, sensitiveLabel, normalizeEmail, maskEmail, HttpError } = require('./validate');
 const assistant = require('./assistant');
 const crypto = require('node:crypto');
-const { createSender, deliverOutbox, TEXTS } = require('./mailer');
+const { createSender, deliverOutbox, TEXTS, scrub } = require('./mailer');
+const { createScheduler, startReminderTimer } = require('./scheduler');
 
 // 使用条款和隐私政策的版本。文本改了就改这个版本号：老用户下次打开时要重新同意，同意之前只能读取或删除自己的数据。
 // TERMS_CHANGES 是给老用户看的“这次改了什么”，和版本号一起改。
 const TERMS_VERSION = '2026-11-27';
-const TERMS_CHANGES = '可以绑定邮箱，用来在换设备或清空浏览器后找回账号（自愿，不绑定也能用）；绑定后我们会保存你的邮箱地址，并通过邮件服务商发送验证码和新设备登录通知。';
-const CODE_TTL_MS = 10 * 60 * 1000;
+const TERMS_CHANGES = '可以绑定邮箱，用来在换设备或清空浏览器后找回账号（自愿，不绑定也能用）；绑定后我们会保存你的邮箱地址，并通过邮件服务商发送验证码和新设备登录通知。绑定后还可以另外打开“邮件提醒”（默认关闭）：期限前 7 天、前 1 天和当天各发一封邮件，邮件里写明是哪件事、哪一天，随时可以在应用里关掉或点邮件里的链接退订。';
 const HOUR = 60 * 60 * 1000;
-// 验证码的限流（次数存在数据库里，重启不清零）。“发验证码”按邮箱（绑定和找回分开计）、来源地址、账号各算一次；
-// “核对验证码”按来源地址、邮箱、账号算；每个验证码另外最多错 5 次（store.verifyChallenge）。
+// 验证码的限流（次数存在数据库里，重启不清零）。
+// “发验证码”：reqEmail 是比较紧的一档，找回按（来源地址，邮箱）计，绑定按（账号，邮箱）计——各人算各人的，
+//   别人对着你的邮箱点“发送”，耗不掉你自己的次数；reqEmailAll 是每个邮箱合计的上限（绑定和找回分开计），管住发到同一个邮箱的邮件总量；
+//   另外按来源地址、按账号各算一次。
+// “核对验证码”按来源地址、账号算；每个验证码另外最多错 5 次（store.verifyChallenge），次数记在验证码自己那一行上，不按邮箱合计
+//   （按邮箱合计的话，谁都能用自己要来的验证码把这个邮箱的次数耗光，让本人验不了）。
 const EMAIL_LIMITS = {
   reqEmail: [{ max: 1, windowMs: 60 * 1000 }, { max: 5, windowMs: HOUR }, { max: 10, windowMs: 24 * HOUR }],
+  reqEmailAll: [{ max: 12, windowMs: HOUR }, { max: 30, windowMs: 24 * HOUR }],
   reqIp: [{ max: 10, windowMs: HOUR }],
   reqUser: [{ max: 5, windowMs: HOUR }],
   verIp: [{ max: 30, windowMs: HOUR }],
-  verEmail: [{ max: 20, windowMs: HOUR }],
   verUser: [{ max: 30, windowMs: HOUR }]
 };
+// 刚用邮箱找回登录的设备，这么久之内不能更换或解除绑定的邮箱。
+// 拿到一次验证码（或一时能看到邮箱）的人因此不能马上把邮箱换成自己的；本人收到“有新设备登录”的通知后，有时间在自己的设备上让它退出。
+const EMAIL_COOLDOWN_MS = 24 * HOUR;
+
+// 退订页面：不用登录、不带脚本的一小页。文字都是固定的，令牌只出现在表单的地址里（已限定为字母、数字、横线、下划线）。
+const UNSUB_TOKEN = /^[A-Za-z0-9_-]{20,100}$/;
+const page = (title, inner) => '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>' + title + ' - 在留导航</title>' +
+  '<style>body{font:16px/1.7 system-ui,sans-serif;max-width:32em;margin:12vh auto;padding:0 20px;color:#1c2733}button{font:inherit;padding:10px 22px;border:0;border-radius:8px;background:#1f6feb;color:#fff;cursor:pointer}p.s{color:#5b6775;font-size:14px}</style></head><body><h1 style="font-size:20px">' + title + '</h1>' + inner + '</body></html>';
+const UNSUB_ASK = (t) => page('退订提醒邮件', '<p>点下面的按钮后，在留导航不再向这个邮箱发期限提醒邮件。账号、已填的内容和用邮箱找回账号的功能都不受影响。</p>' +
+  (t ? '<form method="post" action="/api/unsubscribe?t=' + t + '"><button type="submit" id="unsub-go">退订</button></form>' : '<p>这个退订链接不完整，请从邮件里重新打开。</p>') +
+  '<p class="s">以后想再收到提醒，在应用的“账号和邮箱”里重新打开“邮件提醒”。</p>');
+const UNSUB_DONE = page('已退订', '<p id="unsub-done">已退订。在留导航不会再向这个邮箱发期限提醒邮件。</p><p class="s">提醒仍然可以在应用的“提醒”页里看。以后想再收到邮件，在应用的“账号和邮箱”里重新打开“邮件提醒”。</p>');
+
+// 提醒邮件的设置（npm start 和 npm run remind 共用）。env 是环境变量那样的对象；设置不对就抛错，不启动。
+// APP_URL：邮件里“打开在留导航”和退订链接用的地址。接了真实发信（http、smtp）时必须填，不然发出去的链接指向 localhost。
+function reminderConfig(env, sender) {
+  env = env || {};
+  const raw = env.APP_URL || '';
+  if (raw && !/^https?:\/\/[^\s/?#]+(\/[^\s?#]*)?$/.test(raw)) throw new Error('APP_URL 须是 http:// 或 https:// 开头的地址，不带参数');
+  if (!raw && sender && !sender.dev) throw new Error('MAIL_SENDER=' + sender.name + ' 时需要配置 APP_URL（邮件里的链接要用）');
+  const num = (name, def, min, max) => { if (env[name] == null || env[name] === '') return def; const n = Number(env[name]); if (!Number.isInteger(n) || n < min || n > max) throw new Error(name + ' 须是 ' + min + ' 到 ' + max + ' 的整数'); return n; };
+  if (env.REMINDERS_ENABLED != null && !['', '0', '1'].includes(env.REMINDERS_ENABLED)) throw new Error('REMINDERS_ENABLED 须是 1 或 0');
+  return { appUrl: (raw || 'http://localhost:' + (+env.PORT || 8787)).replace(/\/+$/, ''), enabled: env.REMINDERS_ENABLED === '1', intervalMin: num('REMINDER_INTERVAL_MIN', 60, 1, 1440), hour: num('REMINDER_HOUR', 9, 0, 23) };
+}
+
+class Html { constructor(text) { this.text = text; } }
 
 function createApp(opts) {
   opts = opts || {};
@@ -36,13 +66,15 @@ function createApp(opts) {
   const sender = opts.sender || createSender({});
   const termsVersion = opts.termsVersion || TERMS_VERSION;
   const limits = Object.assign({}, EMAIL_LIMITS, opts.emailLimits || {});
+  const cooldownMs = opts.emailCooldownMs != null ? opts.emailCooldownMs : EMAIL_COOLDOWN_MS;
   const trustProxy = opts.trustProxy != null ? !!opts.trustProxy : process.env.TRUST_PROXY === '1';
   // 来源地址。TRUST_PROXY=1 时取 X-Forwarded-For 的最后一段（紧挨着的那层反向代理写的），否则取连接的对端地址。
   const clientIp = (req) => {
     if (trustProxy) { const last = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim(); if (last) return last; }
     return req.socket.remoteAddress || '';
   };
-  const nowOf = () => opts.now || undefined;
+  // 引擎用的“今天”：传了 now 就固定用它；只传了 clock（测试里拨时间）就跟着 clock 走；都没传用真实时间。
+  const nowOf = () => opts.now || (opts.clock ? clock() : undefined);
   const engineFor = (u) => createEngine({ profile: u.profile, done: u.done, plan: u.plan, auth: u.auth, events: store.listEvents(u.id), now: nowOf() });
   const adminToken = opts.adminToken || process.env.ADMIN_TOKEN || null;
   const bearer = (req) => (/^Bearer (.+)$/.exec(req.headers.authorization || '') || [])[1];
@@ -73,14 +105,21 @@ function createApp(opts) {
   const tooMany = (wait, msg) => new HttpError(429, msg + '，请在' + (wait >= 120 ? Math.ceil(wait / 60) + '分钟' : wait + '秒') + '后再试', { 'retry-after': String(wait) });
 
   // ---- 邮箱验证码 ----
-  const rules = (list, prefix, value) => list.map((r) => ({ key: store.rateKey(prefix, value), max: r.max, windowMs: r.windowMs }));
+  const rules = (list, prefix, ...values) => list.map((r) => ({ key: store.rateKey(prefix, ...values), max: r.max, windowMs: r.windowMs }));
   const limit = (rs, msg) => { const wait = store.hit(rs); if (wait) throw tooMany(wait, msg); };
   const newCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   const BAD_CODE = '验证码不对或已过期。请重新发送验证码再试';
   const codeOf = (b) => { if (!b || typeof b.challengeId !== 'string' || b.challengeId.length > 64 || typeof b.code !== 'string' || !/^\d{6}$/.test(b.code.trim())) throw new HttpError(422, BAD_CODE); return b.code.trim(); };
-  // 邮件在响应发出之后再交给发件方式，发得快慢不影响接口的响应时间
+  // 邮件在响应发出之后再交给发件方式，发得快慢不影响接口的响应时间。
+  // 发送那一步自己也要写库，会占住进程几毫秒；找回时邮箱没绑定过就排一行占位（store.enqueuePad），让这一步做的事一样多，
+  // 外面的人量紧跟着的下一个请求的快慢，也分不出邮箱绑没绑定过。
   let delivering = Promise.resolve();
-  const deliver = () => { delivering = delivering.then(() => deliverOutbox(store, sender)).catch((e) => { if (!closed) console.error(e); }); return delivering; };
+  // 期限提醒邮件的定时任务。这里只建好，不自己定时跑：npm start 按环境变量开定时器，测试直接调 remind()。
+  // appUrl：邮件里的链接用的地址（字符串，或返回字符串的函数）；不传就是这个服务器自己监听的端口。
+  const scheduler = createScheduler({ store, clock, now: opts.now, appUrl: () => (typeof opts.appUrl === 'function' ? opts.appUrl() : opts.appUrl) || 'http://localhost:' + ((server.address() || {}).port || 8787) });
+  let lastDeliver = { sent: 0, failed: 0, dropped: 0 };
+  // 日志里只写错误说明，并把像邮箱的东西换掉
+  const deliver = () => { delivering = delivering.then(() => deliverOutbox(store, sender, { prepare: (row) => scheduler.prepare(row) })).then((r) => { lastDeliver = r; return r; }).catch((e) => { if (!closed) console.error('发邮件时出错：' + scrub(e).slice(0, 200)); }); return delivering; };
   let closed = false, lastPurge = 0;
   const kick = () => setImmediate(() => { if (!closed) deliver(); });
   const purge = () => { if (clock() - lastPurge >= 60 * 1000) { lastPurge = clock(); store.purgeExpired(); } };
@@ -115,17 +154,33 @@ function createApp(opts) {
       return store.listOutbox({ status: url.searchParams.get('status') || undefined, to: to ? to.trim().toLowerCase() : undefined })
         .map((r) => Object.assign({ id: r.id, kind: r.kind, to: sender.dev || !r.to ? r.to : maskEmail(r.to), subject: r.subject, status: r.status, tries: r.tries, lastError: r.lastError, createdAt: r.createdAt, sentAt: r.sentAt }, sender.dev ? { body: r.body } : {}));
     }
+    // 定时提醒的手动入口（管理员令牌）：现在就跑一轮并把到时间的邮件发掉。运维补跑和端到端检查用；跑多少次都不会重复发。
+    if (seg[1] === 'admin' && seg[2] === 'reminders' && seg[3] === 'run' && !seg[4] && m === 'POST') {
+      admin(req);
+      const r = scheduler.runOnce();
+      const d = (await deliver()) || lastDeliver;
+      return Object.assign(r, { sent: d.sent, failed: d.failed, dropped: d.dropped });
+    }
+    // 退订提醒邮件：凭邮件里的链接，不用登录。GET 只显示确认页，什么都不改（邮件服务会预先打开链接，不能因此退订）；POST 才退订。
+    // 令牌对不对、原来开没开，返回的页面都一样。
+    if (seg[1] === 'unsubscribe' && !seg[2] && (m === 'GET' || m === 'POST')) {
+      const t = url.searchParams.get('t') || '', ok = UNSUB_TOKEN.test(t);
+      if (m === 'GET') return new Html(UNSUB_ASK(ok ? t : ''));
+      if (ok) store.unsubscribeByToken(t);
+      return new Html(UNSUB_DONE);
+    }
     // 找回账号：只凭邮箱，不用登录。不管这个邮箱有没有绑定过账号，返回的内容都一样。
     if (seg[1] === 'auth' && seg[2] === 'recover' && m === 'POST') {
       purge();
       if (!seg[3]) {
         const email = normalizeEmail(body && body.email); // 只看写法，和有没有绑定无关
-        limit(rules(limits.reqEmail, 'req-recover-em', email).concat(rules(limits.reqIp, 'req-ip', clientIp(req))), '验证码发得太频繁');
+        limit(rules(limits.reqEmail, 'req-recover-ie', clientIp(req), email).concat(rules(limits.reqEmailAll, 'req-recover-em', email), rules(limits.reqIp, 'req-ip', clientIp(req))), '验证码发得太频繁');
         const owner = store.userByEmail(email), code = newCode(), mail = TEXTS.recoverCode(code);
-        // 绑定过：存验证码并发邮件。没绑定过：存一个永远验不过的验证码，不发邮件。两种情况都是一次提交。
+        // 绑定过：存验证码并发邮件。没绑定过：存一个永远验不过的验证码，不发邮件，排一行占位。两种情况都是一次提交、写的行数一样。
         const challengeId = store.tx(() => {
           const id = store.createChallenge({ purpose: 'recover', userId: owner, email, code: owner ? code : null }, CODE_TTL_MS);
           if (owner) store.enqueueMail({ userId: owner, kind: 'code', to: email, subject: mail.subject, body: mail.text });
+          else store.enqueuePad();
           return id;
         });
         kick();
@@ -133,7 +188,7 @@ function createApp(opts) {
       }
       if (seg[3] === 'verify' && !seg[4]) {
         const code = codeOf(body);
-        limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verEmail, 'ver-em', store.challengeEmail(body.challengeId) || 'challenge ' + body.challengeId)), '验证码试得太频繁');
+        limit(rules(limits.verIp, 'ver-ip', clientIp(req)), '验证码试得太频繁');
         const c = store.verifyChallenge(body.challengeId, 'recover', code);
         // 验证码对了，还要这个邮箱此刻仍然绑在那个账号上（发码之后解除了绑定、删了账号的不算）
         if (!c || !c.userId || store.userByEmail(c.email) !== c.userId) throw new HttpError(422, BAD_CODE);
@@ -213,16 +268,25 @@ function createApp(opts) {
         return store.getUser(u.id);
       }
       // 同意的还是旧版本：只能读取自己的数据、删除账号、重新同意（上面三个），其余一律先拦下。
-      if (u.consentVersion !== termsVersion) throw new HttpError(409, '使用条款和隐私政策已更新（版本 ' + termsVersion + '）。请刷新页面，重新确认后继续使用');
+      // 例外是“收回”类的操作：查看绑定的邮箱、关掉邮件提醒、解除邮箱。不同意新条款的人也要能让我们不再给他发邮件、不再留着他的邮箱。
+      const withdraw = sub === 'email' && ((!seg[4] && (m === 'GET' || m === 'DELETE')) || (seg[4] === 'reminders' && !seg[5] && m === 'PUT' && !!body && body.on === false));
+      if (u.consentVersion !== termsVersion && !withdraw) throw new HttpError(409, '使用条款和隐私政策已更新（版本 ' + termsVersion + '）。请刷新页面，重新确认后继续使用');
       // ---- 邮箱：绑定、查看、解除 ----
       if (sub === 'email') {
         purge();
+        // 这台设备是刚用邮箱找回登录的、账号上已经绑着邮箱：暂时不能换绑或解除
+        const cooldown = () => {
+          const ses = store.sessionOf(u.id, bearer(req));
+          const left = ses && ses.via === 'recover' && store.getEmail(u.id) ? Date.parse(ses.createdAt) + cooldownMs - clock() : 0;
+          if (left > 0) throw new HttpError(403, '这台设备是刚用邮箱找回登录的，' + Math.round(cooldownMs / HOUR) + ' 小时内不能更换或解除绑定的邮箱（防止别人拿到一次验证码就把你的邮箱换掉）。请在' + (left >= HOUR ? Math.ceil(left / HOUR) + '小时' : Math.ceil(left / 60000) + '分钟') + '后再试，或者在注册时用的那台设备上操作');
+        };
         if (!seg[4] && m === 'GET') { const e = store.getEmail(u.id); return { email: e ? maskEmail(e.email) : null, verified: !!e, remindOptIn: !!e && e.remindOptIn }; }
         if (!seg[4] && m === 'POST') {
           const b = body || {};
           const email = normalizeEmail(b.email);
           if (b.consent !== true) throw new HttpError(422, '绑定之前要先同意我们保存这个邮箱地址，用于找回账号、发送验证码和新设备登录通知');
-          limit(rules(limits.reqEmail, 'req-bind-em', email).concat(rules(limits.reqIp, 'req-ip', clientIp(req)), rules(limits.reqUser, 'req-u', u.id)), '验证码发得太频繁');
+          cooldown();
+          limit(rules(limits.reqEmail, 'req-bind-ue', u.id, email).concat(rules(limits.reqEmailAll, 'req-bind-em', email), rules(limits.reqIp, 'req-ip', clientIp(req)), rules(limits.reqUser, 'req-u', u.id)), '验证码发得太频繁');
           // 这个邮箱已经绑在别的账号上：返回的内容一样，但发过去的是“已经绑定过”的说明，存下的验证码永远验不过。
           const owner = store.userByEmail(email), taken = !!owner && owner !== u.id;
           const code = newCode(), mail = taken ? TEXTS.taken() : TEXTS.bindCode(code);
@@ -236,12 +300,30 @@ function createApp(opts) {
         }
         if (seg[4] === 'verify' && !seg[5] && m === 'POST') {
           const code = codeOf(body);
-          limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verEmail, 'ver-em', store.challengeEmail(body.challengeId) || 'challenge ' + body.challengeId), rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
+          limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
+          cooldown();
           const c = store.verifyChallenge(body.challengeId, 'bind', code, u.id);
-          if (!c || !store.bindEmail(u.id, c.email, termsVersion)) throw new HttpError(422, BAD_CODE);
+          // 换了邮箱：给原来的邮箱发一封告知（不写新邮箱是什么），原来的邮箱因此不会被人悄悄换掉
+          const bye = TEXTS.emailChanged(clock());
+          if (!c || !store.bindEmail(u.id, c.email, termsVersion, { subject: bye.subject, body: bye.text })) throw new HttpError(422, BAD_CODE);
+          kick();
+          if (body.remindOptIn === true) store.setRemindOptIn(u.id, true); // 绑定时顺便打开提醒邮件（要明确传 true）
           return { email: maskEmail(c.email), verified: true, remindOptIn: store.getEmail(u.id).remindOptIn };
         }
-        if (!seg[4] && m === 'DELETE') { store.removeEmail(u.id); return [204, null]; }
+        if (!seg[4] && m === 'DELETE') {
+          cooldown();
+          const bye = TEXTS.emailRemoved(clock()); // 给解除掉的邮箱发最后一封告知，发出后地址就不留了
+          store.removeEmail(u.id, { subject: bye.subject, body: bye.text });
+          kick();
+          return [204, null];
+        }
+        // 提醒邮件的开关。默认关；只有绑定并验证过邮箱才能开。换绑邮箱后要重新开。
+        if (seg[4] === 'reminders' && !seg[5] && m === 'PUT') {
+          if (!body || typeof body.on !== 'boolean') throw new HttpError(422, 'on 须为 true 或 false');
+          if (!store.getEmail(u.id)) throw new HttpError(409, '要先绑定邮箱，才能打开邮件提醒');
+          store.setRemindOptIn(u.id, body.on);
+          return { remindOptIn: store.getEmail(u.id).remindOptIn };
+        }
         throw new HttpError(404, '没有这个接口');
       }
       // ---- 登录的设备：查看、让其他设备退出 ----
@@ -347,10 +429,12 @@ function createApp(opts) {
         const chunks = []; let size = 0;
         for await (const c of req) { size += c.length; if (size > 64 * 1024) throw new HttpError(413, '请求太大'); chunks.push(c); }
         const raw = Buffer.concat(chunks).toString('utf8');
-        if (raw) { try { body = JSON.parse(raw); } catch (e) { throw new HttpError(400, '请求体须为 JSON'); } }
+        // 退订的请求体不是 JSON（邮件客户端的一键退订发的是表单），读完就丢，不解析
+        if (raw && url.pathname !== '/api/unsubscribe') { try { body = JSON.parse(raw); } catch (e) { throw new HttpError(400, '请求体须为 JSON'); } }
         if (body !== null && (typeof body !== 'object' || Array.isArray(body))) throw new HttpError(400, '请求体须为 JSON 对象');
       }
       const r = await route(req, url, body);
+      if (r instanceof Html) return send(200, r, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff' });
       if (Array.isArray(r) && typeof r[0] === 'number') return send(r[0], r[1]);
       send(200, r);
     } catch (e) {
@@ -364,7 +448,7 @@ function createApp(opts) {
       try {
         if (res.headersSent || res.destroyed) { if (!res.writableEnded) res.destroy(); return; }
         res.writeHead(status, Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, headers || {}));
-        res.end(obj == null ? '' : JSON.stringify(obj));
+        res.end(obj == null ? '' : obj instanceof Html ? obj.text : JSON.stringify(obj));
       } catch (e) { console.error(e); try { res.destroy(); } catch (e2) { /* 连接已经没了 */ } }
     };
     req.on('error', () => {}); res.on('error', () => {});
@@ -373,18 +457,27 @@ function createApp(opts) {
   });
   server.on('close', () => { closed = true; });
   // deliver：现在就把发件箱里到时间的邮件发一轮（定时重试和测试用）；purge：清理过期的验证码等
-  return { server, store, sender, deliver, purge: () => store.purgeExpired(), termsVersion };
+  // remind(at)：跑一轮提醒（at 可以把“现在”定在某个时刻，测试用），只排进发件箱；发出去还要调 deliver()
+  return { server, store, sender, deliver, purge: () => store.purgeExpired(), termsVersion, scheduler, remind: (at) => scheduler.runOnce(at) };
 }
 
-module.exports = { createApp, validateProfilePatch, TERMS_VERSION };
+module.exports = { createApp, validateProfilePatch, TERMS_VERSION, reminderConfig, EMAIL_LIMITS };
 
 if (require.main === module) {
   const port = +process.env.PORT || 8787;
-  let sender;
-  // 发信的设置不全就不启动，并说清楚缺什么
-  try { sender = createSender(process.env); } catch (e) { console.error('邮件发送没有配置好：' + e.message); process.exit(1); }
-  const app = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db'), sender });
-  app.server.listen(port, () => console.log('在留导航 后端已启动： http://localhost:' + port + ' （邮件：' + sender.name + '）'));
+  let sender, rem;
+  // 发信和提醒的设置不全就不启动，并说清楚缺什么
+  try { sender = createSender(process.env); rem = reminderConfig(process.env, sender); } catch (e) { console.error('邮件发送没有配置好：' + e.message); process.exit(1); }
+  const app = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db'), sender, appUrl: rem.appUrl });
+  app.server.listen(port, () => console.log('在留导航 后端已启动： http://localhost:' + port + ' （邮件：' + sender.name + '；提醒邮件：' + (rem.enabled ? '每 ' + rem.intervalMin + ' 分钟检查一次，日本时间 ' + rem.hour + ' 点以后发' : '定时任务没开') + '）'));
   // 每分钟：重试没发出去的邮件，清理过期的验证码和限流记录
   setInterval(() => { app.deliver(); try { app.purge(); } catch (e) { console.error(e); } }, 60 * 1000).unref();
+  // 提醒邮件（REMINDERS_ENABLED=1 才开）：启动后先看一次，之后每隔 REMINDER_INTERVAL_MIN 分钟看一次；日本时间 REMINDER_HOUR 点之前不发，到点补跑一次。
+  // 一天里看多少次都只发一次（去重在 reminder_sends 表）。日志只有数量。
+  if (rem.enabled) {
+    // 轮到的时候还没到 REMINDER_HOUR 点，定时器会另外等到那个点再跑一次（src/scheduler.js 的 startReminderTimer）
+    startReminderTimer(rem, () => {
+      try { const r = app.remind(); if (r.mails || r.errors) console.log('提醒邮件：新排了 ' + r.mails + ' 封（' + r.items + ' 条）' + (r.errors ? '，' + r.errors + ' 个账号处理出错' : '')); app.deliver(); } catch (e) { console.error('提醒邮件：这一轮出错：' + scrub(e).slice(0, 200)); }
+    });
+  }
 }

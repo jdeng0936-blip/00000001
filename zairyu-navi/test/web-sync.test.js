@@ -18,7 +18,7 @@ test('网页内嵌的规则逻辑和 src/engine.js 一致', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
   const web = blocks(/<script>([\s\S]*)<\/script>/.exec(html)[1]);
   const eng = blocks(fs.readFileSync(path.join(__dirname, '..', 'src', 'engine.js'), 'utf8'));
-  const names = ['compute', 'progress', 'nextQuest', 'reminders', 'advice', 'prCheck', 'hspPoints', 'pointsOptions', 'degreeOptions', 'routeOptions', 'budgetOptions', 'phoneOptions', 'driveOptions', 'companyOptions', 'CARRIERS', 'cny', 'RATE', 'LINKS', 'CATS', 'REGULATED', 'SYS', 'STATUS_NAME', 'jobFit', 'DEF', 'EVRULES', 'evDue',
+  const names = ['compute', 'progress', 'nextQuest', 'reminders', 'advice', 'prCheck', 'hspPoints', 'pointsOptions', 'degreeOptions', 'routeOptions', 'budgetOptions', 'phoneOptions', 'driveOptions', 'companyOptions', 'CARRIERS', 'cny', 'RATE', 'LINKS', 'CATS', 'REGULATED', 'SYS', 'STATUS_NAME', 'jobFit', 'DEF', 'EVRULES', 'JOB_MAIL', 'JOB_MSRC', 'evDue',
     // 日期和文字的小函数：时区、月末的修正都在这里，页面那份不一样时算出的期限就不一样（today、save、NODES 两边本来就不同，不比）
     'jstDay', 'D', 'ymd', 'iso', 'addDays', 'addMonths', 'addYears', 'fmt', 'days', 'yearsBetween', 'y1', 'dueText', 'isDate', 'packText', 'profileText'];
   for (const n of names) {

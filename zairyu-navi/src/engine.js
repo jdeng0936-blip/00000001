@@ -73,14 +73,17 @@ function nextQuest(R){
   return t[0]||null;
 }
 var EVENTS=[];
+// mail、msrc：提醒邮件里用的说明和依据。邮件要经过邮件服务商，写法不分在留资格（从文字和链接看不出收件人是哪一种）；没有 mail 的规则，txt 本身就不分在留资格。
+var JOB_MAIL="工作、学校等所属机关有变动（离开或加入）：自变动之日起14天内，向入管提交所属机关的届出（契约机关或活动机关，按自己的情况交其中一种）；离开和加入各申报一次，各有14天";
+var JOB_MSRC={law:"入管法第19条の16",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]};
 var EVRULES={job_change:["换工作或离职",[
-  {n:14,st:{work:1,ssw:1},txt:"换工作或离职：自离职（合同结束）或入职（签新合同）之日起14天内，向入管提交所属机关（契约机关）的届出；离职和入职各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html"}},
-  {n:14,st:{student:1,biz:1},txt:"离开或转到别的学校、机构：自离开（退学、毕业、离任）或转入之日起14天内，向入管提交所属机关（活动机关）的届出；离开和转入各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号",title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}},
-  {n:14,st:{hsp:1},txt:"换工作或离职：自离职或入职之日起14天内，向入管提交所属机关的届出；高度专门职1号イ、ロ交契约机关的届出，1号ハ交活动机关的届出，离职和入职各申报一次（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号・第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出（1号ハ）",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]}}]],
+  {n:14,st:{work:1,ssw:1},mail:JOB_MAIL,msrc:JOB_MSRC,txt:"换工作或离职：自离职（合同结束）或入职（签新合同）之日起14天内，向入管提交所属机关（契约机关）的届出；离职和入职各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html"}},
+  {n:14,st:{student:1,biz:1},mail:JOB_MAIL,msrc:JOB_MSRC,txt:"离开或转到别的学校、机构：自离开（退学、毕业、离任）或转入之日起14天内，向入管提交所属机关（活动机关）的届出；离开和转入各申报一次，各有14天（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号",title:"入管厅：所属（活动）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}},
+  {n:14,st:{hsp:1},mail:JOB_MAIL,msrc:JOB_MSRC,txt:"换工作或离职：自离职或入职之日起14天内，向入管提交所属机关的届出；高度专门职1号イ、ロ交契约机关的届出，1号ハ交活动机关的届出，离职和入职各申报一次（见任务“工作、学校、婚姻变动后向入管申报”）",src:{law:"入管法第19条の16第1号・第2号",title:"入管厅：所属（契约）机关届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00015.html",more:[{title:"入管厅：所属（活动）机关届出（1号ハ）",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00014.html"}]}}]],
  move:["搬家",[
   {n:14,txt:"搬家：搬进新住址后14天内，带在留卡到新住址的区役所办转入或转居，在留卡上的住址当场一并变更（搬到别的市区町村的，先在原住址办转出）",src:{law:"入管法第19条の9第1項",title:"入管厅：住居地的变更届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00023.html"}}]],
  divorce:["离婚或配偶去世",[
-  {n:14,st:{spouse:1,family:1},txt:"离婚或配偶去世：14天内向入管提交配偶者的届出",alt:{family:"如果你是以配偶身份持有家族滞在：离婚或配偶去世后14天内向入管提交配偶者的届出（以子女身份持有的没有这项届出）"},src:{law:"入管法第19条の16第3号",title:"入管厅：配偶者的届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00016.html"}}]],
+  {n:14,st:{spouse:1,family:1},txt:"离婚或配偶去世：14天内向入管提交配偶者的届出",alt:{family:"如果你是以配偶身份持有家族滞在：离婚或配偶去世后14天内向入管提交配偶者的届出（以子女身份持有的没有这项届出）"},mail:"离婚或配偶去世：14天内向入管提交配偶者的届出（以配偶身份在留的人要办）",src:{law:"入管法第19条の16第3号",title:"入管厅：配偶者的届出",url:"https://www.moj.go.jp/isa/applications/procedures/nyuukokukanri10_00016.html"}}]],
  birth:["孩子出生",[
   {n:13,any:1,txt:"孩子出生：14天内到区役所办出生届，出生当天算第1天",src:{law:"戸籍法第49条",title:"法务省：出生届",url:"https://www.moj.go.jp/ONLINE/FAMILYREGISTER/5-1.html"}},
   {n:30,any:1,txt:"孩子出生：30天内向入管申请在留资格取得（孩子有日本国籍的、出生后60天内离开日本的不用办）",src:{law:"入管法第22条の2・第22条の3",title:"入管厅：在留资格取得许可申请",url:"https://www.moj.go.jp/isa/applications/procedures/16-10.html"}}]]};
@@ -88,17 +91,18 @@ var EVRULES={job_change:["换工作或离职",[
 function evDue(ev){
   var r=Object.prototype.hasOwnProperty.call(EVRULES,ev.type)?EVRULES[ev.type]:null,d=D(ev.date),s=P.status,out=[];
   if(!r||!d||s==="none")return out;
-  r[1].forEach(function(x){if(s==="short"?!x.any:(x.st&&!x.st[s]))return;out.push({d:addDays(d,x.n),txt:(x.alt&&x.alt[s])||x.txt,src:x.src})});
+  r[1].forEach(function(x){if(s==="short"?!x.any:(x.st&&!x.st[s]))return;out.push({d:addDays(d,x.n),txt:(x.alt&&x.alt[s])||x.txt,src:x.src,mail:x.mail||null,msrc:x.msrc||null})});
   return out;
 }
 function reminders(){
   var R=compute(),L=[],t=today(),Y=t.getUTCFullYear(),M=t.getUTCMonth(),card=P.status!=="none"&&P.status!=="short";
-  function add(d,txt,tag,src){if(d&&!isNaN(d.getTime()))L.push({d:d,date:iso(d),txt:txt,tag:tag||"",src:src||null})}
-  function evs(){EVENTS.forEach(function(ev){evDue(ev).forEach(function(x){add(x.d,x.txt,"事件",x.src)})})}
+  // x：{dl:1 是真正的期限（其余是该留意、该开始准备的日子）, mail, msrc 提醒邮件里用的不分在留资格的说明和依据}
+  function add(d,txt,tag,src,x){if(d&&!isNaN(d.getTime()))L.push({d:d,date:iso(d),txt:txt,tag:tag||"",src:src||null,dl:!!(x&&x.dl),mail:(x&&x.mail)||null,msrc:(x&&x.msrc)||null})}
+  function evs(){EVENTS.forEach(function(ev){evDue(ev).forEach(function(x){add(x.d,x.txt,"事件",x.src,{dl:1,mail:x.mail,msrc:x.msrc})})})}
   if(!card){add(t,"先完成第0关：选定路线并申请在留资格认定证明书","路线");evs();L.sort(function(a,b){return a.d-b.d});return L}
-  if(R["1-1"].state==="todo")add(R["1-1"].due,"住民登记：定下住所后14天内到区役所办理","法定期限");
-  if(R["1-3"].state==="todo")add(R["1-3"].due,"国民健康保险：成为对象后14天内加入","法定期限");
-  if(R["4-1"].state==="todo"&&D(P.exp)){var e=D(P.exp);[[4,"在留更新：开始准备材料"],[3,"在留更新：确认可以开始申请的时期"],[1,"在留更新：尽快递交"]].forEach(function(x){add(addMonths(e,-x[0]),x[1],"在留")});add(e,"在留期满日","在留")}
+  if(R["1-1"].state==="todo")add(R["1-1"].due,"住民登记：定下住所后14天内到区役所办理","法定期限",null,{dl:1});
+  if(R["1-3"].state==="todo")add(R["1-3"].due,"国民健康保险：成为对象后14天内加入","法定期限",null,{dl:1});
+  if(R["4-1"].state==="todo"&&D(P.exp)){var e=D(P.exp);[[4,"在留更新：开始准备材料"],[3,"在留更新：确认可以开始申请的时期"],[1,"在留更新：尽快递交"]].forEach(function(x){add(addMonths(e,-x[0]),x[1],"在留")});add(e,"在留期满日","在留",null,{dl:1})}
   if(P.entry)add(addMonths(D(P.entry),6),"入境满6个月：去银行办理账户的居住者变更","银行");
   if(R["1-4"].state==="todo"||R["1-4"].state==="done")add(ymd(Y,M+1,1),"国民年金：本月保险料缴纳","每月");
   var june=ymd(Y,5,1);if(june<t)june=ymd(Y+1,5,1);
@@ -107,7 +111,7 @@ function reminders(){
   add(nov,"年末调整：按公司通知提交扶养控除等申告书；有海外扶养亲属的备齐亲属关系文件和汇款凭证","每年");
   if(M>=10)add(t,"现在是年末调整的时期：公司发来的申告书请按期交回，12月的工资里会结算全年所得税","每年");
   var kk=ymd(Y,2,15);if(kk<t)kk=ymd(Y+1,2,15);
-  add(kk,"确定申告截止（需要申告的人）：2月16日起受理，纳税期限同日","每年");
+  add(kk,"确定申告截止（需要申告的人）：2月16日起受理，纳税期限同日","每年",null,{dl:1});
   if(P.pr&&P.status!=="pr")add(t,"永驻目标：每次缴纳住民税和年金后拍照存档收据","习惯");
   if(AUTH.mail){add(addDays(t,9),"示例：邮箱里识别到国民健康保险料纳付通知，纳期限已提取"+(AUTH.cal?"，已写入日历":""),"邮箱示例");add(addDays(t,3),"示例：运营商账单邮件，本月金额已记入，待你确认是否换套餐","邮箱示例")}
   PLT.forEach(function(x){if(PL.subs[x[0]])add(t,"已订阅“"+x[1]+"”的方案变动提醒：正式版每天联网复核，价格或条件变化时推送","方案")});
@@ -211,13 +215,13 @@ var SYS="你是「在留导航」里随时可以呼出的助手，帮助在日�
 "5. 回答涉及税或在留时，最后一行写：AI 回答不构成税务或法律意见。\n"+
 "6. 用户说明自己的情况时，用 update_profile 记录，只记录明确说过的内容。用户说某件事办完了，用 mark_done 记录。用户提到出国和回国日期，用 add_trip 记录。用户提到换工作或离职、搬家、离婚或配偶去世、孩子出生并说了具体日期时，用 add_event 记录，并告诉他工具返回的期限和依据（法条、官方页面）；工具没有返回这件事的期限时，只说本工具没有登记到对应的期限，这不代表没有其他手续，请他以入管厅或区役所的说明为准，不要下“没有法定届出”“不用办”的结论。\n"+
 "7. 用户问该办什么、进度如何时，用 get_plan 取结果再回答，不自己编排，不自己计算期限。\n"+
-"8. C、D、E 类问题或用户想找人帮忙时，用 suggest_providers 列出对应类别；这里的服务商是示例占位，要告诉用户。\n"+
+"8. C、D、E 类问题或用户想找人帮忙时，用 suggest_providers 列出对应类别的服务商，由用户自己选，不推荐某一家；工具的结果里说明是示例或还没有服务商入驻时，照实告诉用户。\n"+
 "10. 用户问来日本走哪条路、怎么取得学历、高度人才还差几分和怎么加分、电话卡套餐、驾照怎么拿、驾校、开公司费用、第一年要准备多少钱这类需要做选择的问题时，先用 get_options 取方案再回答：按返回的顺序介绍前两三套，说明价格、适合谁、注意什么，并说明价格的核对日期和哪些是待实测。不自己补充价格。提到日元金额时同时给出工具返回的人民币折算。路线的排序和积分的计算是按用户所填条件得出的参考，要说明这不是能否获批的判断，积分以入管审查为准；不说“一定能批”“保证加分”。预算是估算，要说明没有算进去的项目；税和社保的金额仍按C类不计算。\n"+
 "11. 用户表达着急、害怕、沮丧或孤单时，先用一两句话回应他的感受，再给出下一步具体怎么做。不说空泛的安慰话，不对审查结果做任何保证，不夸大风险吓人。用户完成任务时给一句具体的肯定。\n"+
 "14. 不记录、不复述用户的个人编号（My Number）、护照号、银行账号；用户主动发来时提醒他不要发送。\n"+
 "12. 用户问找工作时：说明他的在留资格能做哪类工作、留学和家族滞在打工的时间限制，可以指给他“同城”的招聘板块；不替用户挑选或推荐具体企业，不保证能被录用，换工作是否符合在留资格的个别判断转给行政书士。\n"+
 "13. 用户问学历时只讲正规途径。学位必须来自所在国政府或其认可的认证机构承认的大学；自称大学但官网写明不是大学的机构（例如 Academy Europe 欧洲开放大学）发的证书不是学位，不算高度人才学历分，不要建议用户把它写成学位。问到买学历、代办假毕业证、挂名学校的，明确拒绝，并说明这是虚假申请、会导致不许可和取消在留资格。\n"+
-"9. 用户请你整理清单、窗口话术、给专业人士的咨询摘要等辅助资料时，写好后用 save_document 保存，并告诉用户可以在“我的资料”里查看和下载。递交给官方的申请书、届出书、理由书等文书不制作，也不保存。\n\n【节点资料】\n";
+"9. 用户请你整理清单、窗口话术、给专业人士的咨询摘要等辅助资料时，直接写在回答里。递交给官方的申请书、届出书、理由书等文书不制作。\n\n【节点资料】\n";
 var STATUS_NAME={none:"尚无签证（人在中国）",short:"短期滞在（旅游签）",student:"留学",work:"技术·人文知识·国际业务",hsp:"高度专门职",family:"家族滞在",spouse:"日本人或永住者的配偶",ssw:"特定技能",biz:"经营·管理",pr:"永住者"};
 function profileText(){return "身份="+(STATUS_NAME[P.status]||"未知")+"；入境日="+(P.entry||"未填")+"；定下住所日="+(P.addr||"未填")+"；在留期满日="+(P.exp||"未填")+"；公司社保="+(P.ins?"是":"否")+"；20至59岁="+(P.age?"是":"否")+"；有符合条件的中国驾照="+(P.lic?"是":"否")+"；永驻目标="+(P.pr?"是":"否")}
 function planData(){var R=compute();return NODES.map(function(n){var r=R[n.id];return {id:n.id,title:n.t,state:r.state,note:r.note,due:r.due?fmt(r.due):"",cost:n.cost}}).filter(function(x){return x.state!=="na"})}
