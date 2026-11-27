@@ -299,7 +299,7 @@ test('工具说明：get_options 列出的条件键就是引擎各主题实际�
       assert.ok(OPTION_PARAM_LABELS[k], k + ' 没有说明');
       assert.ok(def.description.includes(k + ' ' + OPTION_PARAM_LABELS[k] + '：' + (v === 'num' ? '数字' : v.join('/'))), topic + ' 的 ' + k + ' 没写进工具说明');
       // 每个取值都要能被引擎接受并回显
-      for (const val of v === 'num' ? ['34', '600'] : v) assert.equal(e.options(topic, { [k]: val }).params[k], val, topic + ' ' + k + '=' + val);
+      for (const val of v === 'num' ? ['34', '600'] : v) assert.equal(e.options(topic, { [k]: val }).given[k], val, topic + ' ' + k + '=' + val);
     }
   }
   assert.match(def.description, /card 有没有日本信用卡：yes\/no/);
@@ -310,15 +310,17 @@ test('工具：get_options 的条件按传入的用，不受页面上保存的�
   const ctx = ctxOf();
   ctx.user.plan = { card: 'yes', visa: 'no' }; ctx.store.saveUser(ctx.user, 'test.plan');
   const r = execTool('get_options', { topic: 'phone', params: { card: 'no' } }, ctx);
-  assert.equal(r.params.card, 'no');
+  assert.equal(r.given.card, 'no'); assert.equal(r.defaults.card, undefined);
   assert.ok(r.options[0].pts.some((p) => /没有信用卡/.test(p)), '按没有信用卡的条件排序');
   assert.ok(!r.options[0].pts.some((p) => /这家办不了/.test(p)), '第一名不能是只收信用卡的');
-  assert.equal(execTool('get_options', { topic: 'phone' }, ctx).params.card, 'yes', '不传时按页面上的选择');
+  const d = execTool('get_options', { topic: 'phone' }, ctx);
+  assert.equal(d.defaults.card, 'yes', '不传时按页面上的选择'); assert.deepEqual(d.given, {});
+  assert.match(d.defaultsNote, /用户未说明/, 'A9：默认条件要写明不是用户的情况');
   const c = execTool('get_options', { topic: 'company', params: { visa: 'yes' } }, ctx);
-  assert.equal(c.params.visa, 'yes'); assert.match(c.note, /3,000万日元/);
+  assert.equal(c.given.visa, 'yes'); assert.deepEqual(c.defaults, {}); assert.equal(c.defaultsNote, undefined); assert.match(c.note, /3,000万日元/);
   const bad = execTool('get_options', { topic: 'company', params: { card: 'no', visa: 'maybe' } }, ctx);
-  assert.deepEqual(bad.params, { visa: 'no' }); assert.match(bad.ignoredParams, /card、visa/);
-  assert.equal(execTool('get_options', { topic: 'phone', params: { card: false } }, ctx).params.card, 'no', '布尔值按 yes/no 处理');
+  assert.deepEqual(bad.given, {}); assert.deepEqual(bad.defaults, { visa: 'no' }); assert.match(bad.ignoredParams, /card、visa/);
+  assert.equal(execTool('get_options', { topic: 'phone', params: { card: false } }, ctx).given.card, 'no', '布尔值按 yes/no 处理');
 });
 
 test('提示词：F 类后果、分类优先级、待核实、D 类替代办法、空名单 disclosure 的规则都在', () => {
