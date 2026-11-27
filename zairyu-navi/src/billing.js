@@ -1,8 +1,13 @@
 // 服务商展示费：开账单、付款提醒、过了宽限期自动不展示。零依赖。
 // 规则（docs/TODO.md 第 7 条，负责人的决定都按建议的默认做法）：
 // - 按自然月（日本时间）收固定的展示费，分士业和其他两档，金额只按价目表（BILLING_PLANS）取，不看任何请求里的 amount；
-//   不按咨询数、成交数收费，没有给个别服务商调价、打折、免费期的口子。账单行里存下开票时的金额和价目表版本。
-// - 下一期的账单提前 BILLING_ISSUE_DAYS 天开，付款期限是下一期开始的前一天；第一张账单在批准时开，期限是开出后 BILLING_FIRST_DUE_DAYS 天。
+//   不按咨询数、成交数收费；除了所有服务商都一样的首月免费，没有给个别服务商调价、打折、免费期的口子。账单行里存下开票时的金额和价目表版本。
+// - 首月免费（负责人 2026-11-27 决定）：批准当月（日本时间的自然月）不收费、不开账单。批准时只记一条“首月免费”的覆盖
+//   （invoices 里 method 为 first_month_free、金额 0、状态 paid，只用来算展示，不发账单邮件，工作台的账单列表里不出现）；
+//   服务商领取令牌后马上上名单（没领取的看不到咨询，所以不展示），展示到批准当月结束 + BILLING_GRACE_DAYS 天。
+//   第一张要付钱的账单是下个月的，按下面的普通规则开：提前 BILLING_ISSUE_DAYS 天开出，期限是下个月开始的前一天；
+//   月底批准、离下个月不到 7 天才开的，期限是开出后 BILLING_FIRST_DUE_DAYS 天（期限 + 宽限天数之前照常展示）。
+// - 下一期的账单提前 BILLING_ISSUE_DAYS 天开，付款期限是下一期开始的前一天。
 // - 付款期限前 7 天、前 1 天、过期第二天各提醒一次；已付款的账单覆盖到 本期结束 + BILLING_GRACE_DAYS 天，过了还没付下一期的就不展示，并告知一次。
 // - 收款方式可以替换（methods）：现在只有手工确认的银行转账（manual_bank）。以后接刷卡、在线支付时实现
 //   { name, createCheckout(inv) -> { payUrl }, verifyWebhook(req, rawBody) -> { invoiceId, paid } | null }，由 POST /api/billing/webhook/:method 接收（现在返回 404）。
@@ -19,6 +24,8 @@ const CAT_KEYS = new Set(REF.CATS.map((c) => c[0]));
 // 代码里的占位金额（日元/期，含税）。正式的金额由负责人填进 BILLING_PLANS。
 const DEFAULT_PLANS = { regulated: 11000, other: 5500 };
 const CHECK_METHODS = ['association_search', 'certificate', 'phone_association'];
+// 首月免费的覆盖记录用的 plan、method、paidBy
+const FREE = 'first_month_free';
 // 老服务商迁移时按入驻申请的规则查资料，返回问题的代号：category 类别不对、license 登录番号的格式或所属会不对（老服务商没有登记过所属会，
 // 士业都会落在这里）、claims 名单上的文字有保证类用语。有问题的不自动展示（store.migrateLegacyProviders 记为 legacy-hold）。
 function legacyIssues(p) {
@@ -74,7 +81,8 @@ function createBilling(opts) {
       name: '银行转账（人工确认入账）',
       instructions: (inv) => '付款方式：银行转账\n' + (cfg.bankText || '（振込先还没有配置：BILLING_BANK_TEXT）') + '\n转账时请在汇款人名称的前面写上参考编号 ' + inv.refCode + '，我们按它确认入账。手续费由付款方负担。'
     },
-    migration: { name: '迁移（免费）', instructions: () => '这一期免费，不用付款。' }
+    migration: { name: '迁移（免费）', instructions: () => '这一期免费，不用付款。' },
+    first_month_free: { name: '首月免费', instructions: () => '批准当月免费，不用付款。' }
   }, opts.methods || {});
   const method = opts.method || cfg.method;
   if (!methods[method]) throw new Error('没有这种收款方式：' + method);
@@ -98,8 +106,12 @@ function createBilling(opts) {
     const b = boundsOf(period), p = planFor(category);
     return { period, periodStart: b.start, periodEnd: b.end, plan: p.plan, amountYen: p.amountYen, taxYen: Math.floor(p.amountYen * 10 / 110), planVersion: cfg.planVersion, method, dueDate };
   }
-  // 批准时开的第一张账单：本期，期限是今天起 firstDueDays 天
-  function firstInvoice(category, at) { const t = todayOf(at); return draft(category, periodOf(t), addDays(t, cfg.firstDueDays)); }
+  // 批准时记的“首月免费”覆盖：批准当月，金额 0、已付款，不是要付钱的账单（不发账单邮件，工作台不列出）。
+  // 下个月的账单由 runOnce 按普通规则开。
+  function firstInvoice(category, at) {
+    const t = todayOf(at), b = boundsOf(periodOf(t));
+    return { period: periodOf(t), periodStart: b.start, periodEnd: b.end, plan: FREE, amountYen: 0, taxYen: 0, planVersion: FREE, method: FREE, dueDate: t, status: 'paid', paidOn: t, paidBy: FREE };
+  }
   // 给这家开某一期的账单（已经有了就不开），并排一封账单邮件（有联系邮箱时）。返回新账单的 id 或 null。
   function issueFor(providerId, period, at) {
     const p = store.getProvider(providerId);
@@ -159,9 +171,10 @@ function createBilling(opts) {
         });
         if (sent) res.reminders++;
       }
-      // 过了宽限期、不再展示：展示过的（付过款的）才告知，每张账单一次
+      // 过了宽限期、不再展示：宽限期最后一天还在名单上的才告知（“不再展示”要是真的），每张账单一次。
+      // 不看有没有已付款的记录：首月免费的记录也是 paid，但首月里没领取令牌、之后才领取的服务商从来没展示过。
       const late = store.listInvoices({ providerId: p.id, status: 'issued' }).filter((i) => addDays(i.dueDate, cfg.graceDays) < t);
-      if (late.length && !listed(p.id, at).listed && invs.some((i) => i.status === 'paid')) {
+      if (late.length && !listed(p.id, at).listed && store.providerListing(p.id, addDays(late[0].dueDate, cfg.graceDays)).listed) {
         const inv = late[0];
         const sent = store.tx(() => {
           if (!store.claimInvoiceReminder(inv.id, 'hidden')) return false;
@@ -198,7 +211,7 @@ function prepareFor(parts) {
   };
 }
 
-module.exports = { createBilling, billingConfig, legacyIssues, prepareFor, periodOf, nextPeriod, boundsOf, DEFAULT_PLANS, CHECK_METHODS };
+module.exports = { createBilling, billingConfig, legacyIssues, prepareFor, periodOf, nextPeriod, boundsOf, DEFAULT_PLANS, CHECK_METHODS, FREE };
 
 // npm run billing：跑一轮“老服务商迁移、开账单、发提醒、发新咨询通知、发件箱”，然后退出。给 cron 用；和正在运行的服务器用同一个库也不会重复发。
 if (require.main === module) {

@@ -27,7 +27,7 @@ test('领取：领到的令牌能用；重新领取后旧令牌 401；领取后�
   try {
     const p = await s.onboard('c@example.jp');
     const me = await s.call('GET', '/api/provider/me', null, p.token);
-    assert.equal(me.status, 200); assert.equal(me.body.name, '大阪中文行政书士事务所'); assert.equal(me.body.contact, 'c***@example.jp'); assert.equal(me.body.listed, false, '还没付款');
+    assert.equal(me.status, 200); assert.equal(me.body.name, '大阪中文行政书士事务所'); assert.equal(me.body.contact, 'c***@example.jp'); assert.equal(me.body.listed, true, '批准当月免费：领取令牌后就展示');
     assert.equal(me.body.notify, true); assert.equal(me.body.licenseBody, '大阪府行政書士会');
     const again = await s.claim('c@example.jp');
     assert.equal(again.status, 200); assert.notEqual(again.body.token, p.token);

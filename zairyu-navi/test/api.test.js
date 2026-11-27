@@ -36,6 +36,11 @@ test('健康检查和节点列表', async () => {
   assert.equal(n.t, '住民登记');
   assert.ok(n.rows.every((r) => typeof r.verified === 'boolean'));
   assert.equal((await call('GET', '/api/nodes/9-9')).status, 404);
+  // 上线规则：资料整理中的节点不给要点、费用、用时，只给官方链接；待核实的罚则不带数字
+  const p = (await call('GET', '/api/nodes/3-2')).body;
+  assert.equal(p.pending, 1); assert.deepEqual(p.rows, []); assert.equal(p.cost, '资料整理中'); assert.ok(p.src.length > 0);
+  const pen = (await call('GET', '/api/nodes/4-2')).body.rows.find((r) => r.key === '逾期的处罚');
+  assert.equal(pen.verified, false); assert.doesNotMatch(pen.value, /[0-9]/);
 });
 
 test('完整流程：建用户、填情况、看路线、完成任务、解锁下一步', async () => {

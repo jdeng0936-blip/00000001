@@ -3,7 +3,8 @@
 // 由 tools/port_engine.py 从产品演示移植而来（2026-11-26），此后以本文件为准。
 module.exports = function createEngine(state) {
 state = state || {};
-var NODES = JSON.parse(JSON.stringify(require('../data/nodes.json')));
+// 节点数据按上线规则处理后再用（见 launchView）；原始数据在 data/nodes.json。
+var NODES = JSON.parse(JSON.stringify(require('../data/nodes.json'))).map(launchView);
 var P, DONE, DOCS = [], SEL = null, DSEL = null, SNOOZE = {}, PVSEL = null;
 // 日期一律按日本时间（Asia/Tokyo）的日历日计算，内部用 UTC 零点的 Date 表示，和服务器、浏览器所在时区无关。
 function jstDay(t){return new Date(Math.floor((t.getTime()+324e5)/864e5)*864e5)}
@@ -27,6 +28,15 @@ function days(a,b){return Math.round((b-a)/864e5)}
 function yearsBetween(a,b){if(!a||!b||b<a)return 0;var n=b.getUTCFullYear()-a.getUTCFullYear();if(addYears(a,n)>b)n--;var s=addYears(a,n);return n+days(s,b)/days(s,addYears(a,n+1))}
 function y1(y){return (Math.floor(y*10+1e-9)/10).toFixed(1)}
 function dueText(d){if(!d)return"";var n=days(today(),d);return n<0?"已过期限 "+fmt(d):"还有"+n+"天（"+fmt(d)+"）"}
+function launchView(n){
+  // 上线规则（docs/compliance-review.md 第二节）。r[2]=0 是待核实；r[3]=1 表示这一行涉及法定期限、罚则或在留资格条件。
+  // 1. 待核实又涉及法定期限、罚则、在留资格条件的行，不显示具体数字，只提示看官方链接；
+  // 2. 待核实超过一半的节点标 pending，显示“资料整理中”，要点、费用、用时、步骤都不显示，只给官方链接（src）；概要（sum）照常显示，所以概要里不写待核实行的内容（test/engine.test.js 查）。
+  var v=JSON.parse(JSON.stringify(n)),un=v.rows.filter(function(r){return !r[2]}).length;
+  v.rows=v.rows.map(function(r){return !r[2]&&r[3]&&/[0-9０-９]/.test(r[1])?[r[0],"待核实：涉及法定期限、罚则或在留资格条件，核实前不显示具体数字，请看官方链接",0,1]:r});
+  if(un*2>v.rows.length){v.pending=1;v.rows=[];v.cost="资料整理中";v.time="资料整理中";v.steps=["资料整理中：步骤还没对照官方页面核实，请看官方链接"]}
+  return v;
+}
 function nodeOf(id){return NODES.filter(function(x){return x.id===id})[0]}
 function compute(){
   var s=P.status, card=s!=="none"&&s!=="short", reg=!!DONE["1-1"], R={};
@@ -144,14 +154,16 @@ function prCheck(){
   var t=today(),arr=D(P.arrive),wk=D(P.work),sp=P.status==="spouse",hsp=Math.max(+P.hsp||0,P.status==="hsp"?70:0),needY=sp?1:hsp>=80?1:hsp>=70?3:10,out=[],why="";
   var yrs=yearsBetween(arr,t), wy=yearsBetween(wk,t), md=D(P.married), my=yearsBetween(md,t), ssw=P.status==="ssw";
   out.push(["在留年数","需连续"+needY+"年，现"+y1(yrs)+"年"+(arr?"":"（还没填来日日期）")+(P.status==="hsp"&&!(+P.hsp>=70)?"；按高度专门职70分算，80分以上的请把积分选为80分以上":""),arr&&addYears(arr,needY)<=t?"ok":"bad",Math.min(1,yrs/needY)]);
-  if(sp)out.push(["婚姻持续年数","需实际持续3年以上，现"+y1(my)+"年"+(md?"":"（还没填结婚日期）")+"；2027年4月1日以后的申请预计改为婚姻5年、在留3年（待核实）",md&&addYears(md,3)<=t?"ok":"bad",Math.min(1,my/3),1]);
+  if(sp)out.push(["婚姻持续年数","需实际持续3年以上，现"+y1(my)+"年"+(md?"":"（还没填结婚日期）")+"；2027年4月1日以后申请的年数可能调整（待核实，资料整理中，以入管厅新指南原文为准）",md&&addYears(md,3)<=t?"ok":"bad",Math.min(1,my/3),1]);
   else if(hsp<70)out.push(["就労或居住资格年数","需连续5年，现"+y1(wy)+"年"+(wk?"":"（还没填开始日期）")+(ssw?"；特定技能1号的年数不算在内":""),ssw?"warn":wk&&addYears(wk,5)<=t?"ok":"bad",Math.min(1,wy/5)]);
   var tenAgo=addYears(t,-10),longest=0,total=0;
   P.trips.forEach(function(x){var a=D(x[0]),b=D(x[1]);if(!a||!b||b<a)return;longest=Math.max(longest,days(a,b));var s=a<tenAgo?tenAgo:a;if(b>s)total+=days(s,b)});
-  out.push(["单次出国","半年以上不利；最长一次"+longest+"天",longest<183?"ok":"bad",Math.min(1,longest/183),1]);
-  out.push(["近10年累计出国","2年6个月以上不利；累计"+total+"天",total<913?"ok":"bad",Math.min(1,total/913),1]);
-  var jp={n1:["达到","ok"],n2:["达到","ok"],n3:["需确认分数","warn"],low:["可能不足","bad"]}[P.jp]||["还没填写","warn"];
-  out.push(["日语能力","需 B1 相当以上；"+jp[0],jp[1],null,1]);
+  // 出国天数和日语的标准没有在官方文字里核实（上线规则 1：在留资格条件核实前不显示具体数字）：只写自己的天数，不写标准，出国较长时提示咨询。
+  // 下面 183 天、913 天只用来决定要不要提示咨询，不作为标准显示，也不判“不达标”。
+  out.push(["单次出国","长期出国可能影响“继续在留”的判断，官方没有公布天数标准；最长一次"+longest+"天",longest<183?"ok":"warn",null,1]);
+  out.push(["近10年累计出国","频繁出国可能影响“继续在留”的判断，官方没有公布天数标准；累计"+total+"天",total<913?"ok":"warn",null,1]);
+  var jp={n1:["已填 N1","ok"],n2:["已填 N2","ok"],n3:["已填 N3，是否相当要确认","warn"],low:["可能不足","warn"]}[P.jp]||["还没填写","warn"];
+  out.push(["日语能力","新指南把日语能力列为考虑要素之一，2027年4月1日以后的申请适用（资料整理中）；"+jp[0],jp[1],null,1]);
   out.push(["税和社保按期缴纳","近5年住民税、近2年年金和医保",P.pay?"ok":"bad",null]);
   // when 只在算得出来的时候给日期：缺日期、特定技能、长期出国时为 null；年数已满但还有不达标的项目时也为 null。原因写在 why 里。
   var when=null;

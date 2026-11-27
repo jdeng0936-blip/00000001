@@ -10,7 +10,7 @@ const assistant = require('./assistant');
 const crypto = require('node:crypto');
 const { createSender, deliverOutbox, TEXTS, scrub } = require('./mailer');
 const { createScheduler, startReminderTimer } = require('./scheduler');
-const { createBilling, billingConfig, prepareFor, CHECK_METHODS } = require('./billing');
+const { createBilling, billingConfig, prepareFor, CHECK_METHODS, FREE } = require('./billing');
 const { createNotifier, notifyConfig } = require('./notifier');
 
 // 使用条款和隐私政策的版本。文本改了就改这个版本号：老用户下次打开时要重新同意，同意之前只能读取或删除自己的数据。
@@ -397,7 +397,7 @@ function createApp(opts) {
         if (a.status !== 'pending') throw new HttpError(409, '这份申请不在审核中（' + a.status + '）');
         sameVersion(a, b);
         const inv = billing.firstInvoice(a.category);
-        const r = store.approveApplication(a.id, who, check, inv, (x) => { const mm = TEXTS.applyApproved(a.ref, appUrlOf() + '/provider.html', x, billing.payText(x), billing.config.regNo); return { subject: mm.subject, body: mm.text }; }, b.reviewKey);
+        const r = store.approveApplication(a.id, who, check, inv, (x) => { const mm = TEXTS.applyApproved(a.ref, appUrlOf() + '/provider.html', x, billing.config.issueDays); return { subject: mm.subject, body: mm.text }; }, b.reviewKey);
         if (!r) { const now2 = store.getApplication(a.id); throw new HttpError(409, now2.status !== 'pending' ? '这份申请不在审核中' : now2.reviewKey !== b.reviewKey ? CHANGED : '申请的联系邮箱已经是别家服务商的联系邮箱'); }
         kick();
         return r; // 没有令牌：令牌由服务商自己用联系邮箱领取
@@ -488,7 +488,8 @@ function createApp(opts) {
       }
       // 自己的账单，带付款说明（振込先和参考编号）；管理员的入账备注不给
       if (seg[2] === 'invoices' && !seg[3] && m === 'GET') {
-        return store.listInvoices({ providerId: p.id }).map((i) => ({ id: i.id, refCode: i.refCode, period: i.period, periodStart: i.periodStart, periodEnd: i.periodEnd, amountYen: i.amountYen, taxYen: billing.config.regNo ? i.taxYen : null, regNo: billing.config.regNo || null, status: i.status, dueDate: i.dueDate, paidOn: i.paidOn, payText: i.status === 'issued' ? billing.payText(i) : '' }));
+        // 首月免费的覆盖记录不是账单，不列出
+        return store.listInvoices({ providerId: p.id }).filter((i) => i.method !== FREE).map((i) => ({ id: i.id, refCode: i.refCode, period: i.period, periodStart: i.periodStart, periodEnd: i.periodEnd, amountYen: i.amountYen, taxYen: billing.config.regNo ? i.taxYen : null, regNo: billing.config.regNo || null, status: i.status, dueDate: i.dueDate, paidOn: i.paidOn, payText: i.status === 'issued' ? billing.payText(i) : '' }));
       }
       if (seg[2] === 'inquiries' && !seg[3] && m === 'GET') return store.listInquiriesFor(p.id);
       if (seg[2] === 'inquiries' && seg[3]) {

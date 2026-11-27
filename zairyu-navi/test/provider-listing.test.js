@@ -124,14 +124,23 @@ test('月底批准：下一期的账单期限在覆盖结束之后时，期限�
   } finally { await s.stop(); }
 });
 
-test('没付过款的服务商：开着的账单不让它展示（批准了没付款不上名单）', async () => {
+test('批准了没领取令牌的不展示；首月免费过了、下个月的账单没付的，期限 + 宽限天数之后不展示', async () => {
   const s = await start();
   const h = helpers(s);
   try {
-    const p = await s.onboard('unpaid@example.jp', null, false);
+    const a = await s.apply('unclaimed@example.jp'); const ap = await s.approve(a.body.ref);
     await h.run();
-    assert.equal(h.listing(p.providerId).listed, false);
+    assert.equal(h.listing(ap.body.providerId).listed, false, '没领取令牌');
     assert.equal((await s.listed()).length, 0);
+    const p = await s.onboard('unpaid@example.jp');
+    await h.run();
+    assert.equal(h.listing(p.providerId).listed, true, '首月免费');
+    const dec = h.inv(p.providerId, '2026-12');
+    assert.equal(dec.dueDate, '2026-12-11');
+    s.set(noon('2026-12-18')); assert.equal(h.listing(p.providerId).listed, true);
+    s.set(noon('2026-12-19')); await h.run();
+    assert.equal(h.listing(p.providerId).listed, false, '下个月的账单没付');
+    assert.deepEqual((await s.listed()).map((x) => x.id), []);
   } finally { await s.stop(); }
 });
 
@@ -199,11 +208,11 @@ test('审核要对上看过的版本：申请人重新提交后，拿旧版本�
   } finally { await s.stop(); }
 });
 
-test('助手：草稿只认在名单上的服务商（批准了没付款的不行）；名单和草稿都带展示费的说明，非士业标含推广', async () => {
+test('助手：草稿只认在名单上的服务商（批准了没领取令牌的不行）；名单和草稿都带展示费的说明，非士业标含推广', async () => {
   const s = await start();
   try {
-    const unpaid = await s.onboard('np@example.jp', null, false);
-    const paid = await s.onboard('pd@example.jp', { name: '已付款行政书士事务所' }, true);
+    const ua = await s.apply('np@example.jp'); const unpaid = { providerId: (await s.approve(ua.body.ref)).body.providerId };
+    const paid = await s.onboard('pd@example.jp', { name: '已付款行政书士事务所' });
     const store = s.app.store, user = store.createUser();
     const ctx = { user, store, now: s.now() };
     const base = { category: 'gyosei', summary: '想咨询在留期间更新的手续。' };
@@ -212,7 +221,7 @@ test('助手：草稿只认在名单上的服务商（批准了没付款的不�
     assert.deepEqual(d.draft.providers, [{ id: paid.providerId, name: '已付款行政书士事务所', promoted: false }]);
     assert.match(d.draft.disclosure, /固定的展示费/);
     const sp = execTool('suggest_providers', { category: 'gyosei' }, ctx);
-    assert.deepEqual(sp.providers.map((x) => x.providerId), [paid.providerId], '没付款的不在助手的名单里');
+    assert.deepEqual(sp.providers.map((x) => x.providerId), [paid.providerId], '不在名单上的不在助手的名单里');
     assert.match(sp.disclosure, /固定的展示费/); assert.doesNotMatch(sp.disclosure, /含推广/);
     assert.match(sp.note, /disclosure/);
     const m = await s.onboard('mb@example.jp', MOBILE, true);

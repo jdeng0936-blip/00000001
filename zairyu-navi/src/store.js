@@ -528,15 +528,18 @@ function createStore(file, opts) {
     //   所以下架再上架、作废了中间一期、拖欠了几期之后，只要付了当期，当期就展示，不会被以前的旧覆盖挡住。
     // - 已开出还没付的一张：只能接在已付款的一段后面，把这段延到它的 付款期限 + 宽限天数（期限没过就不因为它下架；
     //   和 src/billing.js 发“不再展示”告知的条件 付款期限 + 宽限天数 < 今天 一致）。没有付过款的那一段不展示。
-    // legacy-hold（老服务商迁移时资料没过检查）不展示。
+    // legacy-hold（老服务商迁移时资料没过检查）不展示；经申请批准、还没领取令牌的不展示。
+    // 首月免费（src/billing.js 的 firstInvoice）记成一张金额 0 的已付款记录，所以按同一套规则算：批准当月结束 + 宽限天数。
     // 宽限天数由 configureListing 设（src/billing.js 按 BILLING_GRACE_DAYS 设好），默认 7。返回 { listed, listedUntil }，listedUntil 是展示到哪一天（direct 为 null）。
     configureListing(cfg) { if (cfg && Number.isInteger(cfg.graceDays)) listing.graceDays = cfg.graceDays; },
     providerListing(id, today) {
       today = today || jstToday(clock());
-      const p = db.prepare('SELECT p.active, m.source FROM providers p LEFT JOIN provider_meta m ON m.provider_id=p.id WHERE p.id=?').get(id);
+      const p = db.prepare('SELECT p.active, m.source, m.claimed_at FROM providers p LEFT JOIN provider_meta m ON m.provider_id=p.id WHERE p.id=?').get(id);
       if (!p) return { listed: false, listedUntil: null };
       if (p.source === 'direct') return { listed: !!p.active, listedUntil: null };
       if (p.source === 'legacy-hold') return { listed: false, listedUntil: null };
+      // 经申请批准的：领取令牌之前看不到咨询，不展示（首月免费的覆盖也要等领取之后）
+      if (p.source === 'apply' && !p.claimed_at) return { listed: false, listedUntil: null };
       const g = listing.graceDays, runs = [];
       let cur = null; // { from, until }
       for (const inv of db.prepare("SELECT period_start, period_end, due_date, status FROM invoices WHERE provider_id=? AND status IN ('paid','issued') ORDER BY period_start").all(id)) {
@@ -625,9 +628,9 @@ function createStore(file, opts) {
         return true;
       });
     },
-    // 批准：一个事务里建服务商（不发令牌：token_hash 是谁也用不了的 unclaimed:随机值，用联系邮箱领取）、补充资料、联系邮箱和第一张账单，
-    // 再排一封批准邮件。check：{ method, checkedOn, note } 登录番号的核对记录。invoice：billing 算好的第一张账单。mail(inv)：返回 { subject, body }。
-    // 只能从 pending 批准；key（管理员看到的 reviewKey）对不上、联系邮箱已经是别家服务商的时返回 null。返回 { providerId, invoiceId }。
+    // 批准：一个事务里建服务商（不发令牌：token_hash 是谁也用不了的 unclaimed:随机值，用联系邮箱领取）、补充资料、联系邮箱和首月免费的覆盖记录，
+    // 再排一封批准邮件。check：{ method, checkedOn, note } 登录番号的核对记录。invoice：billing.firstInvoice 算好的首月免费记录。mail(inv)：返回 { subject, body }。
+    // 只能从 pending 批准；key（管理员看到的 reviewKey）对不上、联系邮箱已经是别家服务商的时返回 null。返回 { providerId, freeUntil }（免费到哪一天，批准当月的最后一天）。
     approveApplication(id, by, check, invoice, mail, key) {
       return this.tx(() => {
         const a = db.prepare("SELECT * FROM provider_applications WHERE id=? AND status='pending'").get(id);
@@ -642,7 +645,7 @@ function createStore(file, opts) {
         const m = mail(this.getInvoice(inv));
         this.enqueueMail({ kind: 'notice', to: a.email, subject: m.subject, body: m.body });
         log(null, 'papply.approve', { id, providerId: pid, by, method: check ? check.method : null });
-        return { providerId: pid, invoiceId: inv };
+        return { providerId: pid, freeUntil: invoice.periodEnd };
       });
     },
     // ---- 服务商的联系邮箱和令牌 ----
@@ -729,8 +732,9 @@ function createStore(file, opts) {
     dropInvoiceMails(id, why) {
       for (const r of db.prepare("SELECT outbox_id FROM invoice_reminders WHERE invoice_id=? AND outbox_id IS NOT NULL AND stage<>'hidden'").all(String(id))) this.dropMail(r.outbox_id, why);
     },
-    // 收展示费的服务商（经申请批准的和老服务商），在架的
-    billableProviders() { return db.prepare("SELECT p.id, p.category FROM providers p JOIN provider_meta m ON m.provider_id=p.id WHERE p.active=1 AND m.source IN ('apply','legacy') ORDER BY p.created_at, p.rowid").all(); },
+    // 收展示费的服务商（经申请批准的和老服务商），在架的。经申请批准、还没领取令牌的不算：不展示、看不到咨询，
+    // 所以不开账单、不发付款提醒，也不会收到“不再展示”的告知（领取之后下一轮 runOnce 再按普通规则开当期和下一期的账单）。
+    billableProviders() { return db.prepare("SELECT p.id, p.category FROM providers p JOIN provider_meta m ON m.provider_id=p.id WHERE p.active=1 AND (m.source='legacy' OR (m.source='apply' AND m.claimed_at IS NOT NULL)) ORDER BY p.created_at, p.rowid").all(); },
     // 占下“这张账单的这一档邮件”。占到了返回 true（只有一次）。
     claimInvoiceReminder(invoiceId, stage) { return db.prepare('INSERT OR IGNORE INTO invoice_reminders (invoice_id,stage,outbox_id,created_at) VALUES (?,?,NULL,?)').run(invoiceId, String(stage), now()).changes === 1; },
     attachInvoiceReminder(invoiceId, stage, outboxId) { db.prepare('UPDATE invoice_reminders SET outbox_id=? WHERE invoice_id=? AND stage=?').run(outboxId, invoiceId, String(stage)); },

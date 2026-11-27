@@ -72,7 +72,7 @@ function appCard(a){
   g.appendChild(field("核对方式",sel));g.appendChild(field("核对日期",d));g.appendChild(field("核对备注（选填）",n));c.appendChild(g);
   var ns=note(),row=el("p");
   row.appendChild(btn("批准","approve",function(){ns.textContent="";var lc=sel.value||a.regulated||a.checkWhere?{method:sel.value,checkedOn:d.value,note:n.value}:undefined;
-    api("POST","/admin/applications/"+a.id+"/approve",lc?{licenseCheck:lc,reviewKey:a.reviewKey}:{reviewKey:a.reviewKey}).then(function(r){ns.className="muted";ns.textContent="已批准，第一张账单已开出。";return loadApps()},function(e){ns.className="err";ns.textContent=e.message})}));
+    api("POST","/admin/applications/"+a.id+"/approve",lc?{licenseCheck:lc,reviewKey:a.reviewKey}:{reviewKey:a.reviewKey}).then(function(r){ns.className="muted";ns.textContent="已批准。批准当月免费展示（服务商领取令牌后上名单），下个月的账单按时自动开出。";return loadApps()},function(e){ns.className="err";ns.textContent=e.message})}));
   c.appendChild(row);
   var msg=el("textarea","review-msg");msg.rows=2;msg.maxLength=500;c.appendChild(field("拒绝的理由或要修改的地方（会写进发给申请人的邮件，5 至 500 字）",msg));
   var row2=el("p");

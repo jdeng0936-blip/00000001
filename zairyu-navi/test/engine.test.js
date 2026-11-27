@@ -9,10 +9,11 @@ const eng = (profile, done, plan) => createEngine({ profile: Object.assign({}, E
 test('节点数据：26个节点，每条数据都有核实标记', () => {
   const e = eng({});
   assert.equal(e.NODES.length, 26);
-  for (const n of e.NODES) {
+  for (const n of require('../data/nodes.json')) {
     assert.ok(n.t && n.sum && Array.isArray(n.rows) && n.rows.length, n.id);
-    for (const r of n.rows) assert.ok(r.length === 3 && (r[2] === 0 || r[2] === 1), n.id + ' ' + r[0]);
+    for (const r of n.rows) assert.ok((r.length === 3 || (r.length === 4 && r[3] === 1)) && (r[2] === 0 || r[2] === 1), n.id + ' ' + r[0]);
     assert.ok(n.cost && n.time && Array.isArray(n.steps) && n.steps.length, n.id + ' 缺少费用、用时或步骤');
+    assert.ok(e.isDate(n.checked) && n.checked <= '2026-11-27', n.id + ' 要有核对日期（checked，页面上每个节点按它显示）');
   }
 });
 
@@ -118,12 +119,45 @@ test('合规：面向用户的数据里没有保证类用语', () => {
   for (const s of texts) assert.ok(!/包过|必过|一定能批|保证获批|保证加分|100%通过/.test(s), s);
 });
 
+test('上线规则 1：待核实的法定期限、罚则、在留资格条件不显示具体数字', () => {
+  const raw = require('../data/nodes.json'), e = eng({});
+  let hidden = 0;
+  for (const n of raw) {
+    const v = e.NODES.find((x) => x.id === n.id);
+    if (v.pending) continue;
+    n.rows.forEach((r, i) => {
+      const s = v.rows[i]; assert.equal(s[0], r[0]); assert.equal(s[2], r[2]);
+      if (!r[2] && r[3]) { assert.doesNotMatch(s[1], /[0-9０-９]/, n.id + ' ' + r[0]); if (s[1] !== r[1]) { hidden++; assert.match(s[1], /待核实/); } }
+      else assert.equal(s[1], r[1], n.id + ' ' + r[0] + ' 其他行原样显示');
+    });
+  }
+  assert.ok(hidden > 0, '至少有一行被隐去数字（例如 4-2 逾期的处罚）');
+  assert.match(e.NODES.find((x) => x.id === '4-2').rows.find((r) => r[0] === '逾期的处罚')[1], /^待核实：/);
+  // 永驻体检：出国天数和日语的标准没核实，不显示标准的数字，也不判“未达到”
+  const r = eng({ status: 'work', pr: true, arrive: '2010-01-01', work: '2012-01-01', jp: 'low', trips: [['2020-01-01', '2020-12-01']] }).prCheck();
+  for (const name of ['单次出国', '近10年累计出国', '日语能力']) { const x = r.rows.find((y) => y[0] === name); assert.doesNotMatch(x[1], /半年|2年6个月|B1|183|913/, name); assert.notEqual(x[2], 'bad', name); }
+  assert.equal(r.when, null); assert.match(r.why, /出国时间较长/);
+});
+
+test('上线规则 2：待核实超过一半的节点显示“资料整理中”，只给官方链接', () => {
+  const raw = require('../data/nodes.json'), e = eng({});
+  const expect = raw.filter((n) => n.rows.filter((r) => !r[2]).length * 2 > n.rows.length).map((n) => n.id);
+  assert.deepEqual(e.NODES.filter((n) => n.pending).map((n) => n.id), expect);
+  assert.deepEqual(expect, ['3-2'], '本轮核实后只剩 3-2；变了要同步 docs/compliance-review.md 第二节');
+  for (const n of e.NODES.filter((x) => x.pending)) {
+    assert.deepEqual(n.rows, []); assert.equal(n.cost, '资料整理中'); assert.equal(n.time, '资料整理中'); assert.ok(n.src.length > 0, '要给官方链接');
+    assert.deepEqual(n.steps, ['资料整理中：步骤还没对照官方页面核实，请看官方链接'], n.id + ' 的步骤也不显示（3-2 的步骤曾经带着待核实行里的考场和预约规则）');
+  }
+  assert.ok(!/驾校费用待调研/.test(e.kb()), '助手的知识里也不带资料整理中节点的数据');
+  assert.ok(!/网上完全预约/.test(e.kb()), '助手的知识里也不带资料整理中节点的步骤');
+});
+
 test('配偶身份：永驻体检按婚姻3年加在留1年算，并提示2027年4月的变更', () => {
   const r = eng({ status: 'spouse', pr: true, arrive: '2025-06-01', married: '2023-01-10', jp: 'n2' }).prCheck();
   const names = r.rows.map((x) => x[0]);
   assert.ok(names.includes('婚姻持续年数')); assert.ok(!names.includes('就労或居住资格年数'));
   const m = r.rows.find((x) => x[0] === '婚姻持续年数');
-  assert.equal(m[2], 'ok'); assert.match(m[1], /2027年4月1日/); assert.match(m[1], /待核实/);
+  assert.equal(m[2], 'ok'); assert.match(m[1], /2027年4月1日/); assert.match(m[1], /待核实/); assert.doesNotMatch(m[1], /婚姻5年|在留3年/, '新年数没有核实，不显示');
   assert.equal(r.rows.find((x) => x[0] === '在留年数')[2], 'ok');
   assert.equal(r.when.getFullYear(), 2026);
 });
@@ -218,7 +252,6 @@ test('永驻体检：缺日期、特定技能、长期出国或有不达标的�
     [{ status: 'ssw', arrive: '2015-01-01', work: '2020-01-01' }, /特定技能1号/],
     [{ status: 'work', arrive: '2010-01-01', work: '2012-01-01', trips: [['2020-01-01', '2022-06-01']] }, /出国时间较长/],
     [{ status: 'work', arrive: '2010-01-01', work: '2012-01-01', pay: false }, /不达标/],
-    [{ status: 'work', arrive: '2010-01-01', work: '2012-01-01', jp: 'low' }, /不达标/],
     [{ status: 'work', arrive: '', work: '2012-01-01' }, /来日日期/],
     [{ status: 'work', arrive: '2010-02-30', work: '2012-01-01' }, /来日日期/],
   ];
@@ -363,4 +396,50 @@ test('提示词：工具没有返回期限时不让助手下“没有法定届�
   const sys = eng({}).SYS;
   assert.doesNotMatch(sys, /说明按他现在的在留资格没有对应的法定届出/);
   assert.match(sys, /本工具没有登记到对应的期限，这不代表没有其他手续/); assert.match(sys, /以入管厅或区役所的说明为准/);
+});
+
+// 数字、金额、日期、期间：按 NFKC 统一全角，日期按整个“年月日”取
+const numTokens = (s) => s.normalize('NFKC').match(/\d+年\d+月(?:\d+日)?|\d+月\d+日|\d[\d,.]*(?:万日元|日元|元|%|个月|天|岁|分|年度|年|日)?/g) || [];
+// 已知不是泄露的：1-4 依据的标题是指南本身的改定日（5-1 已核实的“适用时期”也写着），和待核实行讲的“免除期间怎么评价”不是一回事
+const LEAK_OK = { '1-4': ['2026年10月1日'] };
+test('上线规则 1、2 不能被绕过：待核实行里隐去的数字，也不出现在同一节点的概要、费用、用时、步骤和依据标题里', () => {
+  const raw = require('../data/nodes.json'), e = eng({}), bad = [];
+  for (const n of raw) {
+    const v = e.NODES.find((x) => x.id === n.id);
+    // 隐去的行：待核实又标了 r[3] 的（规则 1）；资料整理中的节点是全部待核实行（规则 2）
+    const hidden = n.rows.filter((r) => !r[2] && (v.pending || r[3]) && /[0-9０-９]/.test(r[1]));
+    const ok = n.rows.filter((r) => r[2]).map((r) => r[1].normalize('NFKC')).join('\n');
+    const fields = { sum: v.sum, cost: v.cost, time: v.time, steps: v.steps.join('\n'), src: v.src.map((x) => x[0]).join('\n') };
+    for (const r of hidden) for (const t of new Set(numTokens(r[1]))) {
+      if (ok.includes(t) || (LEAK_OK[n.id] || []).includes(t)) continue; // 同一节点已核实的行里也有，不算泄露
+      for (const [k, txt] of Object.entries(fields)) if (txt.normalize('NFKC').includes(t)) bad.push(n.id + ' ' + r[0] + ' → ' + k + ' 里有 ' + t);
+    }
+  }
+  assert.deepEqual(bad, []);
+  // 5-3 的施行日没有官方的政令原文，概要和依据标题里都不写日期
+  const v53 = e.NODES.find((x) => x.id === '5-3');
+  assert.doesNotMatch(v53.sum + v53.src.map((x) => x[0]).join(''), /2027年4月1日/);
+});
+
+// 1-4 的国民年金保险料：依据里的日本年金机构页面上有，但没有单列成一行，也没有在这一轮重新打开核对（docs/compliance-review.md 第四节后的说明）
+const COST_OK = { '1-4': ['17,920日元'] };
+test('费用里的具体金额要么来自同一节点已核实的行，要么那一段标了待核实（4-6 曾经写着没有来源的银行手续费）', () => {
+  const raw = require('../data/nodes.json'), e = eng({}), bad = [];
+  for (const n of raw) {
+    const v = e.NODES.find((x) => x.id === n.id);
+    if (v.pending) continue;
+    const ok = n.rows.filter((r) => r[2]).map((r) => r[1].normalize('NFKC')).join('\n');
+    for (const seg of v.cost.split(/[；;]/)) {
+      if (/待核实|待实测|待调研|待现场确认/.test(seg)) continue;
+      for (const t of numTokens(seg)) if (/日元|元|%/.test(t) && !ok.includes(t) && !(COST_OK[n.id] || []).includes(t)) bad.push(n.id + ' 费用「' + seg + '」里的 ' + t);
+    }
+  }
+  assert.deepEqual(bad, []);
+  assert.doesNotMatch(e.NODES.find((x) => x.id === '4-6').cost, /三菱/);
+});
+
+test('4-1 手续费写明新标准的适用范围：2026年10月1日以后申请的才按新金额', () => {
+  const n = eng({}).NODES.find((x) => x.id === '4-1');
+  const fee = n.rows.find((r) => r[0] === '手续费（窗口）');
+  for (const s of [fee[1], n.sum, n.cost]) { assert.match(s, /2026年10月1日以后/); assert.match(s, /6,000日元/); }
 });

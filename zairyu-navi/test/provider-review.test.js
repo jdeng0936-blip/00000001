@@ -16,7 +16,7 @@ test('批准：士业不填核对方式不能批准；核对日期晚于今天 4
     assert.equal((await s.adm('POST', P + '/approve', { reviewKey: s.rk(id), licenseCheck: CHECK }, 'nope-nope-nope-nope-nope-nope')).status, 401);
     const r = await s.adm('POST', P + '/approve', { reviewKey: s.rk(id), licenseCheck: CHECK }, BOB);
     assert.equal(r.status, 200, JSON.stringify(r.body));
-    assert.deepEqual(Object.keys(r.body).sort(), ['invoiceId', 'providerId'], '返回里没有令牌');
+    assert.deepEqual(Object.keys(r.body).sort(), ['freeUntil', 'providerId'], '返回里没有令牌'); assert.equal(r.body.freeUntil, '2026-11-30', '批准当月免费');
     const d = (await s.adm('GET', P)).body;
     assert.equal(d.status, 'approved'); assert.equal(d.decidedBy, 'bob');
     assert.deepEqual(d.licenseCheck, { method: 'association_search', note: '会员检索一致', checkedOn: '2026-11-27', checkedBy: 'bob' });
@@ -25,9 +25,9 @@ test('批准：士业不填核对方式不能批准；核对日期晚于今天 4
     assert.match(d.checkWhere, /日本行政書士会連合会/);
     assert.equal((await s.adm('POST', P + '/approve', { reviewKey: s.rk(id), licenseCheck: CHECK })).status, 409, '不能批准两次');
     assert.equal((await s.adm('POST', P + '/reject', { reviewKey: s.rk(id), reason: '已经批准过的不能再拒绝。' })).status, 409);
-    // 批准邮件：领取令牌的步骤和账单，没有令牌
+    // 批准邮件：领取令牌的步骤和首月免费的说明，没有令牌，也没有账单
     const m = s.lastMail('a@example.jp');
-    assert.match(m.subject, /已批准/); assert.match(m.body, /用联系邮箱领取/); assert.match(m.body, /参考编号：ZN\d{4}-/);
+    assert.match(m.subject, /已批准/); assert.match(m.body, /用联系邮箱领取/); assert.match(m.body, /批准当月免费/); assert.doesNotMatch(m.body, /参考编号|付款期限/);
     // 非士业不用核对记录
     const b = await s.apply('b@example.jp', { category: 'mobile', licenseNo: '', licenseBody: '' });
     assert.equal((await s.adm('POST', '/api/admin/applications/' + s.appByRef(b.body.ref).id + '/approve', { reviewKey: s.appByRef(b.body.ref).reviewKey })).status, 200);
@@ -75,7 +75,8 @@ test('后台改不了：没有修改类别、收费方式、登录番号、金�
   const s = await start();
   try {
     const p = await s.onboard('n@example.jp');
-    const A = '/api/admin/providers/' + p.providerId, I = '/api/admin/invoices/' + p.invoiceId, AP = '/api/admin/applications/' + s.appByRef(p.ref).id;
+    s.app.billing.runOnce();
+    const A = '/api/admin/providers/' + p.providerId, I = '/api/admin/invoices/' + s.app.store.invoiceFor(p.providerId, '2026-12').id, AP = '/api/admin/applications/' + s.appByRef(p.ref).id;
     for (const [m, path, b] of [['PATCH', A, { category: 'mobile' }], ['PUT', A, { feeModel: 'affiliate_disclosed' }], ['PUT', A + '/category', { category: 'mobile' }], ['PUT', A + '/fee-model', { feeModel: 'success' }],
       ['PUT', A + '/license', { licenseNo: '1' }], ['PATCH', I, { amountYen: 1 }], ['PUT', I, { amountYen: 1 }], ['PUT', I + '/amount', { amount: 1 }], ['PATCH', AP, { category: 'mobile' }], ['PUT', AP, { licenseNo: '1' }]]) {
       assert.equal((await s.adm(m, path, b)).status, 404, m + ' ' + path);
@@ -89,7 +90,9 @@ test('后台改不了：没有修改类别、收费方式、登录番号、金�
 test('留痕：只有编号、动作和管理员名，没有 @、6 位验证码、令牌、理由原文', async () => {
   const s = await start();
   try {
-    const p = await s.onboard('audit@example.jp', null, true);
+    const p = await s.onboard('audit@example.jp');
+    s.app.billing.runOnce();
+    assert.equal((await s.adm('POST', '/api/admin/invoices/' + s.app.store.invoiceFor(p.providerId, '2026-12').id + '/paid', { paidOn: '2026-11-27' })).status, 200);
     const b = await s.apply('audit2@example.jp');
     await s.adm('POST', '/api/admin/applications/' + s.appByRef(b.body.ref).id + '/reject', { reviewKey: s.appByRef(b.body.ref).reviewKey, reason: '这是不应当进留痕的理由原文。' });
     await s.call('PUT', '/api/provider/me/notify', { on: false }, p.token);

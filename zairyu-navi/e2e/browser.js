@@ -58,6 +58,22 @@ async function step(name, fn) {
     assert.equal(plan.next.id, uiNext, '服务器算出的下一步和页面显示的应当一样');
   });
 
+  await step('上线规则：资料整理中的节点只给官方链接；待核实的罚则不显示数字', async () => {
+    await go('#route');
+    const d = await p.evaluate(() => { SEL = '3-2'; renderRoute(); const el = document.getElementById('detail'); return { text: el.textContent, links: el.querySelectorAll('.src a').length, open: el.querySelector('details').open }; });
+    assert.match(d.text, /资料整理中/); assert.ok(d.links > 0, '要给官方链接'); assert.ok(d.open, '依据默认展开');
+    assert.ok(!/驾校费用待调研|1,900日元/.test(d.text), '不显示待核实的费用和要点');
+    assert.ok(!/完全预约|光明池参加学科考试/.test(d.text), '步骤也不显示（步骤里曾经带着待核实行的考场和预约规则）');
+    assert.match(d.text, /核对日期：2026年11月24日/, '核对日期按节点显示');
+    const d53 = await p.evaluate(() => { SEL = '5-3'; renderRoute(); return document.getElementById('detail').textContent; });
+    assert.ok(!/2027年4月1日/.test(d53), '5-3 施行日没核实：概要、要点、依据标题里都不显示日期');
+    const d46 = await p.evaluate(() => { SEL = '4-6'; renderRoute(); return document.getElementById('detail').textContent; });
+    assert.match(d46, /核对日期：2026年11月27日/);
+    const t = await p.evaluate(() => { SEL = '4-2'; renderRoute(); return [...document.querySelectorAll('#detail tr')].map((r) => r.textContent).find((x) => x.startsWith('逾期的处罚')); });
+    assert.ok(t && !/[0-9]/.test(t), t);
+    await p.evaluate(() => { SEL = null; renderAll(); });
+  });
+
   await step('有账号时不提供“恢复示例”，有“删除我的账号和全部数据”', async () => {
     await go('#route'); await p.evaluate(() => { document.getElementById('prof').open = true; });
     assert.equal(await p.isVisible('#reset'), false, '有账号时不应当能点“恢复示例”');
@@ -613,7 +629,7 @@ async function step(name, fn) {
     await ctx6.close();
   });
 
-  await step('服务商入驻：申请页填写（验证码从发件箱读）→ 管理后台批准（要填核对方式）→ 工作台用联系邮箱领取令牌 → 付款确认前不展示 → 标记已付款后展示 → 用户发咨询 → 通知邮件里没有咨询内容 → 工作台回复 → 关掉通知 → 下架后 401', async () => {
+  await step('服务商入驻：申请页填写（验证码从发件箱读）→ 管理后台批准（要填核对方式）→ 工作台用联系邮箱领取令牌 → 批准当月免费，领取后就展示 → 下个月的账单开出了就标记已付款 → 用户发咨询 → 通知邮件里没有咨询内容 → 工作台回复 → 关掉通知 → 下架后 401', async () => {
     const PE = 'e2e.office@example.jp', PNAME = '端到端中文行政书士事务所<b>不是标签</b>', SUM = '想咨询经营管理签证的更新，公司第二年。';
     const reviewer = { authorization: 'Bearer ' + REVIEWER, 'content-type': 'application/json' };
     const code = async (to, after) => {
@@ -671,17 +687,24 @@ async function step(name, fn) {
     assert.ok(pmails.some((m) => /已批准/.test(m.subject)), '应当有批准邮件'); assert.ok(pmails.every((m) => !m.body.includes(ptok)), '任何邮件里都没有令牌');
     await pw.click('#cl-use');
     await pw.waitForSelector('#listing', { timeout: 5000 });
-    assert.match(await pw.innerText('#listing'), /不在名单上展示/, '付款确认前不展示');
-    await pw.waitForFunction(() => /待付款/.test(document.getElementById('billing').innerText), null, { timeout: 5000 });
-    assert.match(await pw.innerText('#billing'), /ZN\d{4}-/);
-    // 4. 付款确认前：首页名单上没有
+    assert.match(await pw.innerText('#listing'), /名单上展示中/, '批准当月免费：领取令牌后就展示');
+    await pw.waitForFunction(() => /展示费账单/.test(document.getElementById('billing').innerText), null, { timeout: 5000 });
+    assert.match(await pw.innerText('#billing'), /还没有账单。批准当月免费/, '首月免费的记录不是账单，不列出');
+    assert.ok(pmails.some((m) => /已批准/.test(m.subject) && /批准当月免费/.test(m.body) && !/参考编号/.test(m.body)), '批准邮件里写首月免费，没有账单');
+    // 4. 首页名单上已经有这家（不用先付款）
     const pid = app.providerId;
-    assert.ok(!(await json('/api/providers?category=gyosei')).some((x) => x.id === pid), '付款确认前不在名单上');
-    // 5. 管理后台标记已付款
-    await pad.click('#tab-invoices');
-    const icard = pad.locator('#invoices .card', { hasText: PNAME });
-    await icard.waitFor({ timeout: 5000 }); await icard.locator('button.mark-paid').click();
-    await pad.waitForFunction((n) => ![...document.querySelectorAll('#invoices .card')].some((c) => c.textContent.includes(n)), PNAME, { timeout: 5000 });
+    assert.ok((await json('/api/providers?category=gyosei')).some((x) => x.id === pid), '领取令牌后就在名单上');
+    // 5. 跑一轮展示费：离下个月不到 14 天时开出下个月的账单（按今天的日期，可能还没到），开出了就在管理后台标记已付款
+    await json('/api/admin/billing/run', { method: 'POST', headers: reviewer });
+    const next = (await json('/api/admin/invoices?status=issued', { headers: reviewer })).filter((i) => i.providerId === pid);
+    if (next.length) {
+      await pw.evaluate(() => loadInvoices()); await pw.waitForFunction(() => /待付款/.test(document.getElementById('billing').innerText), null, { timeout: 5000 });
+      assert.match(await pw.innerText('#billing'), /ZN\d{4}-/);
+      await pad.click('#tab-invoices');
+      const icard = pad.locator('#invoices .card', { hasText: PNAME });
+      await icard.waitFor({ timeout: 5000 }); await icard.locator('button.mark-paid').click();
+      await pad.waitForFunction((n) => ![...document.querySelectorAll('#invoices .card')].some((c) => c.textContent.includes(n)), PNAME, { timeout: 5000 });
+    }
     // 6. 用户（新设备）在首页看到这家：名单上方写着展示费；所属会和事务所地址
     const cu = await b.newContext({ viewport: { width: 390, height: 844 } }); const pu = await cu.newPage(); pu.on('pageerror', (e) => errs.push(e.message));
     await pu.goto(base + '/'); await pu.waitForSelector('#consent-ok', { timeout: 5000 }); await pu.click('#consent-ok'); await apiReady(pu);

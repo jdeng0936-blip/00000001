@@ -48,20 +48,23 @@ async function start(opts, at) {
     const m = lastMail(email);
     return call('POST', '/api/provider-claim', { challengeId: r.body.challengeId, code: m && m.kind === 'code' ? codeIn(m) : '000000' });
   };
-  // 申请、批准、领取令牌；pay 为真时把第一张账单标记为已付款。返回 { ref, providerId, invoiceId, token }
-  const onboard = async (email, over, pay) => {
+  // 申请、批准、领取令牌（批准当月免费，领取后就上名单）。返回 { ref, providerId, freeId（首月免费记录的 id）, freeUntil, token }
+  const onboard = async (email, over) => {
     const a = await apply(email, over); assert.equal(a.status, 201, JSON.stringify(a.body));
     const ap = await approve(a.body.ref, (over && over.category && !['gyosei', 'zeirishi', 'sharoshi', 'shiho', 'estate'].includes(over.category)) ? null : CHECK);
     assert.equal(ap.status, 200, JSON.stringify(ap.body));
     const c = await claim(email); assert.equal(c.status, 200, JSON.stringify(c.body));
-    if (pay) assert.equal((await adm('POST', '/api/admin/invoices/' + ap.body.invoiceId + '/paid', { paidOn: jstToday(t) })).status, 200);
-    return { ref: a.body.ref, providerId: ap.body.providerId, invoiceId: ap.body.invoiceId, token: c.body.token };
+    const free = app.store.invoiceFor(ap.body.providerId, jstToday(t).slice(0, 7));
+    return { ref: a.body.ref, providerId: ap.body.providerId, freeId: free && free.id, freeUntil: ap.body.freeUntil, token: c.body.token };
   };
+  // 把时间拨到 ymd（日本时间中午）跑一轮展示费，返回这家某一期的账单（默认下个月）
+  const runAt = (ymd) => { t = Date.parse(ymd + 'T03:00:00Z'); return app.billing.runOnce(); };
+  const pay = async (inv, ymd) => adm('POST', '/api/admin/invoices/' + inv.id + '/paid', { paidOn: ymd || jstToday(t) });
   const newUser = async () => (await call('POST', '/api/users', { accept: app.termsVersion })).body;
   const inquire = async (u, providerIds, summary, category) => call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: category || 'gyosei', providerIds, summary: summary || '想咨询在留期间更新，明年三月到期，现在是技人国。' }, u.token);
   const listed = async (category) => (await call('GET', '/api/providers?category=' + (category || 'gyosei'))).body;
   return {
-    app, base, call, adm, mails, lastMail, codeIn, applyCode, apply, appByRef, rk, approve, claim, onboard, newUser, inquire, listed,
+    app, base, call, adm, mails, lastMail, codeIn, applyCode, apply, appByRef, rk, approve, claim, onboard, runAt, pay, newUser, inquire, listed,
     now: () => t, advance: (ms) => { t += ms; }, set: (iso) => { t = Date.parse(iso); },
     stop: async () => { await app.deliver(); app.server.close(); app.server.closeAllConnections(); app.store.close(); }
   };
