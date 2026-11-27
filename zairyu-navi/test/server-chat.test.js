@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../src/server');
 
-const V = '2026-11-26';
+const V = '2026-11-27';
 async function start(opts) {
   const app = createApp(Object.assign({ now: '2026-11-26', adminToken: 'adm' }, opts));
   await new Promise((ok) => app.server.listen(0, '127.0.0.1', ok));

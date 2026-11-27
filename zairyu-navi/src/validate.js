@@ -176,4 +176,14 @@ function validateInquiry(b, deps) {
   return { category: b.category, nodeId: b.nodeId || null, summary, providerIds: ids.slice(), providers };
 }
 
-module.exports = { validateProfilePatch, validateInquiry, isDate, findSensitive, sensitiveLabel, assertNoSensitive, HttpError, STATUSES };
+// 邮箱：去掉首尾空白、转小写后保存和比较。只接受最常见的写法（英文字母、数字和 . _ % + - ，域名至少两段），最长 254 个字符。
+// 中文域名之类的地址现在不支持。不合格时返回 422。
+function normalizeEmail(s) {
+  const e = typeof s === 'string' ? s.trim().toLowerCase() : '';
+  if (!e || e.length > 254 || !/^[a-z0-9._%+-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(e) || /\.\.|^\.|\.@|@-|-\.|\.-|-$/.test(e)) throw new HttpError(422, '邮箱地址的写法不对');
+  return e;
+}
+// 给用户看的邮箱只露第一个字符和域名：a***@example.com
+function maskEmail(e) { const i = e.indexOf('@'); return e.slice(0, 1) + '***' + e.slice(i); }
+
+module.exports = { validateProfilePatch, validateInquiry, isDate, findSensitive, sensitiveLabel, assertNoSensitive, normalizeEmail, maskEmail, HttpError, STATUSES };

@@ -4,7 +4,7 @@ const { createApp } = require('../src/server');
 
 let base, app;
 const tokens = {};
-const V = '2026-11-26';
+const V = '2026-11-27';
 const adminCall = (method, path, body) => call(method, path, body, 'adm-secret');
 const newProvider = async (over) => (await adminCall('POST', '/api/admin/providers', Object.assign({ name: '示例行政书士事务所', category: 'gyosei', area: '大阪', langs: '中文、日语', feeNote: '首次咨询30分钟5,500日元', licenseNo: '第00000000号' }, over))).body;
 const call = async (method, path, body, token) => {

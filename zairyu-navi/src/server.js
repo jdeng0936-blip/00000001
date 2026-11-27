@@ -5,19 +5,48 @@ const path = require('node:path');
 const createEngine = require('./engine');
 const { createStore } = require('./store');
 
-const { validateProfilePatch, validateInquiry, isDate, assertNoSensitive, sensitiveLabel, HttpError } = require('./validate');
+const { validateProfilePatch, validateInquiry, isDate, assertNoSensitive, sensitiveLabel, normalizeEmail, maskEmail, HttpError } = require('./validate');
 const assistant = require('./assistant');
+const crypto = require('node:crypto');
+const { createSender, deliverOutbox, TEXTS } = require('./mailer');
+
+// 使用条款和隐私政策的版本。文本改了就改这个版本号：老用户下次打开时要重新同意，同意之前只能读取或删除自己的数据。
+// TERMS_CHANGES 是给老用户看的“这次改了什么”，和版本号一起改。
+const TERMS_VERSION = '2026-11-27';
+const TERMS_CHANGES = '可以绑定邮箱，用来在换设备或清空浏览器后找回账号（自愿，不绑定也能用）；绑定后我们会保存你的邮箱地址，并通过邮件服务商发送验证码和新设备登录通知。';
+const CODE_TTL_MS = 10 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
+// 验证码的限流（次数存在数据库里，重启不清零）。“发验证码”按邮箱（绑定和找回分开计）、来源地址、账号各算一次；
+// “核对验证码”按来源地址、邮箱、账号算；每个验证码另外最多错 5 次（store.verifyChallenge）。
+const EMAIL_LIMITS = {
+  reqEmail: [{ max: 1, windowMs: 60 * 1000 }, { max: 5, windowMs: HOUR }, { max: 10, windowMs: 24 * HOUR }],
+  reqIp: [{ max: 10, windowMs: HOUR }],
+  reqUser: [{ max: 5, windowMs: HOUR }],
+  verIp: [{ max: 30, windowMs: HOUR }],
+  verEmail: [{ max: 20, windowMs: HOUR }],
+  verUser: [{ max: 30, windowMs: HOUR }]
+};
 
 function createApp(opts) {
   opts = opts || {};
-  const store = opts.store || createStore(opts.dbFile);
+  // clock：毫秒时间，验证码过期和限流用；测试里可以拨。now 是引擎用的“今天”，两者互不影响。
+  const clock = opts.clock || (() => Date.now());
+  const store = opts.store || createStore(opts.dbFile, { clock });
+  // 发件方式：不传就是 outbox（不联网，邮件留在库里）。正式启动时由文件末尾按环境变量建好传进来，测试不会误发真邮件。
+  const sender = opts.sender || createSender({});
+  const termsVersion = opts.termsVersion || TERMS_VERSION;
+  const limits = Object.assign({}, EMAIL_LIMITS, opts.emailLimits || {});
+  const trustProxy = opts.trustProxy != null ? !!opts.trustProxy : process.env.TRUST_PROXY === '1';
+  // 来源地址。TRUST_PROXY=1 时取 X-Forwarded-For 的最后一段（紧挨着的那层反向代理写的），否则取连接的对端地址。
+  const clientIp = (req) => {
+    if (trustProxy) { const last = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim(); if (last) return last; }
+    return req.socket.remoteAddress || '';
+  };
   const nowOf = () => opts.now || undefined;
   const engineFor = (u) => createEngine({ profile: u.profile, done: u.done, plan: u.plan, auth: u.auth, events: store.listEvents(u.id), now: nowOf() });
-  // 使用条款和隐私政策的版本。文本改了就改这个版本号，老用户要重新同意（重新同意的流程待做）。
-  const TERMS_VERSION = '2026-11-26';
   const adminToken = opts.adminToken || process.env.ADMIN_TOKEN || null;
   const bearer = (req) => (/^Bearer (.+)$/.exec(req.headers.authorization || '') || [])[1];
-  const admin = (req) => { if (!adminToken) throw new HttpError(503, '管理接口还没有配置（缺少 ADMIN_TOKEN）'); const t = Buffer.from(bearer(req) || ''), k = Buffer.from(adminToken); if (t.length !== k.length || !require('node:crypto').timingSafeEqual(t, k)) throw new HttpError(401, '需要管理员令牌'); };
+  const admin = (req) => { if (!adminToken) throw new HttpError(503, '管理接口还没有配置（缺少 ADMIN_TOKEN）'); const t = Buffer.from(bearer(req) || ''), k = Buffer.from(adminToken); if (t.length !== k.length || !crypto.timingSafeEqual(t, k)) throw new HttpError(401, '需要管理员令牌'); };
   const provider = (req) => { const p = store.providerByToken(bearer(req)); if (!p) throw new HttpError(401, '需要服务商令牌'); return p; };
   const ref = createEngine({ now: nowOf() }); // 只用来取静态数据
   const nodeIds = new Set(ref.NODES.map((n) => n.id));
@@ -43,6 +72,19 @@ function createApp(opts) {
   const signup = limiter(opts.signupLimit || { max: 30, windowMs: 60 * 60 * 1000 });
   const tooMany = (wait, msg) => new HttpError(429, msg + '，请在' + (wait >= 120 ? Math.ceil(wait / 60) + '分钟' : wait + '秒') + '后再试', { 'retry-after': String(wait) });
 
+  // ---- 邮箱验证码 ----
+  const rules = (list, prefix, value) => list.map((r) => ({ key: store.rateKey(prefix, value), max: r.max, windowMs: r.windowMs }));
+  const limit = (rs, msg) => { const wait = store.hit(rs); if (wait) throw tooMany(wait, msg); };
+  const newCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  const BAD_CODE = '验证码不对或已过期。请重新发送验证码再试';
+  const codeOf = (b) => { if (!b || typeof b.challengeId !== 'string' || b.challengeId.length > 64 || typeof b.code !== 'string' || !/^\d{6}$/.test(b.code.trim())) throw new HttpError(422, BAD_CODE); return b.code.trim(); };
+  // 邮件在响应发出之后再交给发件方式，发得快慢不影响接口的响应时间
+  let delivering = Promise.resolve();
+  const deliver = () => { delivering = delivering.then(() => deliverOutbox(store, sender)).catch((e) => { if (!closed) console.error(e); }); return delivering; };
+  let closed = false, lastPurge = 0;
+  const kick = () => setImmediate(() => { if (!closed) deliver(); });
+  const purge = () => { if (clock() - lastPurge >= 60 * 1000) { lastPurge = clock(); store.purgeExpired(); } };
+
   const user = (id, req) => {
     const tok = /^Bearer (.+)$/.exec(req.headers.authorization || '');
     // 没有令牌和令牌不对都返回同样的 401，不透露这个 id 是否存在。
@@ -64,7 +106,47 @@ function createApp(opts) {
       const params = Object.fromEntries(url.searchParams);
       try { return ref.options(seg[2], params); } catch (e) { throw new HttpError(404, e.message); }
     }
-    if (seg[1] === 'terms' && m === 'GET') return { version: TERMS_VERSION, terms: '/terms.html', privacy: '/privacy.html' };
+    if (seg[1] === 'terms' && m === 'GET') return { version: termsVersion, changes: TERMS_CHANGES, terms: '/terms.html', privacy: '/privacy.html' };
+    // 发件箱：本地开发和测试从这里读验证码邮件，运维用它看有没有发不出去的邮件。没配 ADMIN_TOKEN 时是 503。
+    // 正文和完整的收件地址只在本地发件方式（outbox、console）下返回；接了真实发信之后只返回状态，地址打码。
+    if (seg[1] === 'admin' && seg[2] === 'outbox' && m === 'GET') {
+      admin(req);
+      const to = url.searchParams.get('to');
+      return store.listOutbox({ status: url.searchParams.get('status') || undefined, to: to ? to.trim().toLowerCase() : undefined })
+        .map((r) => Object.assign({ id: r.id, kind: r.kind, to: sender.dev || !r.to ? r.to : maskEmail(r.to), subject: r.subject, status: r.status, tries: r.tries, lastError: r.lastError, createdAt: r.createdAt, sentAt: r.sentAt }, sender.dev ? { body: r.body } : {}));
+    }
+    // 找回账号：只凭邮箱，不用登录。不管这个邮箱有没有绑定过账号，返回的内容都一样。
+    if (seg[1] === 'auth' && seg[2] === 'recover' && m === 'POST') {
+      purge();
+      if (!seg[3]) {
+        const email = normalizeEmail(body && body.email); // 只看写法，和有没有绑定无关
+        limit(rules(limits.reqEmail, 'req-recover-em', email).concat(rules(limits.reqIp, 'req-ip', clientIp(req))), '验证码发得太频繁');
+        const owner = store.userByEmail(email), code = newCode(), mail = TEXTS.recoverCode(code);
+        // 绑定过：存验证码并发邮件。没绑定过：存一个永远验不过的验证码，不发邮件。两种情况都是一次提交。
+        const challengeId = store.tx(() => {
+          const id = store.createChallenge({ purpose: 'recover', userId: owner, email, code: owner ? code : null }, CODE_TTL_MS);
+          if (owner) store.enqueueMail({ userId: owner, kind: 'code', to: email, subject: mail.subject, body: mail.text });
+          return id;
+        });
+        kick();
+        return [202, { challengeId, expiresInSec: CODE_TTL_MS / 1000 }];
+      }
+      if (seg[3] === 'verify' && !seg[4]) {
+        const code = codeOf(body);
+        limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verEmail, 'ver-em', store.challengeEmail(body.challengeId) || 'challenge ' + body.challengeId)), '验证码试得太频繁');
+        const c = store.verifyChallenge(body.challengeId, 'recover', code);
+        // 验证码对了，还要这个邮箱此刻仍然绑在那个账号上（发码之后解除了绑定、删了账号的不算）
+        if (!c || !c.userId || store.userByEmail(c.email) !== c.userId) throw new HttpError(422, BAD_CODE);
+        const mail = TEXTS.newDevice(clock());
+        const token = store.tx(() => {
+          const t = store.createSession(c.userId, 'recover'); // 新令牌只返回这一次；原来设备的令牌不动
+          store.enqueueMail({ userId: c.userId, kind: 'notice', to: c.email, subject: mail.subject, body: mail.text });
+          return t;
+        });
+        kick();
+        return { id: c.userId, token };
+      }
+    }
     if (seg[1] === 'providers' && !seg[2] && m === 'GET') {
       const pub = (p) => ({ id: p.id, name: p.name, category: p.category, area: p.area, langs: p.langs, feeNote: p.feeNote, licenseNo: p.licenseNo, promoted: p.feeModel === 'affiliate_disclosed' });
       return store.listProviders(url.searchParams.get('category') || undefined).map(pub);
@@ -115,15 +197,58 @@ function createApp(opts) {
     }
     if (seg[1] === 'users') {
       if (!seg[2] && m === 'POST') {
-        if (!body || body.accept !== TERMS_VERSION) throw new HttpError(422, '要先同意使用条款和隐私政策（版本 ' + TERMS_VERSION + '）');
-        const wait = signup(req.socket.remoteAddress || '');
+        if (!body || body.accept !== termsVersion) throw new HttpError(422, '要先同意使用条款和隐私政策（版本 ' + termsVersion + '）');
+        const wait = signup(clientIp(req));
         if (wait) throw tooMany(wait, '新建账号太频繁');
-        return [201, store.createUser(TERMS_VERSION)];
+        return [201, store.createUser(termsVersion)];
       }
       const u = user(seg[2], req);
       const sub = seg[3];
       if (!sub && m === 'GET') return u;
       if (!sub && m === 'DELETE') { store.deleteUser(u.id); return [204, null]; }
+      // 条款改版后重新同意。accept 必须是当前版本。
+      if (sub === 'consent' && m === 'POST' && !seg[4]) {
+        if (!body || body.accept !== termsVersion) throw new HttpError(422, '要先同意使用条款和隐私政策（版本 ' + termsVersion + '）');
+        if (u.consentVersion !== termsVersion) store.renewConsent(u.id, termsVersion);
+        return store.getUser(u.id);
+      }
+      // 同意的还是旧版本：只能读取自己的数据、删除账号、重新同意（上面三个），其余一律先拦下。
+      if (u.consentVersion !== termsVersion) throw new HttpError(409, '使用条款和隐私政策已更新（版本 ' + termsVersion + '）。请刷新页面，重新确认后继续使用');
+      // ---- 邮箱：绑定、查看、解除 ----
+      if (sub === 'email') {
+        purge();
+        if (!seg[4] && m === 'GET') { const e = store.getEmail(u.id); return { email: e ? maskEmail(e.email) : null, verified: !!e, remindOptIn: !!e && e.remindOptIn }; }
+        if (!seg[4] && m === 'POST') {
+          const b = body || {};
+          const email = normalizeEmail(b.email);
+          if (b.consent !== true) throw new HttpError(422, '绑定之前要先同意我们保存这个邮箱地址，用于找回账号、发送验证码和新设备登录通知');
+          limit(rules(limits.reqEmail, 'req-bind-em', email).concat(rules(limits.reqIp, 'req-ip', clientIp(req)), rules(limits.reqUser, 'req-u', u.id)), '验证码发得太频繁');
+          // 这个邮箱已经绑在别的账号上：返回的内容一样，但发过去的是“已经绑定过”的说明，存下的验证码永远验不过。
+          const owner = store.userByEmail(email), taken = !!owner && owner !== u.id;
+          const code = newCode(), mail = taken ? TEXTS.taken() : TEXTS.bindCode(code);
+          const challengeId = store.tx(() => {
+            const id = store.createChallenge({ purpose: 'bind', userId: u.id, email, code: taken ? null : code }, CODE_TTL_MS);
+            store.enqueueMail({ userId: taken ? owner : u.id, kind: taken ? 'notice' : 'code', to: email, subject: mail.subject, body: mail.text });
+            return id;
+          });
+          kick();
+          return [202, { challengeId, expiresInSec: CODE_TTL_MS / 1000 }];
+        }
+        if (seg[4] === 'verify' && !seg[5] && m === 'POST') {
+          const code = codeOf(body);
+          limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verEmail, 'ver-em', store.challengeEmail(body.challengeId) || 'challenge ' + body.challengeId), rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
+          const c = store.verifyChallenge(body.challengeId, 'bind', code, u.id);
+          if (!c || !store.bindEmail(u.id, c.email, termsVersion)) throw new HttpError(422, BAD_CODE);
+          return { email: maskEmail(c.email), verified: true, remindOptIn: store.getEmail(u.id).remindOptIn };
+        }
+        if (!seg[4] && m === 'DELETE') { store.removeEmail(u.id); return [204, null]; }
+        throw new HttpError(404, '没有这个接口');
+      }
+      // ---- 登录的设备：查看、让其他设备退出 ----
+      if (sub === 'sessions' && !seg[4]) {
+        if (m === 'GET') return store.listSessions(u.id, bearer(req));
+        if (m === 'DELETE') { store.revokeOtherSessions(u.id, bearer(req)); return [204, null]; }
+      }
       if (sub === 'events') {
         if (m === 'GET') return store.listEvents(u.id).map((ev) => Object.assign(ev, { label: evTypes.has(ev.type) ? ref.EVRULES[ev.type][0] : '' }));
         if (m === 'POST') {
@@ -246,13 +371,20 @@ function createApp(opts) {
     // 最后一道兜底：handle 里任何没接住的错误都在这里结束，不会变成未处理的 rejection 让进程退出
     handle(req, res, send).catch((e) => { console.error(e); send(500, { error: '服务器内部错误' }); });
   });
-  return { server, store };
+  server.on('close', () => { closed = true; });
+  // deliver：现在就把发件箱里到时间的邮件发一轮（定时重试和测试用）；purge：清理过期的验证码等
+  return { server, store, sender, deliver, purge: () => store.purgeExpired(), termsVersion };
 }
 
-module.exports = { createApp, validateProfilePatch };
+module.exports = { createApp, validateProfilePatch, TERMS_VERSION };
 
 if (require.main === module) {
   const port = +process.env.PORT || 8787;
-  const { server } = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db') });
-  server.listen(port, () => console.log('在留导航 后端已启动： http://localhost:' + port));
+  let sender;
+  // 发信的设置不全就不启动，并说清楚缺什么
+  try { sender = createSender(process.env); } catch (e) { console.error('邮件发送没有配置好：' + e.message); process.exit(1); }
+  const app = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db'), sender });
+  app.server.listen(port, () => console.log('在留导航 后端已启动： http://localhost:' + port + ' （邮件：' + sender.name + '）'));
+  // 每分钟：重试没发出去的邮件，清理过期的验证码和限流记录
+  setInterval(() => { app.deliver(); try { app.purge(); } catch (e) { console.error(e); } }, 60 * 1000).unref();
 }
