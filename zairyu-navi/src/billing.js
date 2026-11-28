@@ -39,7 +39,7 @@ const FREE = 'first_month_free';
 // 免费期的天数：批准日 + FREE_DAYS 天（含）为止免费
 const FREE_DAYS = 30;
 // 老服务商迁移时按入驻申请的规则查资料，返回问题的代号：category 类别不对、license 登录番号的格式或所属会不对（老服务商没有登记过所属会，
-// 士业都会落在这里）、claims 名单上的文字有保证类用语。有问题的不自动展示（store.migrateLegacyProviders 记为 legacy-hold）。
+// 士业都会落在这里）、claims 名单上的文字有保证类用语或像是给助手下指令的内容。有问题的不自动展示（store.migrateLegacyProviders 记为 legacy-hold）。
 function legacyIssues(p) {
   const out = [];
   if (!CAT_KEYS.has(p.category)) return ['category'];

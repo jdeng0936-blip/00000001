@@ -419,14 +419,20 @@ function createStore(file, opts) {
     // rules：[{ key, max, windowMs }]，key 的冒号后面是哈希（不放来源地址和邮箱的原文）。
     // 任何一条满了就返回还要等多少秒，这次不计数；都没满才给每个 key 记一次，返回 0。
     hit(rules) {
+      const wait = this.peek(rules);
+      if (wait) return wait;
+      const t = clock();
+      for (const k of new Set(rules.map((r) => r.key))) db.prepare('INSERT INTO rate_events (bucket, at) VALUES (?,?)').run(k, t);
+      return 0;
+    },
+    // 只看不记：有哪条满了就返回要等的秒数，否则 0。用来分清是哪一组满了（hit 是同步的，看完紧接着 hit 中间不会插进别的请求）
+    peek(rules) {
       const t = clock(); let wait = 0;
       for (const r of rules) {
         const q = db.prepare('SELECT COUNT(*) AS n, MIN(at) AS first FROM rate_events WHERE bucket=? AND at>?').get(r.key, t - r.windowMs);
         if (q.n >= r.max) wait = Math.max(wait, Math.max(1, Math.ceil((q.first + r.windowMs - t) / 1000)));
       }
-      if (wait) return wait;
-      for (const k of new Set(rules.map((r) => r.key))) db.prepare('INSERT INTO rate_events (bucket, at) VALUES (?,?)').run(k, t);
-      return 0;
+      return wait;
     },
     // 几个值各自哈希后用冒号连起来（例如 来源地址 + 邮箱）；删除账号、解除邮箱时按其中一段找出来删掉
     rateKey(prefix, ...values) { return prefix + ':' + values.map((v) => hash(String(v))).join(':'); },
@@ -531,6 +537,7 @@ function createStore(file, opts) {
       log(userId, 'event.create', { type: ev.type });
       return id;
     },
+    countEvents(userId) { return db.prepare('SELECT COUNT(*) AS n FROM events WHERE user_id=?').get(userId).n; },
     listEvents(userId) { return db.prepare('SELECT id, type, date, note FROM events WHERE user_id=? ORDER BY date').all(userId); },
     deleteEvent(userId, id) { return db.prepare('DELETE FROM events WHERE user_id=? AND id=?').run(userId, id).changes > 0; },
     // ---- 服务商 ----
@@ -829,6 +836,8 @@ function createStore(file, opts) {
       });
       return id;
     },
+    // 这个账号已经把同样的摘要发给过这家服务商、对方还没关掉（重复发的不再收）
+    hasOpenInquiry(userId, providerId, summary) { return !!db.prepare("SELECT 1 FROM inquiries WHERE user_id=? AND provider_id=? AND summary=? AND status<>'closed'").get(userId, providerId, summary); },
     listInquiries(userId) {
       return db.prepare('SELECT i.id, i.node_id AS nodeId, i.category, i.summary, i.status, i.created_at AS createdAt, p.name AS providerName FROM inquiries i JOIN providers p ON p.id=i.provider_id WHERE i.user_id=? ORDER BY i.created_at').all(userId)
         .map((q) => Object.assign(q, { replies: repliesOf(q.id) }));

@@ -24,6 +24,7 @@
 | `MAIL_*`、`SMTP_*`、`BILLING_*`、`REMINDERS_ENABLED` 等 | `deploy/.env` | 见 README。`MAIL_SENDER=http` 时 `APP_URL`、`BILLING_PLANS`、`BILLING_BANK_TEXT` 不填不启动（有意的） |
 | `PORT`、`DB_FILE`、`BACKUP_DIR`、`TRUST_PROXY`、`SHUTDOWN_TIMEOUT_MS` | `compose.yaml` | 由部署方式决定，不放进 `.env` |
 | `LOG_REQUESTS` | `deploy/.env`（可选） | 请求日志，默认 `1`，`0` 关 |
+| `CHAT_DAILY_MAX` | `deploy/.env`（可选） | 助手全站每 24 小时最多回答几句，默认 5000（每句最多调 6 次模型，按模型的价格算出每天的费用上限再定）。用完时标准错误里有一行“助手全站限额已用完”，监控看到就告警 |
 | `BACKUP_KEEP` | `deploy/.env`（可选） | 备份留几份，默认 7 |
 | `APP_VERSION` | 命令行 | 镜像的 tag（`zairyu-navi:${APP_VERSION}`），回滚用；不设是 `latest` |
 
@@ -35,6 +36,7 @@
 - **停机收尾**（SIGTERM、SIGINT）：先停定时器（提醒、展示费、发件箱重试），不再接新连接，`/api/ready` 变 503；手上的请求在 `SHUTDOWN_TIMEOUT_MS`（默认 25 秒）之内照常回答（回答后关掉连接），超时的强制断开；等正在发的那一轮邮件发完（同样有时限）；关数据库，以 0 退出。日志里有 `{"msg":"shutdown"}` 和 `{"msg":"stopped","forced":N}`（`forced` 是被强制断开的请求数）。再收到一次信号就不等了（退出码 1）。助手的一轮最长 120 秒，停机时正在回答的会被断开，用户重发即可。
 - **请求日志**：标准输出一行一个 JSON：`{"t","msg":"request","rid","method","route","status","ms"}`，`TRUST_PROXY=1` 时另有截短的 `ip`（IPv4 去掉最后一段，IPv6 只留前 3 段）；响应没发完连接就断了的带 `"aborted": true`。`route` 是模板（`/api/users/:id/plan`），不是真实地址：不写查询参数（退订令牌在那里）、账号编号、请求体、令牌、邮箱。成功的 `/api/health`、`/api/ready` 不记（每 10 至 30 秒一次，会淹没别的）。每个响应带 `X-Request-Id`：`TRUST_PROXY=1` 时沿用 Caddy 给的（只收 8 至 128 个字母、数字和 `. _ : -`），否则自己生成。出错时（500）的错误说明照旧写到标准错误。
 - 库文件以 600 权限建（服务器启动时 `umask 077`）。
+- **限流**（README“写进代码的合规规则”里的“限流”）：次数存在库里的 `rate_events`，重启、发布新版本都不清零，每分钟清掉 24 小时以前的。放在 Caddy 后面要开 `TRUST_PROXY=1`（`compose.yaml` 已开），否则所有人的来源地址都是 Caddy、一起被限。
 
 ## 3. 部署
 
@@ -131,7 +133,7 @@
 
 ## 9. 压力测试
 
-`npm run loadtest`（`tools/loadtest.js`，零依赖）：不给 `BASE` 时自己起一个和 `npm start` 一样的服务器（子进程，`/tmp` 下的新库，空闲端口，不写请求日志），建 20 个账号（新建账号每个来源地址每小时最多 30 个），填好概况，然后 `CONCURRENCY` 个并发（默认 20）在 `DURATION` 秒（默认 20）里按权重不停地发：读（首页、`/index.js`、`/api/nodes?full=1`、`/plan`、`/reminders`、`/advice`、`/pr-check`、`/options/phone`）和写（`PUT /state`、`PATCH /profile`、`PUT /tasks/:id/done`、记录事件再删掉）。不调助手（不调用真实的模型）、不发邮件。有非 2xx 时退出码 1。`JSON=1` 输出 JSON；`BASE=…` 打已经起好的服务器（只用自己建的测试账号）。
+`npm run loadtest`（`tools/loadtest.js`，零依赖）：不给 `BASE` 时自己起一个和 `npm start` 一样的服务器（子进程，`/tmp` 下的新库，空闲端口，不写请求日志），建 20 个账号（新建账号每个来源地址每小时最多 30 个；记事件每个账号每小时最多 30 条，跑久了撞上的 429 是限流，不算非 2xx，单独记在表里的“限流 429”一列（`JSON=1` 时是每行的 `limited`），耗时的 p50 等不算被限流的请求。下面的数是加限流之前量的，那时记事件一直是 201，表里也还没有“限流 429”这一列），填好概况，然后 `CONCURRENCY` 个并发（默认 20）在 `DURATION` 秒（默认 20）里按权重不停地发：读（首页、`/index.js`、`/api/nodes?full=1`、`/plan`、`/reminders`、`/advice`、`/pr-check`、`/options/phone`）和写（`PUT /state`、`PATCH /profile`、`PUT /tasks/:id/done`、记录事件再删掉）。不调助手（不调用真实的模型）、不发邮件。有非 2xx 时退出码 1。`JSON=1` 输出 JSON；`BASE=…` 打已经起好的服务器（只用自己建的测试账号）。
 
 2026-11-28 在开发用的容器里跑的（4 核 Intel Xeon 2.30GHz，Node v22.23.5，客户端和服务器在同一台机器上，不经过 Caddy；单个 Node 进程、SQLite 同步写）：
 
@@ -156,7 +158,7 @@
 
 并发 50、20 秒：合计 13742 次、0 个非 2xx、每秒 685.6 次，p50 52.8 ms、p95 207.2 ms、p99 272.3 ms、最大 626 ms（最慢的是 `/index.js`，p50 239 ms）。
 
-读法：一个进程大约每秒 700 次请求就到顶了（CPU 一个核满），再加并发只是排队，延迟变长、吞吐不涨；没有出错。每次打开首页要 `/`、`/index.js`、`/index.css`、`/merge.js` 加 4 个读接口，按每个活跃用户每分钟十几次请求算，单台单进程撑几百个同时在线的用户。最慢的是静态文件（首页 HTML 和 85KB 的 `index.js`，每次从磁盘读、不压缩）：经过 Caddy 时有 gzip，浏览器有 ETag 时是 304，实际负担比表里小；要再快可以让 Caddy 直接发 `web/` 的文件。更多并发要多进程时，先把助手的“一个账号同一时间只答一条”、助手和新建账号的限流从进程内存换成共享的（`docs/TODO.md` 第 10 条）。助手的请求主要是等模型（几秒到几十秒），不占 CPU，没有放进压力测试。
+读法：一个进程大约每秒 700 次请求就到顶了（CPU 一个核满），再加并发只是排队，延迟变长、吞吐不涨；没有出错。每次打开首页要 `/`、`/index.js`、`/index.css`、`/merge.js` 加 4 个读接口，按每个活跃用户每分钟十几次请求算，单台单进程撑几百个同时在线的用户。上面的表是静态文件每次从磁盘读、不压缩时量的（当时最慢的是 `/index.js`）。2026-11-28 之后应用自己压缩：网页文件按版本（ETag）放在内存里、文字类的文件存一份 gzip，读接口 1KB 以上的 GET 返回也按 `Accept-Encoding` 压缩（只压 GET，带令牌的 POST 返回不压）；同样的机器、同样的设置再跑一次是合计每秒 699 次、p50 25.5 ms、p95 51.7 ms、p99 67 ms，`/index.js` 的 p50 从最慢降到和读接口一样（25 ms），读接口压缩多花的 CPU 让总吞吐少了约 7%。经过 Caddy 时它不再重复压缩（响应已经带 `Content-Encoding`）；浏览器有 ETag 时是 304。要再快可以让 Caddy 直接发 `web/` 的文件。更多并发要多进程时，先把助手的“一个账号同一时间只答一条”、助手和新建账号的限流从进程内存换成共享的（`docs/TODO.md` 第 10 条）。助手的请求主要是等模型（几秒到几十秒），不占 CPU，没有放进压力测试。
 
 ## 10. 验证过的（2026-11-28，本机）
 

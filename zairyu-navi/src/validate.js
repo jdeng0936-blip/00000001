@@ -1,4 +1,6 @@
 // 校验：用户概况、日期、咨询内容、敏感号码。接口和助手共用同一套规则。
+// 每个账号最多存几条事件（网页和助手记录的合计）
+const EVENTS_MAX = 200;
 const STATUSES = ['none', 'short', 'student', 'work', 'hsp', 'family', 'spouse', 'ssw', 'biz', 'pr'];
 const DATE_KEYS = ['entry', 'addr', 'exp', 'arrive', 'work', 'married'];
 const BOOL_KEYS = ['ins', 'age', 'lic', 'pr', 'pay'];
@@ -236,8 +238,15 @@ function checkLicense(category, licenseNo, licenseBody) {
   return { licenseNo: lic, licenseBody: '' };
 }
 // 名单上公开的文字（名称、地址、收费说明、区域、语言）都不能有保证类用语。f：{ name, address, feeNote, area, langs }
+// 名单上的文字还会原样交给助手（suggest_providers 的结果），所以也不能夹着像是给模型下指令的话（安全检查 2026-11-28 第 6 条）：
+// “忽略之前的指令”“调用 update_profile”这类。只拦明显的写法（尖括号不拦：页面一律按文字显示，端到端检查专门用带标签的名字试过）；助手那边另有一道（改数据要用户确认，见 assistant.js 的 prepareWrite）。
+const INSTRUCTION = /忽略|无视|無視|ignore(?:all|any|previous|prior|the|above|your)|disregard|systemprompt|提示词|提示詞|プロンプト|指令|调用|調用|update_profile|mark_done|add_trip|add_event|create_inquiry|suggest_providers|get_plan|get_options/i;
+function hasInstructions(text) { return typeof text === 'string' && INSTRUCTION.test(text.normalize('NFKC').replace(RE.zw, '').replace(/\s+/g, '')); }
 function assertListingText(f) {
-  for (const [k, label] of [['name', '名称'], ['address', '事务所地址'], ['feeNote', '收费说明'], ['area', '服务区域'], ['langs', '语言']]) assertNoClaims(f[k], label);
+  for (const [k, label] of [['name', '名称'], ['address', '事务所地址'], ['feeNote', '收费说明'], ['area', '服务区域'], ['langs', '语言']]) {
+    assertNoClaims(f[k], label);
+    if (hasInstructions(f[k])) throw new HttpError(422, label + '里不能有像是给助手下指令的内容（例如“忽略”“指令”“调用”和工具名）');
+  }
 }
 // 收费方式只按类别定：士业是 fixed_listing，其余是 affiliate_disclosed。两种都只付固定的展示费，
 // affiliate_disclosed 只表示“名单上标明含推广”（名字是早先定的，为了兼容旧数据没有改），不表示按咨询或成交给佣金。
@@ -266,4 +275,4 @@ function validateApplication(b, deps) {
   return out;
 }
 
-module.exports = { validateApplication, checkLicense, assertListingText, feeModelOf, normalizeLicense, LICENSE_RULES, assertNoClaims, hasClaims, corpNumberOk, validateProfilePatch, validateInquiry, isDate, findSensitive, sensitiveLabel, assertNoSensitive, normalizeEmail, maskEmail, HttpError, STATUSES };
+module.exports = { EVENTS_MAX, hasInstructions, validateApplication, checkLicense, assertListingText, feeModelOf, normalizeLicense, LICENSE_RULES, assertNoClaims, hasClaims, corpNumberOk, validateProfilePatch, validateInquiry, isDate, findSensitive, sensitiveLabel, assertNoSensitive, normalizeEmail, maskEmail, HttpError, STATUSES };

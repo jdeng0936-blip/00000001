@@ -202,7 +202,7 @@ test('告知邮件一直发不出去：放弃时也清掉旧地址和正文', as
   } finally { await s.stop(); }
 });
 
-test('刚用邮箱找回登录的设备 24 小时内不能换绑或解除邮箱；注册时的设备可以；过了 24 小时可以；让其他设备退出不受限', async () => {
+test('刚用邮箱找回登录的设备 24 小时内不能换绑或解除邮箱、不能让其他设备退出、不能删除账号；注册时的设备可以；过了 24 小时可以', async () => {
   const s = await start();
   try {
     const u = await s.newUser(), E = `/api/users/${u.id}/email`;
@@ -226,13 +226,19 @@ test('刚用邮箱找回登录的设备 24 小时内不能换绑或解除邮箱�
     // 本人收到登录通知后，在注册时的设备上让它退出：邮箱还在自己手里
     assert.equal((await s.call('DELETE', `/api/users/${u.id}/sessions`, null, u.token)).status, 204);
     assert.equal((await s.call('GET', E, null, d2)).status, 401);
-    // 反过来：对方先把注册时的设备退出了，本人还能用邮箱再找回，再把对方退出
+    // 刚找回的设备也不能让其他设备退出、不能删除账号（安全检查 2026-11-28 第 1 条）：
+    // 拿到一次验证码的人不能先把本人的设备踢下线、再把账号和数据删光
     const d3 = (await s.recover('owner@example.com')).body.token;
-    assert.equal((await s.call('DELETE', `/api/users/${u.id}/sessions`, null, d3)).status, 204, '让其他设备退出不受冷静期限制（丢了手机的人马上要用）');
-    assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 401);
-    const d4 = (await s.recover('owner@example.com')).body.token;
-    assert.equal((await s.call('DELETE', `/api/users/${u.id}/sessions`, null, d4)).status, 204);
+    const kick = await s.call('DELETE', `/api/users/${u.id}/sessions`, null, d3);
+    assert.equal(kick.status, 403); assert.match(kick.body.error, /24 小时内不能让其他设备退出/);
+    const del = await s.call('DELETE', `/api/users/${u.id}`, null, d3);
+    assert.equal(del.status, 403); assert.match(del.body.error, /24 小时内不能删除账号/);
+    assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 200, '本人的设备还在');
+    assert.equal((await s.call('GET', `/api/users/${u.id}`, null, d3)).status, 200, '账号还在');
+    // 本人在注册时的设备上让它退出
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}/sessions`, null, u.token)).status, 204);
     assert.equal((await s.call('GET', E, null, d3)).status, 401);
+    const d4 = (await s.recover('owner@example.com')).body.token;
     assert.equal(s.app.store.getEmail(u.id).email, 'owner@example.com', '24 小时内邮箱始终换不掉');
     // 差一分钟到 24 小时还不行；过了就可以
     s.advance(DAY - MIN);
@@ -244,6 +250,9 @@ test('刚用邮箱找回登录的设备 24 小时内不能换绑或解除邮箱�
     assert.equal((await s.call('DELETE', E, null, d4)).status, 403, '冷静期过了也要先验证原来的邮箱');
     assert.equal((await s.bind(d4u, 'owner2@example.com')).status, 200);
     assert.equal((await s.unbind(d4u)).status, 204);
+    // 过了 24 小时也能让其他设备退出
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}/sessions`, null, d4)).status, 204);
+    assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 401);
     // 账号上没有绑着邮箱时，刚找回的设备可以绑（没有可以被换掉的东西）；注册时的设备没有冷静期（换绑、解除照样要验证原来的邮箱）
     const v = await s.newUser(); assert.equal((await s.bind(v, 'v@example.com')).status, 200);
     assert.equal((await s.bind(v, 'v2@example.com')).status, 200);

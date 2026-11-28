@@ -119,8 +119,10 @@ test('用户可以删除自己的全部数据', async () => {
 });
 
 test('请求体不是 JSON 时返回 400，不存在的接口返回 404', async () => {
-  const r = await fetch(base + '/api/users/x/profile', { method: 'PATCH', body: '{bad' });
+  const r = await fetch(base + '/api/users/x/profile', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{bad' });
   assert.ok([400, 404].includes(r.status));
+  // 没写 Content-Type: application/json 的请求体（别的网站能不经预检发出的写法）是 415
+  assert.equal((await fetch(base + '/api/users/x/profile', { method: 'PATCH', body: '{bad' })).status, 415);
   assert.equal((await call('GET', '/api/whatever')).status, 404);
 });
 

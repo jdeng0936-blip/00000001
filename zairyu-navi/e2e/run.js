@@ -13,6 +13,7 @@ const adminToken = process.env.ADMIN_TOKEN || 'e2e-admin';
 const reviewerToken = 'e2e-reviewer-token-0123456789';
 // appUrl：提醒邮件里的链接指向这个临时服务器（端口在 listen 之后才知道，所以传函数）
 // allowDirectProvider：前面几步用管理员直接入驻的服务商（只有测试里开）；notify：新咨询通知不延迟，跑一轮就排
+// E2E_DB：数据库文件的位置。只有一处用到：把刚找回的登录改成 25 小时前的，模拟过了冷静期（服务器的时钟不动，提醒的“今天”才对得上）
 const app = createApp({ dbFile: path.join(dir, 'e2e.db'), adminToken, adminTokens: { e2e: reviewerToken }, allowDirectProvider: true, notify: { delayMin: 0, intervalMin: 1 }, appUrl: () => 'http://127.0.0.1:' + app.server.address().port });
 const finish = (code) => {
   app.server.close(); app.server.closeAllConnections();
@@ -23,7 +24,7 @@ const finish = (code) => {
 app.server.listen(0, '127.0.0.1', () => {
   const base = 'http://127.0.0.1:' + app.server.address().port;
   console.log('端到端：服务器在 ' + base + '，数据库在 ' + dir);
-  const child = spawn(process.execPath, [path.join(__dirname, 'browser.js')], { stdio: 'inherit', env: Object.assign({}, process.env, { BASE: base, ADMIN_TOKEN: adminToken, E2E_REVIEWER_TOKEN: reviewerToken }) });
+  const child = spawn(process.execPath, [path.join(__dirname, 'browser.js')], { stdio: 'inherit', env: Object.assign({}, process.env, { BASE: base, ADMIN_TOKEN: adminToken, E2E_REVIEWER_TOKEN: reviewerToken, E2E_DB: path.join(dir, 'e2e.db') }) });
   child.on('error', (e) => { console.error('端到端没有跑起来：', e.message); finish(1); });
   child.on('exit', (code) => finish(code == null ? 1 : code));
 });

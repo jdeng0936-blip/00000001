@@ -689,6 +689,28 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
     row.appendChild(go);row.appendChild(no);row.appendChild(nt);m.appendChild(row);
     $("chat").appendChild(m);$("chat").scrollTop=$("chat").scrollHeight;return m;
   }
+  // 助手准备的改动（对话里出现过服务商自己写的文字之后，助手改“我的情况”、进度、事件不直接生效）：
+  // 显示成卡片，用户点“确认”才调 POST /chat/confirm，点“不用了”就什么都不改。text 是服务器写好的一句话（只当文字显示）。
+  function pendingCards(list){
+    if(!Array.isArray(list))return;
+    list.forEach(function(x){
+      if(!x||typeof x.tool!=="string"||typeof x.text!=="string")return;
+      var m=el("div","msg a pending"),cls=el("span","cls","助手想做的修改（还没有生效）");m.appendChild(cls);
+      m.appendChild(el("div","pending-text",x.text));
+      var row=el("div","row"),go=el("button","act","确认修改"),no=el("button","ghost","不用了"),nt=el("span","pending-note");go.type=no.type="button";go.className="act pending-ok";no.className="ghost pending-drop";nt.setAttribute("role","status");
+      go.onclick=function(){
+        go.disabled=no.disabled=true;nt.textContent="正在保存…";
+        flush().then(function(){return api("POST","/users/"+acct.id+"/chat/confirm",{tool:x.tool,input:x.input})})
+        .then(function(){m.classList.add("done");cls.textContent="已确认的修改";go.remove();no.remove();nt.textContent="已保存。";
+          return api("GET","/users/"+acct.id).then(function(u){if(!dirty())adopt(u);return loadEvents()}).catch(function(){})})
+        .catch(function(e){go.disabled=no.disabled=false;nt.textContent="没有保存："+why(e)});
+      };
+      no.onclick=function(){m.remove()};
+      row.appendChild(go);row.appendChild(no);row.appendChild(nt);m.appendChild(row);
+      $("chat").appendChild(m);
+    });
+    $("chat").scrollTop=$("chat").scrollHeight;
+  }
   // 助手走服务器。对话记录存在服务器上，页面只发新的一句（不保存、不带回历史）。
   function serverAsk(q){
     if(busy||!q)return;
@@ -698,7 +720,7 @@ load();bind();renderAll();show();pushMsg("a",HELLO);
     // 助手可能改了概况和进度：本机没有未保存的修改就直接用服务器的；有的话下次保存时服务器回 409，合并后再存
     function after(){return api("GET","/users/"+acct.id).then(function(u){if(!dirty())adopt(u);return loadEvents()}).catch(function(){})}
     flush().then(function(){return api("POST","/users/"+acct.id+"/chat",{message:body})}).then(function(r){
-      setAns(m,(r.category?"【"+r.category+"】":"")+r.text);draftCard(r.draft);
+      setAns(m,(r.category?"【"+r.category+"】":"")+r.text);draftCard(r.draft);pendingCards(r.pending);
       return after();
     },function(e){
       var t;

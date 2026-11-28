@@ -17,7 +17,7 @@ const CHECK = { method: 'association_search', checkedOn: '2026-11-27', note: '�
 async function start(opts, at) {
   let t = Date.parse(at || '2026-11-27T03:00:00Z');
   const clock = () => t;
-  const app = createApp(Object.assign({ adminTokens: { alice: ALICE, bob: BOB }, clock, emailLimits: LOOSE, applyLimit: [WIDE], signupLimit: WIDE, appUrl: APP }, opts));
+  const app = createApp(Object.assign({ adminTokens: { alice: ALICE, bob: BOB }, clock, emailLimits: LOOSE, applyLimit: [WIDE], signupLimit: WIDE, writeLimits: { inqUser: [WIDE], inqPair: [WIDE], inqIp: [WIDE] }, appUrl: APP }, opts));
   await new Promise((ok) => app.server.listen(0, '127.0.0.1', ok));
   const base = 'http://127.0.0.1:' + app.server.address().port;
   const call = async (method, path, body, token, headers) => {
@@ -61,7 +61,9 @@ async function start(opts, at) {
   const runAt = (ymd) => { t = Date.parse(ymd + 'T03:00:00Z'); return app.billing.runOnce(); };
   const pay = async (inv, ymd) => adm('POST', '/api/admin/invoices/' + inv.id + '/paid', { paidOn: ymd || jstToday(t) });
   const newUser = async () => (await call('POST', '/api/users', { accept: app.termsVersion })).body;
-  const inquire = async (u, providerIds, summary, category) => call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: category || 'gyosei', providerIds, summary: summary || '想咨询在留期间更新，明年三月到期，现在是技人国。' }, u.token);
+  // 不给摘要时每次的摘要都不一样（同样的内容发给同一家会被拒，见 server.js 的咨询限流）
+  let inqN = 0;
+  const inquire = async (u, providerIds, summary, category) => call('POST', `/api/users/${u.id}/inquiries`, { consent: true, category: category || 'gyosei', providerIds, summary: summary || '想咨询在留期间更新，明年三月到期，现在是技人国。（第' + (++inqN) + '次）' }, u.token);
   const listed = async (category) => (await call('GET', '/api/providers?category=' + (category || 'gyosei'))).body;
   return {
     app, base, call, adm, mails, lastMail, codeIn, applyCode, apply, appByRef, rk, approve, claim, onboard, runAt, pay, newUser, inquire, listed,

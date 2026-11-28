@@ -22,8 +22,8 @@
 <div class="card" id="form">
   <h2 id="form-h">第二步：填写申请</h2>
   <label for="ap-cat">服务类别</label><select id="ap-cat"></select>
-  <label for="ap-name">事务所或公司名称</label><input id="ap-name" maxlength="80">
-  <label for="ap-address">事务所地址（会公开在名单上）</label><input id="ap-address" maxlength="200">
+  <label for="ap-name">事务所或公司名称</label><input id="ap-name" maxlength="80" autocomplete="organization">
+  <label for="ap-address">事务所地址（会公开在名单上）</label><input id="ap-address" maxlength="200" autocomplete="street-address">
   <div id="lic-box">
     <label for="ap-lic" id="ap-lic-label">登录番号</label><input id="ap-lic" maxlength="40">
     <small id="ap-lic-hint"></small>
@@ -43,7 +43,7 @@
   <p class="muted">用申请时的邮箱收验证码，查看审核进度；被要求修改时可以改后重新提交，审核完之前可以撤回。</p>
   <label for="vw-email">联系邮箱</label><input id="vw-email" type="email" autocomplete="email">
   <p><button type="button" class="ghost" id="vw-send">发送验证码</button> <span id="vw-send-msg" role="status"></span></p>
-  <label for="vw-code">邮件里的 6 位验证码</label><input id="vw-code" inputmode="numeric" maxlength="6">
+  <label for="vw-code">邮件里的 6 位验证码</label><input id="vw-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
   <p><button type="button" id="vw-open">查看</button> <span id="vw-msg" role="status"></span></p>
   <div id="vw-out"></div>
 </div>

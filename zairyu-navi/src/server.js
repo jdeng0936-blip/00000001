@@ -5,7 +5,7 @@ const path = require('node:path');
 const createEngine = require('./engine');
 const { createStore, CODE_TTL_MS, PROOF_TTL_MS } = require('./store');
 
-const { validateProfilePatch, validateInquiry, validateApplication, assertNoClaims, checkLicense, assertListingText, feeModelOf, LICENSE_RULES, isDate, assertNoSensitive, sensitiveLabel, normalizeEmail, maskEmail, HttpError } = require('./validate');
+const { EVENTS_MAX, validateProfilePatch, validateInquiry, validateApplication, assertNoClaims, checkLicense, assertListingText, feeModelOf, LICENSE_RULES, isDate, assertNoSensitive, sensitiveLabel, normalizeEmail, maskEmail, HttpError } = require('./validate');
 const assistant = require('./assistant');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
@@ -41,6 +41,45 @@ const EMAIL_LIMITS = {
 // 刚用邮箱找回登录的设备，这么久之内不能更换或解除绑定的邮箱。
 // 拿到一次验证码（或一时能看到邮箱）的人因此不能马上把邮箱换成自己的；本人收到“有新设备登录”的通知后，有时间在自己的设备上让它退出。
 const EMAIL_COOLDOWN_MS = 24 * HOUR;
+// 同样在这段时间里，刚用邮箱找回登录的设备也不能删除账号、不能让其他设备退出（安全检查 2026-11-28 第 1 条）：
+// 不然拿到一次验证码的人可以先把本人的设备踢下线，再把账号和全部数据删掉，本人只能事后收到一封通知。
+// 本人在注册时用的那台设备（或更早找回、已过了这段时间的设备）上随时可以删除和让其他设备退出。
+
+// 助手、新建账号、咨询和事件的限流（次数存在库里，重启不清零；超过返回 429 和 retry-after）。
+// 来源地址按 limIp 计：IPv4 按整个地址，IPv6 按前 64 位（同一户、同一台服务器通常分到一整段，换着用里面的地址绕不过去）。
+// 助手：每问一句最多调 CHAT 次模型（assistant 的 maxTurns），模型的费用按这个算。
+//   chatUser 每个账号；chatIp 每个来源地址（新建账号不要钱，只按账号限的话换个账号就能接着问）；
+//   全站每 24 小时最多 CHAT_DAILY_MAX 句（环境变量，默认 5000），到了先停，运维看日志里的“助手全站限额已用完”。
+// 新建账号：每个来源地址 1 小时 30 个。
+// 咨询：每次提交（一次最多三家）按账号、来源地址计；同一个账号对同一家服务商 24 小时最多 3 次；同样的内容发给同一家、对方还没关掉的，不再收。
+// 事件：每个账号 1 小时 30 条、24 小时 100 条，最多存 EVENTS_MAX 条。
+const WRITE_LIMITS = {
+  chatUser: [{ max: 20, windowMs: 10 * 60 * 1000 }, { max: 200, windowMs: 24 * HOUR }],
+  chatIp: [{ max: 60, windowMs: HOUR }, { max: 300, windowMs: 24 * HOUR }],
+  signupIp: [{ max: 30, windowMs: HOUR }],
+  inqUser: [{ max: 5, windowMs: HOUR }, { max: 10, windowMs: 24 * HOUR }],
+  inqPair: [{ max: 3, windowMs: 24 * HOUR }],
+  inqIp: [{ max: 30, windowMs: 24 * HOUR }],
+  evUser: [{ max: 30, windowMs: HOUR }, { max: 100, windowMs: 24 * HOUR }]
+};
+const CHAT_DAILY_MAX = 5000;
+// 发到“还没验证过的邮箱”的验证码（绑定新邮箱、入驻申请）全站合计每小时的上限：这两种谁都能填任意地址，
+// 防止有人换着来源地址把本站当成往任意地址发信的工具。到了上限这一小时里新的绑定和申请要等一等。
+const NEW_ADDR_CODES_PER_HOUR = 300;
+// 限流用的来源地址：IPv4 原样（去掉 ::ffff: 前缀），IPv6 取前 64 位，写成 2001:db8:1:2::/64。认不出的写法原样返回。
+function limIpOf(ip) {
+  ip = String(ip || '').trim().toLowerCase().replace(/%.*$/, '');
+  const m4 = /^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/.exec(ip);
+  if (m4) return m4[1];
+  if (!ip.includes(':')) return ip;
+  const parts = ip.split('::');
+  if (parts.length > 2) return ip;
+  const grp = (x) => { const g = x ? x.split(':') : []; if (g.length && g[g.length - 1].includes('.')) g.splice(g.length - 1, 1, '0', '0'); return g; }; // 末尾嵌着 IPv4 的算两段
+  const h = grp(parts[0]), t = parts.length === 2 ? grp(parts[1]) : null;
+  const all = t ? h.concat(Array(Math.max(0, 8 - h.length - t.length)).fill('0'), t) : h;
+  if (all.length !== 8 || !all.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return ip;
+  return all.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(':') + '::/64';
+}
 
 // 退订页面：不用登录、不带脚本的一小页。文字都是固定的，令牌只出现在表单的地址里（已限定为字母、数字、横线、下划线）。
 const UNSUB_TOKEN = /^[A-Za-z0-9_-]{20,100}$/;
@@ -56,6 +95,15 @@ const UNSUB_DONE = page('已退订', '<p id="unsub-done">已退订。在留导�
 
 // 提醒邮件的设置（npm start 和 npm run remind 共用）。env 是环境变量那样的对象；设置不对就抛错，不启动。
 // APP_URL：邮件里“打开在留导航”和退订链接用的地址。接了真实发信（http、smtp）时必须填，不然发出去的链接指向 localhost。
+// CHAT_DAILY_MAX：助手全站每 24 小时最多回答几句（1 至 1000000，默认 5000）。写错了不启动。
+function chatDailyMaxOf(env) {
+  const v = env && env.CHAT_DAILY_MAX;
+  if (v == null || v === '') return CHAT_DAILY_MAX;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 1000000) throw new Error('CHAT_DAILY_MAX 须是 1 到 1000000 的整数');
+  return n;
+}
+
 function reminderConfig(env, sender) {
   env = env || {};
   const raw = env.APP_URL || '';
@@ -133,7 +181,7 @@ function acceptsGzip(h) {
 // 一行一个 JSON：时间、请求编号、方法、路由的模板（/api/users/:id/plan，不是真实地址）、状态码、耗时。
 // 不写请求体、查询参数（退订链接的令牌在查询参数里）、令牌、邮箱；来源地址只在 TRUST_PROXY=1 时写，并且截短（IPv4 去掉最后一段，IPv6 只留前 3 段）。
 // 路由模板：已知的固定段原样写，其余（账号编号、节点编号、申请编号等）按前一段换成参数名，所以日志里不会出现用户能随意写进去的内容。
-const ROUTE_WORDS = new Set(['admin', 'reject', 'old', 'verify', 'reminders', 'run', 'me', 'invoices', 'inquiries', 'code', 'providers', 'done', 'void', 'status', 'request-changes', 'reply', 'paid', 'approve', 'active', 'notify', 'webhook', 'recover', 'outbox', 'open', 'categories', 'billing', 'applications', 'users', 'unsubscribe', 'terms', 'provider-unsubscribe', 'provider-terms', 'provider-claim', 'provider-apply', 'provider', 'options', 'nodes', 'links', 'health', 'ready', 'event-types', 'auth', 'consent', 'email', 'sessions', 'events', 'state', 'profile', 'tasks', 'plan', 'advice', 'pr-check', 'city', 'chat']);
+const ROUTE_WORDS = new Set(['admin', 'reject', 'old', 'verify', 'reminders', 'run', 'me', 'invoices', 'inquiries', 'code', 'providers', 'done', 'void', 'status', 'request-changes', 'reply', 'paid', 'approve', 'active', 'notify', 'webhook', 'recover', 'outbox', 'open', 'categories', 'billing', 'applications', 'users', 'unsubscribe', 'terms', 'provider-unsubscribe', 'provider-terms', 'provider-claim', 'provider-apply', 'provider', 'options', 'nodes', 'links', 'health', 'ready', 'event-types', 'auth', 'consent', 'email', 'sessions', 'events', 'state', 'profile', 'tasks', 'plan', 'advice', 'pr-check', 'city', 'chat', 'confirm']);
 const ROUTE_PARAM = { users: ':id', tasks: ':nodeId', events: ':eid', options: ':topic', nodes: ':id', inquiries: ':id', providers: ':id', applications: ':id', invoices: ':id', 'provider-apply': ':ref', webhook: ':method' };
 function routeOf(pathname, webFiles) {
   if (!pathname.startsWith('/api/')) return pathname === '/' ? '/' : webFiles.has(pathname.slice(1)) ? pathname : '/*';
@@ -163,11 +211,18 @@ function createApp(opts) {
   const limits = Object.assign({}, EMAIL_LIMITS, opts.emailLimits || {});
   const cooldownMs = opts.emailCooldownMs != null ? opts.emailCooldownMs : EMAIL_COOLDOWN_MS;
   const trustProxy = opts.trustProxy != null ? !!opts.trustProxy : process.env.TRUST_PROXY === '1';
+  const wl = Object.assign({}, WRITE_LIMITS, opts.writeLimits || {});
+  // 旧的参数名（测试在用）：chatLimit、chatDailyLimit 是每个账号的两档，signupLimit 是每个来源地址
+  if (opts.chatLimit || opts.chatDailyLimit) wl.chatUser = [opts.chatLimit || WRITE_LIMITS.chatUser[0], opts.chatDailyLimit || WRITE_LIMITS.chatUser[1]];
+  if (opts.signupLimit) wl.signupIp = [opts.signupLimit];
+  const chatDailyMax = opts.chatDailyMax != null ? opts.chatDailyMax : chatDailyMaxOf(process.env);
+  const newAddrPerHour = opts.newAddrCodesPerHour != null ? opts.newAddrCodesPerHour : NEW_ADDR_CODES_PER_HOUR;
   // 来源地址。TRUST_PROXY=1 时取 X-Forwarded-For 的最后一段（紧挨着的那层反向代理写的），否则取连接的对端地址。
   const clientIp = (req) => {
     if (trustProxy) { const last = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim(); if (last) return last; }
     return req.socket.remoteAddress || '';
   };
+  const limIp = (req) => limIpOf(clientIp(req));
   // 引擎用的“今天”：传了 now 就固定用它；只传了 clock（测试里拨时间）就跟着 clock 走；都没传用真实时间。
   const nowOf = () => opts.now || (opts.clock ? clock() : undefined);
   const engineFor = (u) => createEngine({ profile: u.profile, done: u.done, plan: u.plan, auth: u.auth, events: store.listEvents(u.id), now: nowOf() });
@@ -191,26 +246,19 @@ function createApp(opts) {
   // 咨询只能发给此刻在名单上展示的服务商（在架，并且展示费已付或不收费）
   const inquiryDeps = { hasCategory: (k) => catKeys.has(k), hasNode: (id) => nodeIds.has(id), getProvider: (id) => { const p = store.getProvider(id); return p && Object.assign(p, { active: p.active && store.providerListing(id, billing.todayOf()).listed }); } };
 
-  // 限流（内存里的滑动窗口，单进程够用；多进程部署时要换成共享存储）。
-  // 助手：每个账号 10 分钟 20 次、24 小时 200 次。注册：每个来源地址 1 小时 30 个账号。
-  // 放在反向代理后面时，所有请求的来源地址都是代理，要在代理上按真实地址限流，并把 signupLimit 调大。
-  const limiter = (cfg) => {
-    const hits = new Map();
-    return (key) => {
-      const t = Date.now();
-      if (hits.size > 5000) for (const [k, v] of hits) if (!v.length || v[v.length - 1] <= t - cfg.windowMs) hits.delete(k);
-      const list = (hits.get(key) || []).filter((x) => x > t - cfg.windowMs);
-      if (list.length >= cfg.max) { hits.set(key, list); return Math.max(1, Math.ceil((list[0] + cfg.windowMs - t) / 1000)); } // 返回还要等多少秒
-      list.push(t); hits.set(key, list); return 0;
-    };
-  };
-  const chatShort = limiter(opts.chatLimit || { max: 20, windowMs: 10 * 60 * 1000 });
-  const chatDaily = limiter(opts.chatDailyLimit || { max: 200, windowMs: 24 * 60 * 60 * 1000 });
-  const signup = limiter(opts.signupLimit || { max: 30, windowMs: 60 * 60 * 1000 });
+  let lastChatAlarm = -Infinity;
   const tooMany = (wait, msg) => new HttpError(429, msg + '，请在' + (wait >= 120 ? Math.ceil(wait / 60) + '分钟' : wait + '秒') + '后再试', { 'retry-after': String(wait) });
 
+  // 发请求的设备是刚用邮箱找回登录的、账号上绑着邮箱、还没过 cooldownMs：不让做 what 这件事（403）
+  const recoverCooldown = (u, req, what) => {
+    const ses = store.sessionOf(u.id, bearer(req));
+    const left = ses && ses.via === 'recover' && store.getEmail(u.id) ? Date.parse(ses.createdAt) + cooldownMs - clock() : 0;
+    if (left > 0) throw new HttpError(403, '这台设备是刚用邮箱找回登录的，' + Math.round(cooldownMs / HOUR) + ' 小时内不能' + what + '。请在' + (left >= HOUR ? Math.ceil(left / HOUR) + '小时' : Math.ceil(left / 60000) + '分钟') + '后再试，或者在注册时用的那台设备上操作');
+  };
   // ---- 邮箱验证码 ----
   const rules = (list, prefix, ...values) => list.map((r) => ({ key: store.rateKey(prefix, ...values), max: r.max, windowMs: r.windowMs }));
+  // 全站合计的一条（发到还没验证过的邮箱的验证码，见 NEW_ADDR_CODES_PER_HOUR）
+  const newAddrRule = () => [{ key: store.rateKey('code-new-all', 'all'), max: newAddrPerHour, windowMs: HOUR }];
   const limit = (rs, msg) => { const wait = store.hit(rs); if (wait) throw tooMany(wait, msg); };
   const newCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   const BAD_CODE = '验证码不对或已过期。请重新发送验证码再试';
@@ -330,7 +378,7 @@ function createApp(opts) {
       purge();
       if (!seg[3]) {
         const email = normalizeEmail(body && body.email); // 只看写法，和有没有绑定无关
-        limit(rules(limits.reqEmail, 'req-recover-ie', clientIp(req), email).concat(rules(limits.reqEmailAll, 'req-recover-em', email), rules(limits.reqIp, 'req-ip', clientIp(req))), '验证码发得太频繁');
+        limit(rules(limits.reqEmail, 'req-recover-ie', limIp(req), email).concat(rules(limits.reqEmailAll, 'req-recover-em', email), rules(limits.reqIp, 'req-ip', limIp(req))), '验证码发得太频繁');
         const owner = store.userByEmail(email), code = newCode(), mail = TEXTS.recoverCode(code);
         // 绑定过：存验证码并发邮件。没绑定过：存一个永远验不过的验证码，不发邮件，排一行占位。两种情况都是一次提交、写的行数一样。
         const challengeId = store.tx(() => {
@@ -344,7 +392,7 @@ function createApp(opts) {
       }
       if (seg[3] === 'verify' && !seg[4]) {
         const code = codeOf(body);
-        limit(rules(limits.verIp, 'ver-ip', clientIp(req)), '验证码试得太频繁');
+        limit(rules(limits.verIp, 'ver-ip', limIp(req)), '验证码试得太频繁');
         const c = store.verifyChallenge(body.challengeId, 'recover', code);
         // 验证码对了，还要这个邮箱此刻仍然绑在那个账号上（发码之后解除了绑定、删了账号的不算）
         if (!c || !c.userId || store.userByEmail(c.email) !== c.userId) throw new HttpError(422, BAD_CODE);
@@ -368,7 +416,7 @@ function createApp(opts) {
       // 第一步：向这个邮箱发验证码。谁都能申请，所以对任何邮箱都一样发（返回内容、花的时间都不看邮箱的情况）。
       if (seg[2] === 'code' && !seg[3] && m === 'POST') {
         const email = normalizeEmail(body && body.email);
-        limit(rules(limits.reqEmail, 'req-papply-ie', clientIp(req), email).concat(rules(limits.reqEmailAll, 'req-papply-em', email), rules(limits.reqIp, 'req-ip', clientIp(req))), '验证码发得太频繁');
+        limit(rules(limits.reqEmail, 'req-papply-ie', limIp(req), email).concat(rules(limits.reqEmailAll, 'req-papply-em', email), rules(limits.reqIp, 'req-ip', limIp(req)), newAddrRule()), '验证码发得太频繁');
         const code = newCode(), mail = TEXTS.applyCode(code);
         const challengeId = store.tx(() => {
           const id = store.createChallenge({ purpose: 'papply', userId: null, email, code }, CODE_TTL_MS);
@@ -381,7 +429,7 @@ function createApp(opts) {
       // 核对 papply 的验证码，对了返回验证过的邮箱
       const verified = (b) => {
         const code = codeOf(b);
-        limit(rules(limits.verIp, 'ver-ip', clientIp(req)), '验证码试得太频繁');
+        limit(rules(limits.verIp, 'ver-ip', limIp(req)), '验证码试得太频繁');
         const c = store.verifyChallenge(b.challengeId, 'papply', code);
         if (!c) throw new HttpError(422, BAD_CODE);
         return c.email;
@@ -391,7 +439,7 @@ function createApp(opts) {
         const b = body || {};
         codeOf(b);
         const a = validateApplication(b, appDeps);
-        limit(rules(applyLimit, 'papply-submit', clientIp(req)), '提交得太频繁');
+        limit(rules(applyLimit, 'papply-submit', limIp(req)), '提交得太频繁');
         const email = verified(b);
         // 这时邮箱已经验证过，告诉本人“已经有一份在审核”不算泄露
         if (store.openApplicationByEmail(email)) throw new HttpError(409, '这个邮箱已经有一份在审核中或等待修改的申请。请在“查看或修改申请”里查看');
@@ -435,7 +483,7 @@ function createApp(opts) {
       purge();
       if (seg[2] === 'code' && !seg[3]) {
         const email = normalizeEmail(body && body.email);
-        limit(rules(limits.reqEmail, 'req-pclaim-ie', clientIp(req), email).concat(rules(limits.reqEmailAll, 'req-pclaim-em', email), rules(limits.reqIp, 'req-ip', clientIp(req))), '验证码发得太频繁');
+        limit(rules(limits.reqEmail, 'req-pclaim-ie', limIp(req), email).concat(rules(limits.reqEmailAll, 'req-pclaim-em', email), rules(limits.reqIp, 'req-ip', limIp(req))), '验证码发得太频繁');
         const owner = store.claimableProviderByEmail(email), code = newCode(), mail = TEXTS.claimCode(code);
         const challengeId = store.tx(() => {
           const id = store.createChallenge({ purpose: 'pclaim', userId: owner, email, code: owner ? code : null }, CODE_TTL_MS);
@@ -448,7 +496,7 @@ function createApp(opts) {
       }
       if (!seg[2]) {
         const code = codeOf(body);
-        limit(rules(limits.verIp, 'ver-ip', clientIp(req)), '验证码试得太频繁');
+        limit(rules(limits.verIp, 'ver-ip', limIp(req)), '验证码试得太频繁');
         const c = store.verifyChallenge(body.challengeId, 'pclaim', code);
         // 验证码对了，还要这个邮箱此刻仍是那家在架服务商的联系邮箱（发码之后下架了的不算）
         if (!c || !c.userId || store.claimableProviderByEmail(c.email) !== c.userId) throw new HttpError(422, BAD_CODE);
@@ -610,14 +658,17 @@ function createApp(opts) {
     if (seg[1] === 'users') {
       if (!seg[2] && m === 'POST') {
         if (!body || body.accept !== termsVersion) throw new HttpError(422, '要先同意使用条款和隐私政策（版本 ' + termsVersion + '）');
-        const wait = signup(clientIp(req));
-        if (wait) throw tooMany(wait, '新建账号太频繁');
+        limit(rules(wl.signupIp, 'signup-ip', limIp(req)), '新建账号太频繁');
         return [201, store.createUser(termsVersion)];
       }
       const u = user(seg[2], req);
       const sub = seg[3];
       if (!sub && m === 'GET') return u;
-      if (!sub && m === 'DELETE') { store.deleteUser(u.id); return [204, null]; }
+      // 刚用邮箱找回登录的设备：cooldownMs 之内不能删除账号（见 EMAIL_COOLDOWN_MS 下面的说明）
+      if (!sub && m === 'DELETE') {
+        recoverCooldown(u, req, '删除账号（防止别人拿到一次验证码就删掉你的全部数据）');
+        store.deleteUser(u.id); return [204, null];
+      }
       // 条款改版后重新同意。accept 必须是当前版本。
       if (sub === 'consent' && m === 'POST' && !seg[4]) {
         if (!body || body.accept !== termsVersion) throw new HttpError(422, '要先同意使用条款和隐私政策（版本 ' + termsVersion + '）');
@@ -635,11 +686,7 @@ function createApp(opts) {
       if (sub === 'email') {
         purge();
         // 这台设备是刚用邮箱找回登录的、账号上已经绑着邮箱：暂时不能换绑或解除
-        const cooldown = () => {
-          const ses = store.sessionOf(u.id, bearer(req));
-          const left = ses && ses.via === 'recover' && store.getEmail(u.id) ? Date.parse(ses.createdAt) + cooldownMs - clock() : 0;
-          if (left > 0) throw new HttpError(403, '这台设备是刚用邮箱找回登录的，' + Math.round(cooldownMs / HOUR) + ' 小时内不能更换或解除绑定的邮箱（防止别人拿到一次验证码就把你的邮箱换掉）。请在' + (left >= HOUR ? Math.ceil(left / HOUR) + '小时' : Math.ceil(left / 60000) + '分钟') + '后再试，或者在注册时用的那台设备上操作');
-        };
+        const cooldown = () => recoverCooldown(u, req, '更换或解除绑定的邮箱（防止别人拿到一次验证码就把你的邮箱换掉）');
         // 账号上已经绑着邮箱时，更换（action 'change'）和解除（'remove'）都要带上原来的邮箱验证过之后拿到的确认 proof（见下面的 /email/old）。
         // 从哪台设备操作都一样。原来的邮箱收不到信了的人：不能换绑也不能解除（没有绕过的办法，客服也不替人改），可以删除账号重新开始。
         const needProof = (action, proof) => {
@@ -653,7 +700,7 @@ function createApp(opts) {
           const cur = store.getEmail(u.id);
           if (!cur) throw new HttpError(409, '这个账号没有绑定邮箱');
           cooldown();
-          limit(rules(limits.reqEmail, 'req-old-ue', u.id, cur.email).concat(rules(limits.reqEmailAll, 'req-old-em', cur.email), rules(limits.reqIp, 'req-ip', clientIp(req)), rules(limits.reqUser, 'req-u', u.id)), '验证码发得太频繁');
+          limit(rules(limits.reqEmail, 'req-old-ue', u.id, cur.email).concat(rules(limits.reqEmailAll, 'req-old-em', cur.email), rules(limits.reqIp, 'req-ip', limIp(req)), rules(limits.reqUser, 'req-u', u.id)), '验证码发得太频繁');
           const code = newCode(), mail = TEXTS.oldCode(action, code);
           const challengeId = store.tx(() => {
             const id = store.createChallenge({ purpose: 'old-' + action, userId: u.id, email: cur.email, code }, CODE_TTL_MS);
@@ -666,7 +713,7 @@ function createApp(opts) {
         // 第二步：body { action, challengeId, code }，对了返回 { proof, expiresInSec }（proof 只返回这一次）。
         if (seg[4] === 'old' && seg[5] === 'verify' && !seg[6] && m === 'POST') {
           const action = actionOf(body), code = codeOf(body);
-          limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
+          limit(rules(limits.verIp, 'ver-ip', limIp(req)).concat(rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
           cooldown();
           const c = store.verifyChallenge(body.challengeId, 'old-' + action, code, u.id);
           const cur = store.getEmail(u.id);
@@ -680,7 +727,7 @@ function createApp(opts) {
           if (b.consent !== true) throw new HttpError(422, '绑定之前要先同意我们保存这个邮箱地址，用于找回账号、发送验证码和新设备登录通知');
           cooldown();
           needProof('change', b.proof); // 只查不用掉：新邮箱的验证码可以重发；真正用掉在 /verify 换绑的那一刻
-          limit(rules(limits.reqEmail, 'req-bind-ue', u.id, email).concat(rules(limits.reqEmailAll, 'req-bind-em', email), rules(limits.reqIp, 'req-ip', clientIp(req)), rules(limits.reqUser, 'req-u', u.id)), '验证码发得太频繁');
+          limit(rules(limits.reqEmail, 'req-bind-ue', u.id, email).concat(rules(limits.reqEmailAll, 'req-bind-em', email), rules(limits.reqIp, 'req-ip', limIp(req)), rules(limits.reqUser, 'req-u', u.id), newAddrRule()), '验证码发得太频繁');
           // 这个邮箱已经绑在别的账号上：返回的内容一样，但发过去的是“已经绑定过”的说明，存下的验证码永远验不过。
           const owner = store.userByEmail(email), taken = !!owner && owner !== u.id;
           const code = newCode(), mail = taken ? TEXTS.taken() : TEXTS.bindCode(code);
@@ -694,7 +741,7 @@ function createApp(opts) {
         }
         if (seg[4] === 'verify' && !seg[5] && m === 'POST') {
           const code = codeOf(body);
-          limit(rules(limits.verIp, 'ver-ip', clientIp(req)).concat(rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
+          limit(rules(limits.verIp, 'ver-ip', limIp(req)).concat(rules(limits.verUser, 'ver-u', u.id)), '验证码试得太频繁');
           cooldown();
           needProof('change', body.proof); // 先查，确认不对时不白白用掉新邮箱的验证码
           const c = store.verifyChallenge(body.challengeId, 'bind', code, u.id);
@@ -727,7 +774,10 @@ function createApp(opts) {
       // ---- 登录的设备：查看、让其他设备退出 ----
       if (sub === 'sessions' && !seg[4]) {
         if (m === 'GET') return store.listSessions(u.id, bearer(req));
-        if (m === 'DELETE') { store.revokeOtherSessions(u.id, bearer(req)); return [204, null]; }
+        if (m === 'DELETE') {
+          recoverCooldown(u, req, '让其他设备退出（防止别人拿到一次验证码就让你自己的设备掉线）');
+          store.revokeOtherSessions(u.id, bearer(req)); return [204, null];
+        }
       }
       if (sub === 'events') {
         if (m === 'GET') return store.listEvents(u.id).map((ev) => Object.assign(ev, { label: evTypes.has(ev.type) ? ref.EVRULES[ev.type][0] : '' }));
@@ -737,6 +787,8 @@ function createApp(opts) {
           if (!isDate(b.date)) throw new HttpError(422, 'date 须为 YYYY-MM-DD，且是真实存在的日期');
           if (b.note != null && (typeof b.note !== 'string' || b.note.length > 200)) throw new HttpError(422, 'note 须为200字以内');
           assertNoSensitive(b.note, '备注');
+          if (store.countEvents(u.id) >= EVENTS_MAX) throw new HttpError(409, '记录的事件已经有 ' + EVENTS_MAX + ' 条了，请先删掉不需要的再记');
+          limit(rules(wl.evUser, 'ev-u', u.id), '记录得太频繁');
           // deadlines：按现在的身份，这件事产生几条期限（0 时网页说明“这里没有登记到对应的期限”，不说没有法定期限）
           return [201, { id: store.addEvent(u.id, { type: b.type, date: b.date, note: b.note }), deadlines: engineFor(u).eventDeadlines({ type: b.type, date: b.date }).length }];
         }
@@ -807,9 +859,20 @@ function createApp(opts) {
         if (typeof b.message !== 'string' || !b.message.trim() || b.message.length > 2000) throw new HttpError(422, 'message 须为1至2000字');
         // 对话内容会转给模型服务商，敏感号码在这里拦下
         assertNoSensitive(b.message, '消息');
-        const wait = chatShort(u.id) || chatDaily(u.id);
-        if (wait) throw tooMany(wait, '提问太频繁');
+        // 上一句还在回答时直接 409，不算次数
         if (chatting.has(u.id)) throw new HttpError(409, '上一条还在回答，请等它答完再问');
+        // 账号、来源地址、全站三组一起记：有一条满了就哪一组都不记（全站满了时反复重试不会耗掉自己的次数）。
+        // 先看账号和来源地址，都没满再看全站的（全站的满了说明有人在大量调用，记一行错误日志给运维）
+        const own = rules(wl.chatUser, 'chat-u', u.id).concat(rules(wl.chatIp, 'chat-ip', limIp(req)));
+        const allRule = [{ key: store.rateKey('chat-all', 'all'), max: chatDailyMax, windowMs: 24 * HOUR }];
+        const ownWait = store.peek(own);
+        if (ownWait) throw tooMany(ownWait, '提问太频繁');
+        const allWait = store.peek(allRule);
+        if (allWait) {
+          if (clock() - lastChatAlarm >= HOUR) { lastChatAlarm = clock(); console.error('助手全站限额已用完（CHAT_DAILY_MAX=' + chatDailyMax + '）'); }
+          throw new HttpError(429, '助手今天的回答次数已经到了上限，请明天再试。期限和手续可以先看“闯关”和“提醒”页', { 'retry-after': String(allWait) });
+        }
+        limit(own.concat(allRule), '提问太频繁');
         chatting.add(u.id);
         try {
           // 存着的历史再查一遍再用：形状不对（旧版本存的、库被改过）或者里面有疑似敏感号码（例如模型复述了号码）时整段丢掉重新开始，
@@ -833,14 +896,30 @@ function createApp(opts) {
           // r.messages 已按整轮裁剪（条数、字节和 trimHistory 一样）。账号在这一轮里被删掉了就不再写回
           if (store.getUser(u.id)) store.saveChat(u.id, assistant.trimHistory(r.messages));
           // draft：助手准备的咨询草稿（没有则为 null）。草稿没有发送，网页端显示给用户核对，用户同意后调 POST /inquiries。
-          return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => ({ name: t.name, ok: t.ok })), draft: r.draft };
+          // pending：等用户确认的改动（对话里出现过服务商写的文字之后，助手改数据要用户在页面上点确认，确认时调 POST /chat/confirm）
+          return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => Object.assign({ name: t.name, ok: t.ok }, t.pending ? { pending: true } : {})), draft: r.draft, pending: r.pending || [] };
         } finally { chatting.delete(u.id); }
+      }
+      // 用户确认助手准备的改动：body { tool, input }，tool 只能是改数据的那四个工具，和助手直接执行时走同一段代码（同样的校验）。
+      // 只是替用户做他自己在页面上也能做的事，所以不需要别的凭据；返回 { ok, text }（做了什么）
+      if (sub === 'chat' && seg[4] === 'confirm' && !seg[5] && m === 'POST') {
+        const b = body || {};
+        if (typeof b.tool !== 'string' || !assistant.WRITE_TOOLS.has(b.tool)) throw new HttpError(422, 'tool 无效');
+        if (b.tool === 'add_event') limit(rules(wl.evUser, 'ev-u', u.id), '记录得太频繁');
+        const ctx = { user: u, store, now: nowOf() };
+        try {
+          const pr = assistant.prepareWrite(b.tool, b.input, ctx);
+          assistant.execTool(b.tool, pr.input, ctx);
+          return { ok: true, text: pr.text };
+        } catch (e) { if (e instanceof HttpError) throw e; throw new HttpError(422, e.message); }
       }
       if (sub === 'inquiries' && m === 'GET') return store.listInquiries(u.id);
       if (sub === 'inquiries' && m === 'POST') {
         const b = body || {};
         if (b.consent !== true) throw new HttpError(422, '发给服务商之前必须先让用户看过摘要并明确同意');
         const q = validateInquiry(b, inquiryDeps); // 和助手准备草稿用同一套校验
+        if (q.providerIds.some((pid) => store.hasOpenInquiry(u.id, pid, q.summary))) throw new HttpError(409, '同样的内容已经发给这家服务商了，请在“找人帮忙”里等对方回复');
+        limit(rules(wl.inqUser, 'inq-u', u.id).concat(rules(wl.inqIp, 'inq-ip', limIp(req)), ...q.providerIds.map((pid) => rules(wl.inqPair, 'inq-up', u.id, pid))), '发咨询太频繁');
         return [201, { ids: q.providerIds.map((pid) => store.addInquiry(u.id, { providerId: pid, nodeId: q.nodeId, category: q.category, summary: q.summary })) }];
       }
     }
@@ -885,12 +964,18 @@ function createApp(opts) {
         return;
       }
       let body = null;
+      // 别的网站的页面不能替访问者发写请求（安全检查 2026-11-28 第 3 条）：浏览器说是从别的站点发来的（Sec-Fetch-Site 是 cross-site 或 same-site）一律 403；
+      // 请求体只收 Content-Type: application/json（别的网站能不经预检发出的只有表单和 text/plain，这样就发不进来）。
+      // 例外是两个退订地址：邮件客户端的一键退订和退订页的表单发的是表单。
+      const unsub = url.pathname === '/api/unsubscribe' || url.pathname === '/api/provider-unsubscribe';
+      if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method) && !unsub && ['cross-site', 'same-site'].includes(String(req.headers['sec-fetch-site'] || '').toLowerCase())) throw new HttpError(403, '不接受从别的网站发来的请求');
       if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) { // DELETE 的请求体只有解除邮箱用（带原邮箱的确认），其余 DELETE 不看
         const chunks = []; let size = 0;
         for await (const c of req) { size += c.length; if (size > 64 * 1024) throw new HttpError(413, '请求太大'); chunks.push(c); }
         const raw = Buffer.concat(chunks).toString('utf8');
         // 退订的请求体不是 JSON（邮件客户端的一键退订发的是表单），读完就丢，不解析
-        if (raw && url.pathname !== '/api/unsubscribe' && url.pathname !== '/api/provider-unsubscribe') { try { body = JSON.parse(raw); } catch (e) { throw new HttpError(400, '请求体须为 JSON'); } }
+        if (raw && !unsub && !/^application\/json\s*(;|$)/i.test(String(req.headers['content-type'] || ''))) throw new HttpError(415, '请求体须为 JSON（Content-Type: application/json）');
+        if (raw && !unsub) { try { body = JSON.parse(raw); } catch (e) { throw new HttpError(400, '请求体须为 JSON'); } }
         if (body !== null && (typeof body !== 'object' || Array.isArray(body))) throw new HttpError(400, '请求体须为 JSON 对象');
       }
       const r = await route(req, url, body);
@@ -983,7 +1068,7 @@ function createApp(opts) {
   return { server, store, sender, deliver, shutdown, isDraining: () => draining, purge: () => store.purgeExpired(), termsVersion, scheduler, remind: (at) => scheduler.runOnce(at), billing, notifier, providerTick };
 }
 
-module.exports = { createApp, validateProfilePatch, TERMS_VERSION, PROVIDER_TERMS_VERSION, reminderConfig, adminTokens, opsConfig, routeOf, truncateIp, EMAIL_LIMITS, SECURITY_HEADERS };
+module.exports = { createApp, validateProfilePatch, TERMS_VERSION, PROVIDER_TERMS_VERSION, reminderConfig, adminTokens, opsConfig, routeOf, truncateIp, EMAIL_LIMITS, WRITE_LIMITS, SECURITY_HEADERS, limIpOf, chatDailyMaxOf };
 
 if (require.main === module) {
   const port = +process.env.PORT || 8787;
@@ -992,7 +1077,7 @@ if (require.main === module) {
   try { sender = createSender(process.env); rem = reminderConfig(process.env, sender); } catch (e) { console.error('邮件发送没有配置好：' + e.message); process.exit(1); }
   try { bc = billingConfig(process.env, sender); nc = notifyConfig(process.env); adminTokens(process.env.ADMIN_TOKENS); } catch (e) { console.error('服务商相关的设置不对，没有启动：' + e.message); process.exit(1); }
   // 助手的模型、EFFORT、MAX_TOKENS 写错就不启动
-  try { assistant.llmConfig(process.env); } catch (e) { console.error('助手的设置不对，没有启动：' + e.message); process.exit(1); }
+  try { assistant.llmConfig(process.env); chatDailyMaxOf(process.env); } catch (e) { console.error('助手的设置不对，没有启动：' + e.message); process.exit(1); }
   // 运维相关：请求日志（默认开，LOG_REQUESTS=0 关）、停机收尾最多等几秒（SHUTDOWN_TIMEOUT_MS）。写错了不启动
   let ops;
   try { ops = opsConfig(process.env); } catch (e) { console.error('运维设置不对，没有启动：' + e.message); process.exit(1); }

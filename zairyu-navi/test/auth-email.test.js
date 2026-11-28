@@ -341,7 +341,14 @@ test('登录的设备：能看到几台、哪台是自己；让其他设备退�
     assert.deepEqual(Object.keys(list[0]).sort(), ['createdAt', 'current', 'lastUsedAt', 'via'], '不带令牌和哈希');
     assert.ok(list[1].lastUsedAt, '用过的登录有最后使用时间');
     assert.equal((await s.call('GET', S)).status, 401);
-    // 从找回的设备发起：注册时的设备和另一台找回的设备都退出
+    // 刚找回的设备 24 小时内不能让其他设备退出（拿到一次验证码的人不能先把本人踢下线），什么都不改
+    const early = await s.call('DELETE', S, null, d2);
+    assert.equal(early.status, 403);
+    assert.match(early.body.error, /刚用邮箱找回登录.*24 小时内不能让其他设备退出/);
+    assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 200, '注册时的设备还在');
+    assert.equal((await s.call('GET', `/api/users/${u.id}`, null, d3)).status, 200);
+    // 过了 24 小时，从找回的设备发起：注册时的设备和另一台找回的设备都退出
+    s.advance(25 * 60 * 60 * 1000);
     assert.equal((await s.call('DELETE', S, null, d2)).status, 204);
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 401, '注册时的设备已退出');
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, d3)).status, 401);
@@ -415,7 +422,13 @@ test('删除账号：邮箱、验证码、别的设备的登录、发件箱、�
     await s.bind(keep, 'keep@example.com');
     const before = s.app.store.emailFootprint(u.id, 'li@example.com');
     for (const k of ['sessions', 'emails', 'challenges', 'outbox', 'rate']) assert.ok(before[k] > 0, '删除之前 ' + k + ' 里有记录');
-    assert.equal((await s.call('DELETE', `/api/users/${u.id}`, null, d2)).status, 204, '用找回的设备也能删除账号');
+    // 刚找回的设备 24 小时内不能删除账号（拿到一次验证码的人不能马上删光数据）；什么都不删
+    const early = await s.call('DELETE', `/api/users/${u.id}`, null, d2);
+    assert.equal(early.status, 403);
+    assert.match(early.body.error, /24 小时内不能删除账号/);
+    assert.deepEqual(s.app.store.emailFootprint(u.id, 'li@example.com'), before);
+    s.advance(25 * 60 * 60 * 1000);
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}`, null, d2)).status, 204, '过了 24 小时，用找回的设备也能删除账号');
     assert.deepEqual(s.app.store.emailFootprint(u.id, 'li@example.com'), { sessions: 0, emails: 0, challenges: 0, outbox: 0, reminders: 0, rate: 0 });
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, u.token)).status, 401);
     assert.equal((await s.call('GET', `/api/users/${u.id}`, null, d2)).status, 401);
@@ -447,7 +460,8 @@ test('留痕：绑定、找回、退出、解除、删除都有记录，但不�
     codes.push(s.codeIn(s.lastMail('li.hua@example.com')));
     const d2 = (await s.call('POST', '/api/auth/recover/verify', { challengeId: q.body.challengeId, code: codes[1] })).body.token;
     await s.call('POST', '/api/auth/recover', { email: 'stranger@example.com' });
-    await s.call('DELETE', `/api/users/${u.id}/sessions`, null, d2);
+    s.advance(25 * 60 * MIN); // 刚找回的设备 24 小时内不能让其他设备退出、解除邮箱、删除账号
+    assert.equal((await s.call('DELETE', `/api/users/${u.id}/sessions`, null, d2)).status, 204);
     const check = () => {
       const rows = s.app.store.auditRows(), dump = JSON.stringify(rows);
       for (const bad of ['li.hua', 'example.com', 'stranger', d2, u.token, q.body.challengeId, r.body.challengeId].concat(codes)) assert.ok(!dump.includes(bad), '留痕里不应当有 ' + bad);
@@ -455,7 +469,6 @@ test('留痕：绑定、找回、退出、解除、删除都有记录，但不�
     };
     const acts = check();
     for (const a of ['email.bind', 'session.recover', 'session.revoke']) assert.ok(acts.includes(a), a);
-    s.advance(25 * 60 * MIN); // 刚找回的设备 24 小时内不能解除邮箱
     const proof = await s.proveOld(u, 'remove', d2); codes.push(proof, s.codeIn(s.lastMail('li.hua@example.com')));
     assert.equal((await s.call('DELETE', `/api/users/${u.id}/email`, { proof }, d2)).status, 204);
     assert.ok(check().includes('email.remove')); assert.ok(check().includes('email.confirm'), '验证原来的邮箱有记录（只记动作）');

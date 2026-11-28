@@ -30,6 +30,21 @@ async function startServer() {
 const pct = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.ceil(p / 100 * sorted.length) - 1)] : 0;
 const PROFILE = { status: 'work', entry: '2026-04-01', addr: '2026-04-05', exp: '2027-04-01', ins: true, pr: true, trips: [['2026-08-10', '2026-08-20']] };
 
+// 汇总：次数含被限流的（429）；非 2xx 不含 429；耗时（p50 等）只算没被限流的请求
+function summarize(stats, secs) {
+  const rows = Object.entries(stats).map(([name, s]) => { const ms = s.ms.slice().sort((a, b) => a - b); return { name, n: s.n, bad: s.bad, codes: s.codes, limited: s.limited || 0, rps: +(s.n / secs).toFixed(1), p50: +pct(ms, 50).toFixed(1), p95: +pct(ms, 95).toFixed(1), p99: +pct(ms, 99).toFixed(1), max: +(ms[ms.length - 1] || 0).toFixed(1) }; });
+  const all = Object.values(stats).flatMap((s) => s.ms).sort((a, b) => a - b);
+  const n = rows.reduce((a, r) => a + r.n, 0);
+  const total = { name: '合计', n, bad: rows.reduce((a, r) => a + r.bad, 0), limited: rows.reduce((a, r) => a + r.limited, 0), rps: +(n / secs).toFixed(1), p50: +pct(all, 50).toFixed(1), p95: +pct(all, 95).toFixed(1), p99: +pct(all, 99).toFixed(1), max: +(all[all.length - 1] || 0).toFixed(1) };
+  return { rows, total };
+}
+// Markdown 表格；“限流 429”一列是被限流的次数（不算非 2xx）
+function table(rows, total) {
+  const lines = ['| 请求 | 次数 | 非 2xx | 限流 429 | 每秒 | p50 ms | p95 ms | p99 ms | 最大 ms |', '|---|---|---|---|---|---|---|---|---|'];
+  for (const r of rows.concat([total])) lines.push('| ' + [r.name, r.n, r.bad + (r.codes && r.bad ? ' ' + JSON.stringify(r.codes) : ''), r.limited || 0, r.rps, r.p50, r.p95, r.p99, r.max].join(' | ') + ' |');
+  return lines.join('\n');
+}
+
 async function main() {
   const own = env.BASE ? null : await startServer();
   const base = env.BASE || own.base;
@@ -77,7 +92,11 @@ async function main() {
         const t0 = performance.now();
         const r = await fetch(base + '/api/users/' + u.id + '/events', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + u.token }, body: JSON.stringify({ type: 'move', date: '2026-12-01' }) }).catch(() => null);
         const s = stats['POST event'] || (stats['POST event'] = { n: 0, bad: 0, ms: [], codes: {} });
-        s.n++; s.ms.push(performance.now() - t0);
+        s.n++;
+        // 429：每个账号记事件有限流（1 小时 30 条），跑久了会撞上，那是规则，不是故障；记在 limited 里（表里“限流 429”那一列），
+        // 不算非 2xx，耗时也不算进 p50 等（被限的请求很快，混进去会把记事件的耗时拉低）
+        if (r && r.status === 429) { s.limited = (s.limited || 0) + 1; await r.arrayBuffer(); return; }
+        s.ms.push(performance.now() - t0);
         if (!r || r.status !== 201) { s.bad++; s.codes[r ? r.status : 0] = (s.codes[r ? r.status : 0] || 0) + 1; if (r) await r.arrayBuffer(); return; }
         const id = (await r.json()).id;
         await call('DELETE event', 'DELETE', '/api/users/' + u.id + '/events/' + id, null, u.token);
@@ -88,18 +107,15 @@ async function main() {
     const end = Date.now() + DURATION * 1000, t0 = performance.now();
     await Promise.all(Array.from({ length: CONC }, async (_, i) => { while (Date.now() < end) await pick()[2](users[i % users.length]); }));
     const secs = (performance.now() - t0) / 1000;
-    const rows = Object.entries(stats).map(([name, s]) => { const ms = s.ms.slice().sort((a, b) => a - b); return { name, n: s.n, bad: s.bad, codes: s.codes, rps: +(s.n / secs).toFixed(1), p50: +pct(ms, 50).toFixed(1), p95: +pct(ms, 95).toFixed(1), p99: +pct(ms, 99).toFixed(1), max: +(ms[ms.length - 1] || 0).toFixed(1) }; });
-    const all = Object.values(stats).flatMap((s) => s.ms).sort((a, b) => a - b);
-    const sum = { name: '合计', n: all.length, bad: rows.reduce((a, r) => a + r.bad, 0), rps: +(all.length / secs).toFixed(1), p50: +pct(all, 50).toFixed(1), p95: +pct(all, 95).toFixed(1), p99: +pct(all, 99).toFixed(1), max: +(all[all.length - 1] || 0).toFixed(1) };
+    const { rows, total: sum } = summarize(stats, secs);
     const out = { at: new Date().toISOString(), node: process.version, cpus: os.cpus().length, cpu: (os.cpus()[0] || {}).model, concurrency: CONC, durationSec: DURATION, users: USERS, target: env.BASE ? 'BASE' : 'npm start（子进程）', rows, total: sum };
     if (env.JSON === '1') console.log(JSON.stringify(out, null, 2));
     else {
       console.log('并发 ' + CONC + '，' + DURATION + ' 秒，' + USERS + ' 个账号；Node ' + process.version + '，' + out.cpus + ' 核 ' + out.cpu);
-      console.log('| 请求 | 次数 | 非 2xx | 每秒 | p50 ms | p95 ms | p99 ms | 最大 ms |');
-      console.log('|---|---|---|---|---|---|---|---|');
-      for (const r of rows.concat([sum])) console.log('| ' + [r.name, r.n, r.bad + (r.codes && r.bad ? ' ' + JSON.stringify(r.codes) : ''), r.rps, r.p50, r.p95, r.p99, r.max].join(' | ') + ' |');
+      console.log(table(rows, sum));
     }
     if (sum.bad) process.exitCode = 1;
   } finally { if (own) await own.stop(); }
 }
-main().catch((e) => { console.error('压力测试：' + e.message); process.exit(1); });
+module.exports = { summarize, table };
+if (require.main === module) main().catch((e) => { console.error('压力测试：' + e.message); process.exit(1); });
