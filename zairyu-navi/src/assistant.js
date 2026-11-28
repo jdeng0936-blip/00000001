@@ -104,13 +104,14 @@ function execTool(name, input, ctx) {
 }
 
 // ---- 对话历史 ----
-// 历史由网页端保存并在下一轮带回来，所以服务器不能照单全收：只接受本助手自己会产生的形状。
+// 历史存在服务器上（store 的 chat_history，每个账号一行），网页端不再保存和带回。用之前仍按下面的规则查一遍
+// （旧版本存进去的、库被人改过的），不合规则就整段丢掉：只接受本助手自己会产生的形状。
 // 规则：
 // - 最多 HISTORY_MAX_IN 条；每条 role 只能是 user 或 assistant。
 // - user 的内容是文字（1至 TEXT_MAX 字），或者一组 tool_result（必须正好对应上一条 assistant 里的 tool_use）。
 // - assistant 的内容是文字，或者一组 text / tool_use 块（工具名必须是本助手的工具）。
 // - 第一条必须是 user 的文字；tool_use 后面必须紧跟它的 tool_result，历史不能停在没有结果的 tool_use 上。
-// 通过后返回只含已知字段的干净副本。不合规则时抛 HttpError(422)，网页端应清空历史后重试。
+// 通过后返回只含已知字段的干净副本。不合规则时抛 HttpError(422)；服务器读库时遇到这种情况把这段历史丢掉重新开始。
 const HISTORY_MAX_IN = 60, HISTORY_KEEP = 20, HISTORY_BYTES = 40000, TEXT_MAX = 8000, RESULT_MAX = 40000;
 function validateHistory(history) {
   const bad = (why) => new HttpError(422, 'history 无效（' + why + '）。请清空对话历史后重试');
@@ -171,6 +172,20 @@ function historyTexts(history) {
       else if (b.type === 'tool_use') out.push(JSON.stringify(b.input));
       else if (b.type === 'tool_result') out.push(b.content);
     }
+  }
+  return out;
+}
+
+// 给网页显示的对话记录：只有用户的话和助手的回答文字（工具调用和结果不显示）。
+// 用户的话去掉网页加在前面的“（用户正在看的任务：…）”；助手的回答去掉第一行的类别【A】到【G】，类别单独给出。
+function displayHistory(history) {
+  const out = [];
+  for (const msg of history || []) {
+    if (msg.role === 'user') { if (typeof msg.content === 'string') out.push({ role: 'user', text: msg.content.replace(/^（用户正在看的任务：[^）\n]*）/, '') }); continue; }
+    const text = typeof msg.content === 'string' ? msg.content : (Array.isArray(msg.content) ? msg.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('') : '');
+    if (!text) continue;
+    const m = /^\s*【([A-G])】\s*/.exec(text);
+    out.push({ role: 'assistant', text: m ? text.slice(m[0].length) : text, category: m ? m[1] : null });
   }
   return out;
 }
@@ -341,7 +356,7 @@ const addUsage = (sum, u) => {
 
 // 返回 { text, category, toolCalls, draft, messages, stopReason, refusal, usage, model, effort }
 // draft：这一轮里助手准备好的咨询草稿（没有则为 null）。草稿没有发送，要由用户在页面上确认后调 POST /inquiries。
-// messages：已按轮裁剪过的完整历史，网页端原样保存、下一轮带回。
+// messages：已按轮裁剪过的完整历史，服务器存起来（chat_history），下一轮从库里读出来带上。
 // stopReason：最后一次模型回复的 stop_reason（end_turn、refusal、max_tokens、pause_turn……；工具轮数用完是 max_turns）。
 // refusal：模型拒答时的 { category, explanation }（接口的 stop_details），否则 null。usage：这一轮所有请求的 token 合计。
 //
@@ -349,8 +364,8 @@ const addUsage = (sum, u) => {
 // - 取回答文字时只看 text 块，思考块（默认文字是空的）一律忽略。
 // - 同一轮的工具循环里，助手的回复原样（包括思考块和签名）发回给模型；系统提示在这一轮开始时生成一次，整轮不变
 //   （接口会核对思考块产生之后 system、tools 和之前的消息有没有被改过，改过的新账号直接 400）。工具改了概况，模型从工具结果里看到。
-// - 返回给网页端保存的历史里不留思考块（cleanContent 只留 text 和 tool_use）：跨轮重放思考块不是必须的，接口会丢掉读不了的块；
-//   历史由网页端保存、会被裁剪，留着反而可能因为前面的消息变了而被拒。
+// - 存进服务器的历史里不留思考块（cleanContent 只留 text 和 tool_use）：跨轮重放思考块不是必须的，接口会丢掉读不了的块；
+//   历史会被裁剪，留着反而可能因为前面的消息变了而被拒。
 // 拒答（stop_reason refusal，HTTP 200）：给用户固定的说法，这一轮（用户这句话和这一轮里的工具调用）不进历史，免得下一轮带着同样的内容又被拒；
 // 工具已经写进库的改动照常保留。
 // 被截断（max_tokens）：用 MAX_TOKENS_CAP 重试一次；仍被截断就不给半截回答，回复 TRUNCATED_TEXT，被截断的工具调用不执行。
@@ -363,7 +378,7 @@ async function chat(ctx, history, userText, opts) {
   const cfg = llmConfig(process.env, opts);
   const engOf = () => createEngine({ profile: ctx.user.profile, done: ctx.user.done, plan: ctx.user.plan, auth: ctx.user.auth, events: ctx.store ? ctx.store.listEvents(ctx.user.id) : [], now: ctx.now });
   const prior = trimHistory(history || []);
-  const messages = prior.concat([{ role: 'user', content: userText }]); // 返回给网页端的历史
+  const messages = prior.concat([{ role: 'user', content: userText }]); // 存进服务器的历史
   const api = messages.slice(); // 发给模型的；这一轮里助手的回复原样放进来
   const system = systemPrompt(engOf(), ctx.now);
   const toolCalls = [], usage = opts.usage || newUsage(), signal = opts.signal;
@@ -425,7 +440,7 @@ async function chat(ctx, history, userText, opts) {
         apiResults.push(valid.has(b.id) ? results.get(b.id) : { type: 'tool_result', tool_use_id: b.id, content: '没有这个工具', is_error: true });
       }
       api.push({ role: 'user', content: apiResults });
-      // 给网页端的：只有 text 和认识的 tool_use，结果一一对应
+      // 存进历史的：只有 text 和认识的 tool_use，结果一一对应
       messages.push({ role: 'assistant', content });
       messages.push({ role: 'user', content: uses.map((b) => results.get(b.id)) });
     }
@@ -434,4 +449,4 @@ async function chat(ctx, history, userText, opts) {
   }
 }
 
-module.exports = { OPTION_PARAM_LABELS, TOOL_DEFS, systemPrompt, execTool, chat, anthropicLLM, abortError, newUsage, CHAT_LLM_OPTS, CHAT_DEADLINE_MS, llmConfig, buildRequest, checkRequest, validateHistory, historyTexts, trimHistory, DEFAULT_MODEL, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, EFFORTS, REFUSAL_TEXT, TRUNCATED_TEXT, RETRY_TEXT };
+module.exports = { OPTION_PARAM_LABELS, TOOL_DEFS, systemPrompt, execTool, chat, anthropicLLM, abortError, newUsage, CHAT_LLM_OPTS, CHAT_DEADLINE_MS, llmConfig, buildRequest, checkRequest, validateHistory, historyTexts, displayHistory, trimHistory, DEFAULT_MODEL, DEFAULT_EFFORT, DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, EFFORTS, REFUSAL_TEXT, TRUNCATED_TEXT, RETRY_TEXT };

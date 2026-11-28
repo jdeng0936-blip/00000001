@@ -14,7 +14,12 @@ npm run e2e       # 网页端的端到端检查（需要 playwright）；发布�
 npm start         # http://localhost:8787 ，网页在根路径，接口在 /api
 npm run remind    # 期限提醒邮件跑一轮就退出（给 cron 用；也可以让 npm start 自己定时跑，见下面 REMINDERS_ENABLED）
 npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给 cron 用；npm start 自己也每分钟、每小时跑，见下面“服务商入驻”）
+npm run backup         # 在线备份数据库到 BACKUP_DIR，只留最新的 BACKUP_KEEP 份（见 docs/ops.md“备份”）
+npm run backup:verify  # 核对最新的一份备份（integrity_check、表齐不齐）并做一次恢复演练
+npm run loadtest       # 压力测试：自己起一个服务器，并发打主要的读写接口（见 docs/ops.md“压力测试”）
 ```
+
+部署（Docker、compose、Caddy 的 HTTPS）、备份和恢复、轮换令牌和 API key、应急清单见 `docs/ops.md`。
 
 环境变量：`PORT`、`DB_FILE`（SQLite 文件位置）、`ADMIN_TOKENS`（有名字的管理员令牌，写法 `名字:令牌,名字:令牌`，名字是 1 至 32 个小写字母、数字、横线、下划线，令牌至少 24 个字符；名字记进留痕和审核记录。写错了不启动）、`ADMIN_TOKEN`（旧的单个管理员令牌，继续可用，名字记为 `admin`；两个都不配则管理接口返回 503）、`ANTHROPIC_API_KEY`（助手用，不配则助手接口返回 503）、`MODEL`（默认 `claude-sonnet-5-5`）、`EFFORT`（`low`、`medium`、`high`、`xhigh`、`max`，默认 `medium`）、`MAX_TOKENS`（默认 8000，1000 至 16000）；后三个写错了不启动，调用模型的细节见“助手调用模型”。
 
@@ -32,7 +37,10 @@ npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给
 | `REMINDERS_ENABLED` | 关 | 设为 `1` 时 `npm start` 在进程里定时跑期限提醒。不开的话用 cron 跑 `npm run remind`，或者调 `POST /api/admin/reminders/run`；两种一起用也不会重复发 |
 | `REMINDER_INTERVAL_MIN` | 60 | 定时器隔多少分钟看一次（1 到 1440）。轮到的时候还没到 `REMINDER_HOUR` 点，会另外等到那个点再跑一次，所以间隔设得再长（例如 1440）每天也至少跑一次 |
 | `REMINDER_HOUR` | 9 | 日本时间几点以后才发（0 到 23）。只管进程里的定时器；`npm run remind` 什么时候跑由 cron 决定 |
-| `TRUST_PROXY` | 关 | 设为 `1` 时，来源地址取 `X-Forwarded-For` 的最后一段（放在一层反向代理后面时开；直接对外时不要开，否则限流能被伪造的头绕过） |
+| `TRUST_PROXY` | 关 | 设为 `1` 时，来源地址取 `X-Forwarded-For` 的最后一段（放在一层反向代理后面时开；直接对外时不要开，否则限流能被伪造的头绕过）。开了以后还会：`X-Forwarded-Proto` 的最后一段是 `https` 时带 HSTS；沿用代理给的 `X-Request-Id`；请求日志里写截短的来源地址 |
+| `LOG_REQUESTS` | `1` | 请求日志（标准输出一行一个 JSON：时间、请求编号、方法、路由模板、状态码、耗时；不写地址里的编号和查询参数、请求体、令牌、邮箱），`0` 关。只有 `npm start` 读，`createApp()` 默认不记 |
+| `SHUTDOWN_TIMEOUT_MS` | 25000 | 收到 SIGTERM 后最多等手上的请求多久（1000 到 120000 毫秒），之后强制断开、关库退出 |
+| `BACKUP_DIR`、`BACKUP_KEEP` | `DB_FILE` 所在目录下的 `backups`、7 | `npm run backup` 用：备份放哪里（不能就是库所在的目录）、留几份（1 到 365） |
 
 服务商入驻（展示费和新咨询通知）用的环境变量，`npm start` 和 `npm run billing` 都读；写错了不启动并说明是哪一项：
 
@@ -50,43 +58,52 @@ npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给
 
 `MAIL_SENDER` 是 `http` 或 `smtp` 而设置不全（包括没有 `APP_URL`）、或者上面几个提醒的参数写得不对时，`npm start` 和 `npm run remind` 直接报错退出，并说明缺哪几项。期限的日期一律按日本时间的日历日算，和服务器的 `TZ` 无关。日志里只有数量和错误说明，不写邮件正文和收件地址（`console` 这种本地发件方式除外，它就是把邮件打印出来）。`createApp()` 不读这些变量（默认就是 `outbox`），所以测试和 `npm run e2e` 不会误发真邮件。
 
-数据库：打开时先设 `busy_timeout`（10 秒）和 `secure_delete`，再建表。`npm start` 和 `npm run remind` 可以同时用同一个库文件，一方正在写时另一方等待；`npm run remind` 处理某个账号时撞上“库正忙”会再试两次，库打不开时报一行原因后以退出码 1 结束（cron 下一轮再跑）。删掉的行在库文件里用零覆盖，不留在空闲页里；这只管库文件本身，备份要按同样的期限另行清理，改动之前就存在的旧库文件要执行一次 `VACUUM` 才能清掉以前留下的空闲页。
+数据库：打开时先设 `busy_timeout`（10 秒）和 `secure_delete`，再建表。`npm start` 和 `npm run remind` 可以同时用同一个库文件，一方正在写时另一方等待；`npm run remind` 处理某个账号时撞上“库正忙”会再试两次，库打不开时报一行原因后以退出码 1 结束（cron 下一轮再跑）。删掉的行在库文件里用零覆盖，不留在空闲页里；这只管库文件本身，备份要按同样的期限另行清理（`npm run backup` 用 `VACUUM INTO`，备份里没有空闲页，但删除之前做的备份里仍有那些数据，直到被轮换删掉，见 `docs/ops.md`“secure_delete 和备份的保存期限”），改动之前就存在的旧库文件要执行一次 `VACUUM` 才能清掉以前留下的空闲页。库文件以 600 权限建。
 
 ## 目录
 
 | 位置 | 内容 |
 |---|---|
-| `data/nodes.json` | 26 个节点的资料。每条数据带核实标记（1 已对照官网，0 待核实）和来源链接；第 4 项为 1 表示涉及法定期限、罚则或在留资格条件。引擎和网页按上线规则处理后再用（`launchView`：待核实的这类数据不显示数字；待核实超过一半的节点显示“资料整理中”，要点、费用、用时、步骤都不显示，只给概要和官方链接；每个节点带核对日期 `checked`，页面按节点显示，见 `docs/compliance-review.md` 第二节） |
-| `tools/sync-nodes.js` | 改了 `data/nodes.json` 后运行，把网页内嵌的节点数据写回 `web/index.html`（`--check` 只检查，`test/web-sync.test.js` 会跑） |
-| `src/engine.js` | 规则引擎：路线和期限、提醒、永驻体检、七个选方案主题、高度人才积分、人民币折算。纯逻辑 |
+| `data/nodes.json` | 26 个节点的资料。每条数据带核实标记（1 已对照官网，0 待核实）和来源链接；第 4 项为 1 表示涉及法定期限、罚则或在留资格条件。引擎按上线规则处理后再用（`launchView`，网页显示的是接口返回的处理后的数据：待核实的这类数据不显示数字；待核实超过一半的节点显示“资料整理中”，要点、费用、用时、步骤都不显示，只给概要和官方链接；每个节点带核对日期 `checked`，页面按节点显示，见 `docs/compliance-review.md` 第二节） |
+| `data/options.json` | 选方案的数据：七个主题（来日本走哪条路、怎么取得学历、高度人才积分规划、电话卡套餐、驾照怎么拿、开公司费用、第一年要准备多少钱）里每一项的名称、价格、条件、要点、来源 `src`（[标题, 地址]）、依据的种类 `st`、核对日期 `checkedOn` 和下次复核日期 `nextReviewOn`，以及人民币汇率（`rate`）。排序和取舍的规则留在 `src/engine.js`。改了价格或条件要同时改 `checkedOn`；复核过没变化的只改 `checkedOn` 和 `nextReviewOn`。`test/options-data.test.js` 在 `nextReviewOn` 过了时失败（按 `OPTIONS_REVIEW_ON=YYYY-MM-DD` 指定的日期，默认今天），提前看哪些快到期：`OPTIONS_REVIEW_ON=2027-01-01 npm test`。现在电话卡和汇率每月复核（下次 2026-12-25、2026-12-24），驾校、开公司、路线、预算每季度（2027-02-25），学历和积分的途径每半年（2027-05-25） |
+| `tools/options-snapshot.js` | 选方案输出的快照（`test/fixtures/options-snapshot.json`，499 组条件）。数据搬进 `data/options.json` 时用它保证内容一字不差；以后有意改了方案的内容，运行 `node tools/options-snapshot.js --write` 重新生成并在提交说明里写明 |
+| `src/engine.js` | 规则引擎：路线和期限、提醒、永驻体检、七个选方案主题的排序规则（数据在 `data/options.json`）、高度人才积分、人民币折算，以及网页“闯关”页要的进度数据（`routeView`）。纯逻辑。网页不再内嵌它的副本 |
 | `src/validate.js` | 用户概况、咨询内容的校验和敏感号码过滤，接口和助手共用 |
-| `src/store.js` | 持久化（SQLite）。换数据库只改这个文件。邮箱、验证码、登录、限流、发件箱、提醒邮件的去重账本各一张表，`users` 表没有加列，旧的数据库文件打开后自动多出这几张表 |
+| `src/store.js` | 持久化（SQLite）。换数据库只改这个文件。邮箱、验证码、登录、限流、发件箱、提醒邮件的去重账本、助手的对话记录（`chat_history`）各一张表；`users` 表加了一列 `version`（多台设备同时修改用），旧的数据库文件打开后自动补上这一列（旧账号从 0 起）并多出这几张表 |
 | `src/mailer.js` | 发件方式（outbox、console、http、smtp）、邮件的文字、把发件箱里的邮件发出去并按退避重试 |
 | `src/scheduler.js` | 期限提醒邮件的定时任务：算出谁的哪件事到了前 7 天、前 1 天、当天，去重后排进发件箱；`npm run remind` 的入口 |
 | `src/billing.js` | 服务商展示费：价目表、开账单、付款提醒、过了宽限期不再展示、可替换的收款方式；`npm run billing` 的入口 |
 | `src/notifier.js` | 新咨询通知：合成一封、发之前再核对 |
 | `src/assistant.js` | 助手的提示词、工具和对话循环 |
-| `src/server.js` | HTTP 接口和静态网页 |
-| `web/index.html` | 网页端。在本服务器上打开时，概况和进度存到服务器，助手走服务器接口（规则见下面“网页端的行为”） |
+| `src/server.js` | HTTP 接口和静态网页；每个响应带安全相关的头（CSP 等，见 `docs/ops.md`），静态文件带 ETag；请求日志和请求编号；存活和就绪检查；收到 SIGTERM 后的停机收尾 |
+| `web/*.js`、`web/*.css` | 各页面的脚本和样式（`index.js`、`index.css` 等）。内容安全策略不允许内联脚本、内联样式和 `on…=` 属性，所以都放在单独的文件里；HTML 里只用 `<script src>`、`<link rel="stylesheet">`，初始隐藏的元素用 `hidden` 属性，页面内不提交的表单带 `data-nosubmit`（`test/ops.test.js` 检查） |
+| `web/index.html` | 网页端。要连着本服务器才能用（没有离线的演示模式，README 和待办都没有要求不连服务器也能用）：概况和进度存到服务器，路线、提醒、判断、永驻体检、选方案都调接口，不内嵌规则；助手走服务器接口（规则见下面“网页端的行为”） |
+| `web/merge.js` | 多台设备同时修改时的逐项合并（网页用，`test/state-version.test.js` 在 Node 里直接测） |
 | `web/provider.html` | 服务商工作台：用联系邮箱领取令牌，查看和回复咨询，看展示状态和账单，开关新咨询通知 |
 | `web/provider-apply.html` | 服务商入驻申请：验证联系邮箱、填申请、查看或修改申请、撤回 |
 | `web/provider-terms.html` | 服务商条款的草案（带版本号，空着的地方用【 】） |
 | `web/admin.html` | 管理后台（首页不链接，要管理员令牌）：审核申请、服务商的展示状态和下架、账单的入账和作废 |
 | `web/privacy.html`、`web/terms.html` | 隐私政策和使用条款的草案 |
-| `e2e/browser.js`、`e2e/run.js` | 真实浏览器的端到端检查，24 步；`npm run e2e` 自己起服务器再跑（需要 playwright，见下面“端到端检查”） |
+| `e2e/browser.js`、`e2e/run.js` | 真实浏览器的端到端检查，29 步（倒数第二步打开每个页面，确认样式和脚本都加载了、没有违反 CSP）；`npm run e2e` 自己起服务器再跑（需要 playwright，见下面“端到端检查”） |
 | `eval/questions.json` | 68 道边界测试题，其中 35 道必须全部通过才能上线 |
 | `eval/run.js` | 跑题脚本（见“用真实模型跑题集”） |
-| `docs/` | 合规自查记录、待办 |
+| `tools/backup.js` | `npm run backup`、`npm run backup:verify`：在线备份、轮换、核对和恢复演练 |
+| `tools/loadtest.js` | `npm run loadtest`：压力测试 |
+| `Dockerfile`、`.dockerignore`、`compose.yaml`、`deploy/` | 容器镜像、单台虚拟机上的部署（应用 + Caddy 的 HTTPS）、Caddy 的设置、环境变量的样板 `deploy/env.example`（见 `docs/ops.md`） |
+| `test/ops.test.js`、`test/web-source.js` | 上线准备的测试（响应头、CSP、缓存、存活和就绪、停机收尾、请求日志、备份、部署文件）；读网页源码（HTML 加上它引用的脚本）的测试工具 |
+| `docs/` | 合规自查记录、待办、运维手册 `docs/ops.md` |
 
 ## 接口
 
 | 方法和路径 | 作用 |
 |---|---|
+| `GET /api/health` | 存活检查：进程还能回答就是 200 `{ ok, nodes }`，不碰数据库（容器的 HEALTHCHECK 用） |
+| `GET /api/ready` | 就绪检查：读得了表结构、建表和补列都做过、库能写，并且不在停机收尾，才是 200 `{ ok: true, failed: [] }`；否则 503，`failed` 是 `readable`、`migrations`、`writable`、`shutting-down` 里没过的几项（反向代理用） |
 | `POST /api/users` | 新建账号，body `{ "accept": "条款版本" }`（版本从 `GET /api/terms` 取），返回 id 和令牌（令牌只返回这一次）。之后的 `/api/users/:id/...` 都要带 `Authorization: Bearer 令牌` |
-| `PUT /api/users/:id/state` | 网页端整体同步概况和完成记录 |
-| `GET /api/users/:id`、`DELETE /api/users/:id` | 读取、删除自己的全部数据（删除时邮箱、验证码、其他设备的登录、发给这个邮箱的邮件、按它计的限流次数一并删掉） |
+| `PUT /api/users/:id/state` | 网页端整体同步概况和完成记录，body `{ profile, done, version? }`，返回 `{ ok, version }`。带 `version`（上次读到或存上的版本号）时，服务器上已经不是这个版本（另一台设备或助手先改过）就返回 409 `{ error, current }`，`current` 是服务器上现在的账号（含 `version`），什么都不改；网页端逐项合并后用 `current.version` 重发。不带 `version` 的旧客户端照旧整体覆盖。概况和进度每保存一次（含完成任务的接口和助手的工具）版本号加一 |
+| `GET /api/users/:id`、`DELETE /api/users/:id` | 读取（含版本号 `version`）、删除自己的全部数据（删除时邮箱、验证码、其他设备的登录、发给这个邮箱的邮件、按它计的限流次数、助手的对话记录一并删掉） |
 | `GET /api/terms` | 当前的条款版本 `{ version, changes, terms, privacy }`，`changes` 是给老用户看的“这次改了什么” |
-| `POST /api/users/:id/consent` | 条款改版后重新同意，body `{ "accept": "当前版本" }`，返回账号。同意的还是旧版本的账号，除了 `GET`、`DELETE /api/users/:id`、这个接口，以及“收回”类的操作（`GET .../email`、`DELETE .../email` 和解除之前验证原邮箱的 `POST .../email/old`、`.../email/old/verify`（`action: "remove"`）、`PUT .../email/reminders` 关掉提醒），其余 `/api/users/:id/...` 一律返回 409 |
+| `POST /api/users/:id/consent` | 条款改版后重新同意，body `{ "accept": "当前版本" }`，返回账号。同意的还是旧版本的账号，除了 `GET`、`DELETE /api/users/:id`、这个接口，以及“收回”类的操作（`GET .../email`、`DELETE .../email` 和解除之前验证原邮箱的 `POST .../email/old`、`.../email/old/verify`（`action: "remove"`）、`PUT .../email/reminders` 关掉提醒、`DELETE .../chat` 清空助手的对话记录），其余 `/api/users/:id/...` 一律返回 409 |
 | `GET /api/users/:id/email` | `{ email, verified, remindOptIn }`，`email` 是打码的地址（`a***@example.com`）或 `null`；`remindOptIn` 是邮件提醒开没开 |
 | `POST /api/users/:id/email/old` | 更换或解除之前验证原来的邮箱，第一步。body `{ "action": "change" }`（更换）或 `{ "action": "remove" }`（解除），向账号现在绑着的邮箱发 6 位验证码，返回 `202 { challengeId, expiresInSec: 600 }`。没有绑定邮箱时 409；刚用邮箱找回登录的设备 24 小时内 403 |
 | `POST /api/users/:id/email/old/verify` | 第二步，body `{ "action", "challengeId", "code" }`，成功返回 `{ proof, expiresInSec: 900 }`：确认（只返回这一次），15 分钟内有效、只能用一次，只能用于这个账号、这种操作（`change` 的不能拿来解除，反过来也不行）、验证时绑着的那个邮箱。失败是同一个 422 |
@@ -98,16 +115,20 @@ npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给
 | `POST /api/auth/recover` | 用邮箱找回账号的第一步，不用登录，body `{ "email" }`。不管邮箱有没有绑定过，都返回 `202 { challengeId, expiresInSec: 600 }`；只有绑定过的才真的发验证码 |
 | `POST /api/auth/recover/verify` | 第二步，body `{ "challengeId", "code" }`，成功返回 `{ id, token }`：这台设备的新令牌（只返回这一次），原来设备的令牌不变，并向邮箱发一封“有新设备登录”的通知。失败是同一个 422 |
 | `GET /api/users/:id/sessions`、`DELETE /api/users/:id/sessions` | 登录着的设备 `[{ createdAt, lastUsedAt, via, current }]`（`via`：`signup` 注册时的令牌、`recover` 邮箱找回）；DELETE 让发请求的这台以外的设备全部退出，返回 204 |
-| `PATCH /api/users/:id/profile` | 修改概况（身份、日期、出国记录等） |
+| `PATCH /api/users/:id/profile` | 修改概况（身份、日期、出国记录等）。body 里可以带 `version`，规则和 `PUT /state` 一样（过时就 409 和 `current`）；返回改后的概况，新的版本号在响应头 `x-state-version` |
 | `PUT /api/users/:id/tasks/:nodeId/done` | 标记任务完成或撤销，body `{ "done": true }` |
-| `GET /api/users/:id/plan`、`/reminders`、`/advice`、`/pr-check` | 路线、提醒、判断、永驻体检。`/reminders` 每条是 `{ date, text, tag, src }`：`date` 是日本时间的日历日，`YYYY-MM-DD` 的文字（不是时刻，不要按时区换算）；`src` 是事件期限的依据 `{ law, title, url, more? }`（法条、官方页面，`more` 是另外要看的页面），其他提醒为 `null` |
-| `POST /api/users/:id/chat` | 和助手对话，body `{ "message": "...", "history": [] }`。返回 `{ text, category, toolCalls, draft, history }`：`history` 原样保存、下一轮带回（服务器已按轮裁剪到最多 20 条）；`draft` 是助手准备的咨询草稿或 `null`，助手自己不能发送咨询。历史不合规则、或历史里有疑似敏感号码时返回 422，说明以 `history` 开头（清空历史后重试），提问太频繁返回 429（带 `retry-after`） |
+| `GET /api/users/:id/plan`、`/reminders`、`/advice`、`/pr-check` | 路线、提醒、判断、永驻体检，网页显示的就是这几个接口的结果。`/plan` 是助手 `get_plan` 工具的那几项，另加 `view`：网页“闯关”页用的 `{ today, stages, titles, level, xp, max, done, total, clear, next, dayInJapan, legalDone, nodes: [{ id, stage, title, state, note, due, dueFmt, dueText, dueDays, xp, legal }] }`（日期和“还有几天”都按日本时间在服务器上算好）。`/reminders` 每条是 `{ date, text, tag, src, dateText, days }`：`date` 是日本时间的日历日，`YYYY-MM-DD` 的文字（不是时刻，不要按时区换算），`dateText` 是同一天写成“2026年12月1日”，`days` 是离今天（日本时间）几天，过了是负数；`src` 是事件期限的依据 `{ law, title, url, more? }`（法条、官方页面，`more` 是另外要看的页面），其他提醒为 `null`。`/advice` 每条 `{ title, text, href, action }`（`href`、`action` 是后面那个链接去哪一页、链接文字）。`/pr-check` 另有 `whenText`（最早时点写成“2029年4月1日”）和 `reached`（今天已经到了） |
+| `GET /api/users/:id/options/:topic?条件` | 按这个人的情况排的选方案（驾照那一题看有没有中国驾照），其余和 `GET /api/options/:topic` 一样 |
+| `GET /api/users/:id/city` | 同城的示例信息 `{ jobs: [{ title, type, place, fit, fitText }], house, used, life }`，招聘按这个人的在留资格标出能不能做（`fit`：ok、warn、bad） |
+| `POST /api/users/:id/chat` | 和助手对话，body `{ "message": "..." }`，只发新的一句。返回 `{ text, category, toolCalls, draft }`；`draft` 是助手准备的咨询草稿或 `null`，助手自己不能发送咨询。对话记录存在服务器上（`chat_history` 表，每个账号一行），每轮结束后按整轮裁剪（和 `trimHistory` 一样：最多 20 条、40000 字节，开头总是用户的话）再存；网页端不保存、不带回，所以没法伪造助手说过的话或工具的结果。存着的记录每次用之前再查一遍：形状不对、或者任何一段文字（用户的话、助手的话、工具参数、工具结果）里有疑似敏感号码，整段丢掉重新开始，不转给模型。为了兼容旧页面，`history` 是空数组照常收（旧页面清空历史后重试时就是这样），有内容的返回 422（说明以 `history` 开头，旧页面据此清空后重试），其他多余字段也是 422。同一个账号上一条还在回答时返回 409，提问太频繁返回 429（带 `retry-after`） |
+| `GET /api/users/:id/chat`、`DELETE /api/users/:id/chat` | 对话记录：GET 返回 `{ messages: [{ role, text, category? }] }`，只有用户的话（去掉网页加的“正在看的任务”）和助手的回答（类别单独给出），不含工具调用；DELETE 清空（留痕只记“清空过一次”，没有账号编号和内容），返回 204。删除账号时一并删掉，内容不写进留痕 |
 | `GET`、`POST /api/users/:id/inquiries` | 发给服务商的咨询。必须带 `consent: true` 和 `providerIds`（最多三家）。这是唯一能把咨询发出去的途径 |
-| `GET /api/nodes`、`/api/nodes/:id` | 节点资料 |
-| `GET /api/options/:topic` | 选方案。topic：route、degree、points、phone、drive、company、budget |
+| `GET /api/nodes`、`/api/nodes/:id` | 节点资料（按上线规则处理过）。`/api/nodes?full=1` 一次返回全部节点的完整资料（网页打开时读一次） |
+| `GET /api/links`、`GET /api/event-types` | 每个环节可以找哪类服务商 `[{ nodeId, title, category, categoryName, what, bring }]`；会产生期限的事件种类 `[{ type, label }]` |
+| `GET /api/options/:topic` | 选方案。topic：route、degree、points、phone、drive、company、budget。条件用查询参数传（和 `get_options` 的 params 一样）。每套方案带核对日期 `checkedOn`（来自 `data/options.json`），返回里另有折算用的汇率 `rate: { value, on }` |
 | `GET /api/providers/categories` | 服务类别和收费方式：`{ key, name, what, regulated, feeModel, promoted }`。所有类别都只付固定的展示费；`feeModel` 士业是 `fixed_listing`，其余是 `affiliate_disclosed`（只表示名单上标“含推广”，名字为兼容保留，不表示有佣金），`promoted` 为真的在名单上标“含推广” |
 | `GET /api/providers?category=` | 名单上展示的服务商（在架，经申请批准的已领取令牌，并且在 30 天免费期内或展示费已付到今天；见“服务商入驻”）。公开名称、所属会、登录番号、事务所地址、收费说明、区域、语言，联系邮箱不公开 |
-| `GET`、`POST /api/users/:id/events`，`DELETE .../events/:eid` | 会产生期限的事件 |
+| `GET`、`POST /api/users/:id/events`，`DELETE .../events/:eid` | 会产生期限的事件。POST 返回 `{ id, deadlines }`，`deadlines` 是按现在的身份这件事产生几条期限（0 时网页说明“这里没有登记到对应的期限”） |
 | `GET /api/admin/providers`、`PUT /api/admin/providers/:id/active` | 管理员看全部服务商（展示状态、展示到哪一天、最近一张账单、打码的联系邮箱）和上架、下架（带管理员令牌）。下架时令牌立即作废，排队中的新咨询通知和账单邮件不发；重新上架后要重新领取令牌 |
 | `POST /api/admin/providers` | 管理员直接入驻：会把令牌返回给管理员，所以只在 `createApp({ allowDirectProvider: true })` 时有（测试和端到端用，不读环境变量），正式环境 404。和入驻申请同一套检查：登录番号的格式和所属会（`licenseBody`）、名称、地址、收费说明、区域、语言没有保证类用语、过敏感号码过滤；收费方式按类别定，请求里的 `feeModel` 和它不一致就 422 |
 | `GET /api/provider-terms` | 服务商条款的版本 `{ version, url }` |
@@ -178,11 +199,13 @@ npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给
 `web/index.html` 在本服务器上打开时按下面的规则工作，每一条都在 `e2e/browser.js` 里有检查。
 
 - 账号：同意条款后才建账号（或在同一个对话框里用邮箱找回已有的账号），账号（id 和令牌）存在浏览器的 localStorage 里。打开页面读取账号时，只有服务器明确回答 401 或 404 才丢掉本机的账号并重新走同意流程；连不上、5xx、429 都保留账号，页面顶部显示状态和“重试”，并按 2 秒起、每次加倍、最长 60 秒自动重试。建账号失败时同意对话框不消失，把原因显示出来。
-- 保存：修改先写本机，再发 `PUT /state`（同一时间只发一个请求）。没存上时记下“有修改未保存”的标记（localStorage 的 `zairyu-unsaved`），顶部显示提示，自动重试（同样的退避，浏览器恢复联网时也立刻重试）。带着这个标记再打开页面时，以本机的内容为准发给服务器，不用服务器的旧内容覆盖本机。422 这类重试也没用的失败只提示，不反复重试。
-- 邮箱和设备：“我的情况”里有“账号和邮箱”。绑定要填邮箱、勾选同意、再填邮件里的验证码；绑定后只显示打码的地址，有“更换邮箱”和“解除绑定”两个按钮，没有直接填新邮箱的框：点“更换邮箱”后验证码发到现在绑着的邮箱，填对了（“确认是我”）才出现新邮箱的输入框、同意的勾和“发送验证码”，再填新邮箱的验证码“确认更换”；点“解除绑定”先确认，再填发到现在这个邮箱的验证码，对了就解除。每一步都可以取消；确认过期（15 分钟）时页面回到开头并显示服务器的说明。下面有一段“原来的邮箱收不到信了？”说明没有绕过的办法、可以照常用或删除账号重新开始。刚用邮箱找回登录的设备 24 小时内点这两个按钮，页面显示服务器的说明，不发验证码。绑定后那里和“提醒”页各有一个“邮件提醒”的勾（同一个设置，默认不勾），文字写明前 7 天、前 1 天和当天各一封、有官方页面的会带上链接；没绑定邮箱时“提醒”页说明要先去绑定。连着服务器时不显示“授权自动获取”里演示用的那个“邮件提醒”。下面列出登录着的设备，多于一台时可以“让其他设备退出登录”（先确认）。同意对话框里有“已有账号？用邮箱找回”：不管邮箱有没有绑定过，发送后的提示都一样；验证码对了就换成找回的账号（这台设备拿到新令牌，本机缓存的别的账号的内容不带过来）。本机的登录失效（401）时，对话框里说明原因并提示可以用邮箱找回。
+- 只调接口：页面不内嵌规则和节点数据。打开时读一次 `/api/nodes?full=1`、`/api/links`、`/api/providers/categories`、`/api/event-types`；路线、提醒、判断、永驻体检、同城由 `/plan`、`/reminders`、`/advice`、`/pr-check`、`/city` 算好，存上一次修改之后重新读一遍；选方案读 `/options/:topic`，每套方案下面写着核对日期。连不上服务器时只显示状态和“重试”，没有离线的演示内容（没有“恢复示例”，也没有演示用的“授权自动获取”“价格变动提醒”、拍照读信和下载到 claude.ai）。“我的资料”（办事准备单、路线清单、通关纪念卡）只存在这台设备的浏览器里，下载是普通的文本文件。
+- 保存：修改先写本机，再发 `PUT /state`（同一时间只发一个请求），带上上次和服务器对上的版本号。没存上时记下“有修改未保存”的标记（localStorage 的 `zairyu-unsaved`），顶部显示提示，自动重试（同样的退避，浏览器恢复联网时也立刻重试）。带着这个标记再打开页面时，以本机的内容为准发给服务器，不用服务器的旧内容覆盖本机。422 这类重试也没用的失败只提示，不反复重试。
+- 多台设备同时修改：保存时服务器回 409（另一台设备或助手先改过），页面用 `web/merge.js` 逐项合并后用新的版本号重发：概况按字段、已完成的任务按任务编号、出国记录按“出国日~回国日”逐条，本机改过的用本机的，本机没改的用服务器的；两边改了同一项、改得不一样时以这台设备刚改的为准，并提示“另一台设备也改了同样的项（…）”。事件每条单独存在服务器上，不会互相覆盖。
+- 邮箱和设备：“我的情况”里有“账号和邮箱”。绑定要填邮箱、勾选同意、再填邮件里的验证码；绑定后只显示打码的地址，有“更换邮箱”和“解除绑定”两个按钮，没有直接填新邮箱的框：点“更换邮箱”后验证码发到现在绑着的邮箱，填对了（“确认是我”）才出现新邮箱的输入框、同意的勾和“发送验证码”，再填新邮箱的验证码“确认更换”；点“解除绑定”先确认，再填发到现在这个邮箱的验证码，对了就解除。每一步都可以取消；确认过期（15 分钟）时页面回到开头并显示服务器的说明。下面有一段“原来的邮箱收不到信了？”说明没有绕过的办法、可以照常用或删除账号重新开始。刚用邮箱找回登录的设备 24 小时内点这两个按钮，页面显示服务器的说明，不发验证码。绑定后那里和“提醒”页各有一个“邮件提醒”的勾（同一个设置，默认不勾），文字写明前 7 天、前 1 天和当天各一封、有官方页面的会带上链接；没绑定邮箱时“提醒”页说明要先去绑定。下面列出登录着的设备，多于一台时可以“让其他设备退出登录”（先确认）。同意对话框里有“已有账号？用邮箱找回”：不管邮箱有没有绑定过，发送后的提示都一样；验证码对了就换成找回的账号（这台设备拿到新令牌，本机缓存的别的账号的内容不带过来）。本机的登录失效（401）时，对话框里说明原因并提示可以用邮箱找回。
 - 条款改版：读回来的账号同意的版本和 `GET /api/terms` 的不一样时，先弹出“条款有更新”（写明这次改了什么），点“同意并继续”后调 `POST /consent` 才进入；也可以在那里直接删除账号。
-- 示例和删除：有账号时没有“恢复示例”（它只在不连服务器的本地演示里出现），“从零开始”要先确认。“我的情况”里有“删除我的账号和全部数据”：确认后调 `DELETE /api/users/:id`，成功（或服务器上已经没有这个账号）后清空 localStorage 里的账号、缓存和未保存标记，回到同意对话框；删除失败时什么都不清，并说明没删成。
-- 助手：`history` 原样保存、原样带回，页面不裁剪。历史被拒（422，说明以 `history` 开头）时清空历史自动重试一次；连续两次其他失败或 413 时清空历史，避免卡死；敏感号码（422）和限流（429）显示服务器的说明，历史保留，原话放回输入框。
+- 示例和删除：没有“恢复示例”，“从零开始”要先确认（清空成空白的概况，不带示例人物的日期）。“我的情况”里有“删除我的账号和全部数据”：确认后调 `DELETE /api/users/:id`，成功（或服务器上已经没有这个账号）后清空 localStorage 里的账号、缓存和未保存标记，回到同意对话框；删除失败时什么都不清，并说明没删成。
+- 助手：页面只发新的一句，不保存、不带回历史；打开时从 `GET /chat` 读回对话记录显示出来（换设备也能看到）。“清空对话记录”先确认，再调 `DELETE /chat`。敏感号码（422）、限流（429）、上一条还在回答（409）显示服务器的说明，原话放回输入框。助手改了概况和进度时，本机没有未保存的修改就读回服务器的内容，有的话下次保存时按上面的规则合并。
 - 助手的咨询草稿：接口返回 `draft` 时，对话里出现一张卡片，写明发给哪几家、要发送的全文，同意的勾默认不勾。用户勾选并点“发送给服务商”后，页面才调 `POST /inquiries`（`consent: true`，摘要就是卡片上显示的文字）。不点就什么都不发。
 - 咨询申请表：页面上显示的就是要发出去的全文（咨询内容、方式、情况说明），发出去的也是这段文字。选的服务商、类别、文字或情况说明一变，同意的勾就取消；没有选中的服务商时表单收起；发送失败后要重新勾。
 - 助手的名单和草稿：`suggest_providers` 和 `create_inquiry` 的结果都带 `disclosure`（服务商付固定的展示费；非士业另说明含推广），系统提示第 8 条要求助手照着说，并给 `promoted` 的服务商标“含推广”。草稿卡片上每家非士业的后面有“含推广”，下面固定写着展示费的说明。`create_inquiry` 和 `POST /inquiries` 一样只认此刻在名单上展示的服务商（批准了还没领取令牌的、免费期过后没付款的都不行）。
@@ -190,6 +213,7 @@ npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给
 - 事件期限：提醒里每条事件期限带法条和官方页面的链接（只接受 `https://` 的地址；高度专门职换工作带契约机关和活动机关两个页面）。短期滞在的人记录孩子出生也有出生届和在留资格取得的期限。记录的事件按当前身份没有登记到期限时，只提示“这里没有登记到对应的期限，请以入管厅或区役所的说明为准”，不说“没有法定期限”；助手的提示词和 `add_event` 的返回也是这个口径。
 - 服务商入驻：申请页（`web/provider-apply.html`）先验证联系邮箱，再填申请（选了士业或不动产才出现登录番号和所属会的栏），要勾同意服务商条款；被拒的原因（保证类用语、敏感号码、格式）显示服务器的说明；提交后显示申请编号。“查看或修改申请”用邮箱的验证码打开，被要求修改时可以改后重新提交，审核完之前可以撤回。管理后台（`web/admin.html`）的令牌只在内存里，士业不选核对方式批准不了（显示服务器的说明）。工作台里“第一次使用或令牌丢了”用联系邮箱领取，新令牌只显示一次、不存进浏览器；登录后显示是否在名单上展示、展示到哪一天、账单（振込先和参考编号）、新咨询通知的开关。首页名单上方固定写着展示费的说明，每家显示所属会和事务所地址，下面有“服务商申请入驻”的链接。
 - 服务商工作台：只有 401 才说“令牌不对，或账号已停用”，连不上和服务器出错分开说明；登录成功但名单读不出来时在名单上方提示并可重试；发送回复、结束咨询失败都在那一条下面说明原因；没发出去的回复草稿在名单刷新后还在。
+- 内容安全策略：页面只从本站加载脚本和样式（`web/*.js`、`web/*.css`），不连外站（原来从 Google Fonts 加载的字体已去掉，用系统字体）；`npm run e2e` 收集每个页面控制台里 CSP 的报错，一条都不能有。
 - 页面里不使用 `innerHTML`：来自服务器、用户、服务商和助手的文字一律用 `textContent` 放进去。
 
 ## 助手调用模型
@@ -200,7 +224,7 @@ npm run billing   # 服务商展示费和新咨询通知跑一轮就退出（给
 - 不发 `temperature`、`top_p`、`top_k`，不发 `tool_choice`（强制调用工具 `any`、`tool` 是 400），发出去的 `messages` 最后一条一定是用户（不能预填助手的话）。`checkRequest` 在发出之前再查一遍，写错了不发。
 - `max_tokens` 默认 8000（思考也算在里面）。回复被截断（`stop_reason` 为 `max_tokens`）时用 16000 重试一次，仍被截断就回“这次的回答太长……”，不给半截回答，被截断的工具调用不执行。
 - 拒答（`stop_reason` 为 `refusal`，HTTP 200）：回一句固定的说法，这一轮不进对话历史（免得下一轮带着同样的内容又被拒），工具已经写进库的改动照常保留；`chat` 的结果里有 `stopReason` 和 `refusal`（`stop_details` 的类别和说明），eval 记下来。没有开服务器端的备用模型（`fallbacks`）：eval 要量的是 Sonnet 5.5 本身，拒答要能看到。`pause_turn`（只有服务器端工具才会有，本助手没有）和其他没见过的 `stop_reason` 回“这次没有成功，请再试一次”。
-- 思考块（`thinking`，默认文字是空的；`redacted_thinking`）：取回答时只看 `text` 块；同一轮的工具循环里助手的回复原样发回（含签名），系统提示在一轮开始时生成一次、整轮不变（接口会核对思考块产生之后系统提示、工具和之前的消息有没有改过，新账号改过就 400；工具改了概况，模型从工具结果里看到）；返回给网页端保存的历史里不留思考块——跨轮重放不是必须的，接口会丢掉读不了的块，而网页端的历史会被裁剪，留着反而可能被拒。
+- 思考块（`thinking`，默认文字是空的；`redacted_thinking`）：取回答时只看 `text` 块；同一轮的工具循环里助手的回复原样发回（含签名），系统提示在一轮开始时生成一次、整轮不变（接口会核对思考块产生之后系统提示、工具和之前的消息有没有改过，新账号改过就 400；工具改了概况，模型从工具结果里看到）；存进服务器的历史里不留思考块——跨轮重放不是必须的，接口会丢掉读不了的块，而历史会被裁剪，留着反而可能被拒。
 - 429、408、409、500 以上（含 529 overloaded）和连不上、超时、200 但响应体读到一半断了或不是 JSON：退避重试（1、2、4、8 秒左右，带抖动），有 `retry-after` 就按它等满；`retry-after` 比肯等的最长时间还长时不提前重试（提前重试只会再被限流），直接报错；`x-should-retry` 说不重试就不重试。每次请求的时限包括读完响应体。
 - 两套设置：eval 用默认值（每次请求 300 秒、最多重试 4 次、每次最多等 60 秒）；聊天接口有人在等，用 `CHAT_LLM_OPTS`（每次 60 秒、最多重试 2 次、每次最多等 15 秒），整轮（含工具循环）另有 120 秒的总时限（`CHAT_DEADLINE_MS`）：到了就中断正在发的请求（`AbortSignal` 一路传到 `fetch`），不再发新的请求、不再执行工具，不替已经没人等的请求改数据。重试完仍然忙或超过总时限，助手接口返回 503（`retry-after` 是接口要求等的秒数，没有就是 30），不是 500。
 - 每一轮的 token 用量（`usage`，含思考的输出 token）随 `chat` 的结果返回，eval 用它估算费用。
@@ -237,7 +261,7 @@ ANTHROPIC_API_KEY=... npm run eval
 npm run e2e
 ```
 
-`e2e/run.js` 在空闲端口上起一个服务器（临时目录里的新数据库），跑 `e2e/browser.js`，跑完关掉并删掉数据库。网页端的行为只有这里在检查，`npm test` 不跑它（`npm test` 只保证网页内嵌的规则和引擎一致），所以改了 `web/` 之后和发布之前都要跑。playwright 不在默认的模块路径上时用 `PLAYWRIGHT_PATH` 指过去。也可以对着已经起好的服务器手动跑：
+`e2e/run.js` 在空闲端口上起一个服务器（临时目录里的新数据库），跑 `e2e/browser.js`，跑完关掉并删掉数据库。网页端的行为只有这里在检查，`npm test` 不跑它（`npm test` 只查接口返回网页要的东西、网页文件里没有规则逻辑），所以改了 `web/` 之后和发布之前都要跑。playwright 不在默认的模块路径上时用 `PLAYWRIGHT_PATH` 指过去。也可以对着已经起好的服务器手动跑：
 
 ```
 PORT=18787 DB_FILE=/tmp/zairyu-e2e.db ADMIN_TOKEN=test-admin ADMIN_TOKENS=e2e:e2e-reviewer-token-0123456789 npm start &
@@ -246,11 +270,11 @@ BASE=http://localhost:18787 ADMIN_TOKEN=test-admin E2E_KEEP_GOING=1 node e2e/bro
 
 这样跑时服务商的几步会失败：它们要用管理员直接入驻（只有 `createApp({ allowDirectProvider: true })` 才开）和不延迟的新咨询通知，这两项不读环境变量，所以服务商的检查只能用 `npm run e2e` 跑。
 
-邮箱那几步的验证码和提醒邮件从 `GET /api/admin/outbox` 读，定时提醒用 `POST /api/admin/reminders/run` 触发，所以服务器要用默认的发件方式（不设 `MAIL_SENDER`）。不需要配置 `ANTHROPIC_API_KEY`：助手接口的返回在浏览器里换成固定内容，其余请求都打到真实的服务器上。每次用新的数据库文件。`E2E_KEEP_GOING=1` 时某一步失败后继续跑完并一并报告。
+邮箱那几步的验证码和提醒邮件从 `GET /api/admin/outbox` 读，定时提醒用 `POST /api/admin/reminders/run` 触发，所以服务器要用默认的发件方式（不设 `MAIL_SENDER`）。不需要配置 `ANTHROPIC_API_KEY`：助手接口（发送）的返回在浏览器里换成固定内容，其余请求都打到真实的服务器上。每次用新的数据库文件。`E2E_KEEP_GOING=1` 时某一步失败后继续跑完并一并报告。
 
 ## 敏感号码过滤
 
-`src/validate.js` 的 `findSensitive` / `assertNoSensitive`，用在四处：咨询摘要（接口和助手草稿）、助手对话（这一轮的消息，以及带回来的历史里的每一段文字：用户的话、助手的话、工具调用的参数、工具结果）、服务商回复、事件备注。命中就返回 422，内容不落库、不转给服务商或模型。
+`src/validate.js` 的 `findSensitive` / `assertNoSensitive`，用在四处：咨询摘要（接口和助手草稿）、助手对话（这一轮的消息；服务器上存着的历史每次转给模型之前也逐段检查：用户的话、助手的话、工具调用的参数、工具结果，有命中的整段丢掉，不报错）、服务商回复、事件备注。命中就返回 422，内容不落库、不转给服务商或模型。
 
 检查分三步：
 

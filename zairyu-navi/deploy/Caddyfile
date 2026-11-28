@@ -1,0 +1,16 @@
+# 反向代理：自动申请和续期 HTTPS 证书（Let's Encrypt），把请求转给应用容器。
+# SITE_DOMAIN 在 deploy/.env 里设（例如 navi.example.jp），域名的 A/AAAA 记录要先指向这台机器，80 和 443 端口要能从外面连进来。
+{$SITE_DOMAIN} {
+	encode zstd gzip
+
+	# 每个请求一个编号，应用的日志和响应头里用同一个（应用在 TRUST_PROXY=1 时才信这个头）
+	reverse_proxy app:8787 {
+		header_up X-Request-Id {http.request.uuid}
+		# 应用停机收尾或没就绪时（/api/ready 不是 200）不往那边转
+		health_uri /api/ready
+		health_interval 10s
+		health_timeout 3s
+	}
+
+	# 不写 log 指令：Caddy 不记访问日志（完整地址里可能有退订令牌）；访问日志由应用自己写，见 docs/ops.md
+}

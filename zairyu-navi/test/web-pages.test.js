@@ -6,7 +6,8 @@ const path = require('node:path');
 const { hasClaims } = require('../src/validate');
 const { PROVIDER_TERMS_VERSION } = require('../src/server');
 
-const web = (f) => fs.readFileSync(path.join(__dirname, '..', 'web', f), 'utf8');
+// HTML 连同它引用的本站脚本（CSP 要求脚本放在单独的文件里）
+const web = (f) => require('./web-source').pageSource(f);
 // 样式表里的 width:100% 不是文字，检查用语之前去掉
 const noStyle = (h) => h.replace(/<style>[\s\S]*?<\/style>/g, '');
 const PAGES = ['provider-apply.html', 'admin.html', 'provider-terms.html'];

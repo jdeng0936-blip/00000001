@@ -213,7 +213,7 @@ test('审核要对上看过的版本：申请人重新提交后，拿旧版本�
     assert.equal(ok.status, 200);
     assert.equal(s.app.store.getProvider(ok.body.providerId).licenseNo, '87654321');
     // 管理页带上版本
-    const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'admin.html'), 'utf8');
+    const html = require('./web-source').pageSource('admin.html');
     assert.equal((html.match(/reviewKey:a\.reviewKey/g) || []).length, 4);
   } finally { await s.stop(); }
 });
@@ -240,7 +240,7 @@ test('助手：草稿只认在名单上的服务商（批准了没领取令牌�
     assert.match(sm.disclosure, /含推广/); assert.match(sm.note, /含推广/);
     const dm = execTool('create_inquiry', { category: 'mobile', summary: '想办一张电话卡。', providerIds: [m.providerId] }, ctx);
     assert.equal(dm.draft.providers[0].promoted, true);
-    // 系统提示里有说明展示费、标含推广的规则（网页内嵌的那份由 web-sync 测试保证一致）
+    // 系统提示里有说明展示费、标含推广的规则（网页不再内嵌提示词，助手只走服务器）
     const { SYS } = require('../src/engine')({});
     assert.match(SYS, /disclosure/); assert.match(SYS, /含推广/);
     // 名单页和草稿卡片的“含推广”都按类别定
@@ -286,6 +286,6 @@ test('文字和代码一致：条款写明资料变更找运营者、全部邮�
   assert.match(fs.readFileSync(path.join(__dirname, '..', 'web', 'privacy.html'), 'utf8'), /90 天/);
   const server = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
   assert.doesNotMatch(server, /推广佣金/);
-  const page = fs.readFileSync(path.join(__dirname, '..', 'web', 'provider.html'), 'utf8');
+  const page = require('./web-source').pageSource('provider.html');
   assert.match(page, /reply-tip/);
 });

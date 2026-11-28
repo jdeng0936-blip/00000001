@@ -1,0 +1,20 @@
+:root{color-scheme:light dark}
+body{margin:0;font:15px/1.7 system-ui,-apple-system,"PingFang SC","Hiragino Sans GB","Noto Sans SC",sans-serif;background:#f6f5f1;color:#1d1d1b}
+main{max-width:900px;margin:0 auto;padding:20px 16px 64px}
+h1{font-size:22px;margin:6px 0}h2{font-size:17px;margin:6px 0}
+p{margin:6px 0}small,.muted{color:#5d5d57}
+label{display:block;margin:8px 0 2px}
+textarea,input,button,select{font:inherit}textarea,input,select{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #bdbbb2;border-radius:8px;background:#fff;color:inherit}
+button{padding:6px 12px;border-radius:8px;border:1px solid #0f5f5a;background:#0f5f5a;color:#fff;cursor:pointer}button.ghost{background:transparent;color:#0f5f5a}
+.card{background:#fff;border:1px solid #d9d7cf;border-radius:10px;padding:10px 12px;margin:10px 0}
+.tag{display:inline-block;font-size:12px;padding:0 8px;border-radius:10px;border:1px solid #bdbbb2;margin-right:6px}
+.err{color:#a3261b}
+.grid{display:grid;grid-template-columns:1fr 1fr 2fr;gap:8px}
+@media (max-width:600px){.grid{grid-template-columns:1fr}}
+/* 手机：点按目标至少 44px；输入框 16px（小于 16px 时 iPhone 点进去会放大页面） */
+@media (max-width:640px){textarea,input,select{font-size:16px;min-height:44px}button{min-height:44px}}
+:focus-visible{outline:2px solid #0f5f5a;outline-offset:2px}
+@media (prefers-color-scheme:dark){body{background:#161614;color:#ecebe6}.card,textarea,input,select{background:#1f1f1c;border-color:#3a3a35}small,.muted{color:#a9a79f}button.ghost{color:#6fc9c1;border-color:#6fc9c1}.err{color:#ff8f84}}
+/* 原来写在标签上的 style="…"（CSP 不允许内联样式） */
+.mw220{max-width:220px !important}
+@media (prefers-color-scheme:dark){:focus-visible{outline-color:#6fc9c1}}

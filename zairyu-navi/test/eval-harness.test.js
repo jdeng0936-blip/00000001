@@ -143,7 +143,8 @@ test('拒答（stop_reason refusal，HTTP 200）：给用户固定的说法，�
     const u = await (await fetch(base + '/api/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ accept: app.termsVersion }) })).json();
     const res = await fetch(base + '/api/users/' + u.id + '/chat', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + u.token }, body: JSON.stringify({ message: '一个会被拒的问题' }) });
     const b = await res.json();
-    assert.equal(res.status, 200); assert.equal(b.text, A.REFUSAL_TEXT); assert.deepEqual(b.history, []);
+    assert.equal(res.status, 200); assert.equal(b.text, A.REFUSAL_TEXT); assert.equal(b.history, undefined, '历史不再返回给网页');
+    assert.deepEqual(app.store.getChat(u.id), [], '拒答的这一轮也不存进服务器上的历史');
   } finally { app.server.close(); app.store.close(); }
 });
 

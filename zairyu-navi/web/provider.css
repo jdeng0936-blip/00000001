@@ -1,0 +1,16 @@
+:root{color-scheme:light dark}
+body{margin:0;font:16px/1.75 system-ui,-apple-system,"PingFang SC","Hiragino Sans GB","Noto Sans SC",sans-serif;background:#f6f5f1;color:#1d1d1b}
+main{max-width:720px;margin:0 auto;padding:24px 18px 64px}
+h1{font-size:24px;margin:8px 0 4px}h2{font-size:18px;margin:28px 0 6px}
+p,li{margin:6px 0}small,.muted{color:#5d5d57}
+a{color:#0f5f5a}table{border-collapse:collapse;width:100%}td,th{border:1px solid #d9d7cf;padding:6px 8px;text-align:left;vertical-align:top}
+.draft{border:1px solid #b9770e;background:#fdf3dd;color:#5a3a05;padding:10px 12px;border-radius:8px}
+textarea,input,button,select{font:inherit}textarea,input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #bdbbb2;border-radius:8px;background:#fff;color:inherit}
+button{padding:8px 14px;border-radius:8px;border:1px solid #0f5f5a;background:#0f5f5a;color:#fff;cursor:pointer}button.ghost{background:transparent;color:#0f5f5a}
+summary{cursor:pointer;padding:10px 0}
+:focus-visible{outline:2px solid #0f5f5a;outline-offset:2px}
+.card{background:#fff;border:1px solid #d9d7cf;border-radius:10px;padding:12px 14px;margin:12px 0}
+@media (prefers-color-scheme:dark){body{background:#161614;color:#ecebe6}.card,textarea,input{background:#1f1f1c;border-color:#3a3a35}td,th{border-color:#3a3a35}small,.muted{color:#a9a79f}a{color:#6fc9c1}.draft{background:#3a2c0c;color:#f3deb0;border-color:#8a6a1c}button.ghost{color:#6fc9c1;border-color:#6fc9c1}}
+/* 原来写在标签上的 style="…"（CSP 不允许内联样式） */
+#cl-token{word-break:break-all !important}
+@media (prefers-color-scheme:dark){:focus-visible{outline-color:#6fc9c1}}

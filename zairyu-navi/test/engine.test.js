@@ -351,13 +351,6 @@ test('事件：每条期限规则都带法条和官方链接，并带到提醒�
   for (const r of rem) { assert.ok('src' in r && 'date' in r && r.d instanceof Date); if (r.tag !== '事件') assert.equal(r.src, null); }
 });
 
-test('网页内嵌的日期工具函数和 src/engine.js 一致', () => {
-  const blocks = (src) => { const out = {}; for (const l of src.split('\n')) { const m = /^function ([\w$]+)/.exec(l); if (m) out[m[1]] = l.trim(); } return out; };
-  const web = blocks(fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8')), en = blocks(fs.readFileSync(ENGINE, 'utf8'));
-  for (const n of ['jstDay', 'D', 'ymd', 'iso', 'addDays', 'addMonths', 'addYears', 'fmt', 'days', 'yearsBetween', 'y1', 'isDate']) { assert.ok(web[n] && en[n], n); assert.equal(web[n], en[n], n + ' 在网页和引擎里不一致'); }
-  assert.equal(web.today, 'function today(){return jstDay(new Date())}');
-});
-
 test('事件：短期滞在记录孩子出生也有出生届和在留资格取得的期限；别的事件没有；人在中国的都没有', () => {
   const birth = [{ type: 'birth', date: '2026-11-01' }];
   const sh = at('2026-11-27', { status: 'short' }, birth).reminders();

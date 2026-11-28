@@ -11,6 +11,9 @@
     "remind": "node src/scheduler.js",
     "billing": "node src/billing.js",
     "eval": "node eval/run.js",
-    "eval:dry": "node eval/run.js --dry"
+    "eval:dry": "node eval/run.js --dry",
+    "backup": "node tools/backup.js",
+    "backup:verify": "node tools/backup.js --verify",
+    "loadtest": "node tools/loadtest.js"
   }
 }

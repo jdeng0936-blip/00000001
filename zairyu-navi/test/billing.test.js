@@ -462,6 +462,6 @@ test('工作台的免费期说明：第一期从 1 日起时写整月，否则�
     assert.equal(me.issueDays, 10);
     assert.deepEqual(me.free, { from: '2026-12-01', until: '2026-12-31', days30: true, firstBillStart: '2027-01-01', firstProrated: false });
   } finally { await s.stop(); }
-  const page = fs.readFileSync(path.join(__dirname, '..', 'web', 'provider.html'), 'utf8');
+  const page = require('./web-source').pageSource('provider.html');
   assert.doesNotMatch(page, /14 天开出/); assert.match(page, /firstProrated/); assert.match(page, /days30/);
 });

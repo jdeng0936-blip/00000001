@@ -1,7 +1,7 @@
 // 端到端：真实浏览器打开网页，数据应当存到服务器，换一个“设备”带同一账号能读回来。
 // 运行：npm run e2e（e2e/run.js 起好服务器再跑这里）。服务器要开 allowDirectProvider（前面几步直接入驻服务商）、ADMIN_TOKEN 和 ADMIN_TOKENS 里的 e2e 要和这里的一致，
 // 新咨询通知不延迟；这几项只能用 createApp 的参数设，所以对着 npm start 起的服务器跑不了服务商的那几步。
-// 需要已安装 playwright。助手没有配置密钥也能跑：助手接口的返回在浏览器里用 page.route 替换成固定内容，
+// 需要已安装 playwright。助手没有配置密钥也能跑：助手接口（发送）的返回在浏览器里用 page.route 替换成固定内容，
 // 其余请求（发咨询、删账号、保存等）都打到真实的服务器上。
 // E2E_KEEP_GOING=1 时某一步失败后继续跑后面的步骤，最后一并报告（用来确认新加的检查在旧页面上确实会失败）。
 const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
@@ -17,6 +17,10 @@ async function step(name, fn) {
 }
 (async () => {
   const b = await chromium.launch(); const errs = [];
+  // 内容安全策略（CSP）：浏览器拦下内联脚本、内联样式、外站资源时会在控制台报一条。每个上下文里的每个页面都收集起来，最后一步要求一条都没有。
+  const cspErrs = [];
+  const newContext = b.newContext.bind(b);
+  b.newContext = async (o) => { const c = await newContext(o); c.on('page', (pg) => pg.on('console', (m) => { if (/Content Security Policy|Refused to (load|execute|apply|connect|frame)/i.test(m.text())) cspErrs.push(pg.url() + '：' + m.text().slice(0, 200)); })); return c; };
   const ctx = await b.newContext({ viewport: { width: 390, height: 844 } });
   const p = await ctx.newPage(); p.on('pageerror', (e) => errs.push(e.message));
   let dialogs = [], acceptDialog = true;
@@ -54,8 +58,9 @@ async function step(name, fn) {
     await p.evaluate(() => complete('1-1', true)); await p.waitForTimeout(800);
     assert.deepEqual((await get()).done, { '1-1': true });
     plan = await json(`/api/users/${acct.id}/plan`, { headers: h });
-    const uiNext = await p.evaluate(() => { const n = nextQuest(compute()); return n && n.id; });
-    assert.equal(plan.next.id, uiNext, '服务器算出的下一步和页面显示的应当一样');
+    // 页面不自己算：显示的下一步就是服务器算的
+    await p.waitForFunction((id) => VIEW && VIEW.next === id, plan.next.id, { timeout: 5000 });
+    assert.ok((await p.innerText('#next')).includes(plan.next.title), '页面显示的下一步就是服务器算出的那一件');
   });
 
   await step('上线规则：资料整理中的节点只给官方链接；待核实的罚则不显示数字', async () => {
@@ -74,12 +79,25 @@ async function step(name, fn) {
     await p.evaluate(() => { SEL = null; renderAll(); });
   });
 
-  await step('有账号时不提供“恢复示例”，有“删除我的账号和全部数据”', async () => {
+  await step('选方案：服务器按情况排好的方案，每套写着核对日期；换条件后重新排', async () => {
+    await go('#plans');
+    await p.waitForFunction(() => document.querySelectorAll('#pl-list .card').length > 3, null, { timeout: 5000 });
+    const first = await p.innerText('#pl-list .card');
+    assert.match(first, /核对日期：\d{4}年\d{1,2}月\d{1,2}日/, '方案卡片上有核对日期');
+    assert.match(await p.innerText('#pl-note'), /人民币按2026年11月24日的人民币汇率中间价折算/);
+    const srv = await json(`/api/users/${acct.id}/options/phone?usage=max`, { headers: h });
+    await p.selectOption('#pq-u', 'max');
+    await p.waitForFunction((n) => document.querySelector('#pl-list .card h3').textContent === n, srv.options[0].name, { timeout: 5000 });
+    const shownDate = /核对日期：(\d+)年(\d+)月(\d+)日/.exec(await p.innerText('#pl-list .card'));
+    assert.equal([shownDate[1], shownDate[2].padStart(2, '0'), shownDate[3].padStart(2, '0')].join('-'), srv.options[0].checkedOn, '显示的就是数据文件里的核对日期');
+    await go('#route');
+  });
+
+  await step('没有“恢复示例”（没有演示模式），有“删除我的账号和全部数据”', async () => {
     await go('#route'); await p.evaluate(() => { document.getElementById('prof').open = true; });
-    assert.equal(await p.isVisible('#reset'), false, '有账号时不应当能点“恢复示例”');
+    assert.equal(await p.locator('#reset').count(), 0, '不应当有“恢复示例”');
     assert.equal(await p.isVisible('#del-account'), true, '应当有删除账号的按钮');
-    // 即使脚本去点，也不能把示例人物写到服务器上
-    await p.evaluate(() => document.getElementById('reset').click()); await p.waitForTimeout(700);
+    await p.waitForTimeout(300);
     const u = await get();
     if (u.profile.arrive === '2019-04-01') { // 旧页面：示例已经盖上去了。恢复原样，让后面的步骤接着跑
       await p.evaluate(() => { P.arrive = ''; P.work = ''; P.trips = []; P.status = 'work'; P.entry = '2026-11-18'; P.addr = '2026-11-20'; P.ins = true; DONE = { '1-1': 1 }; save(); bind(); renderAll(); }); await p.waitForTimeout(700);
@@ -98,9 +116,15 @@ async function step(name, fn) {
   });
 
   await step('高度专门职的换工作期限带两个官方页面；短期滞在记录孩子出生有出生届的期限；没有登记到期限时不下“没有法定期限”的结论', async () => {
-    const setStatus = async (x) => { await p.evaluate((v) => { P.status = v; save(); bind(); renderAll(); }, x); await p.waitForTimeout(300); };
+    // 改身份：等服务器存上、页面按新的身份重新读完提醒
+    const setStatus = async (x) => {
+      await p.evaluate((v) => { P.status = v; save(); bind(); }, x);
+      const t0 = Date.now(); while ((await get()).profile.status !== x && Date.now() - t0 < 5000) await p.waitForTimeout(100);
+      await p.waitForFunction(() => document.getElementById('sync-state').hidden, null, { timeout: 5000 }); await p.waitForTimeout(300);
+    };
     const record = async (type, date) => { await p.selectOption('#ev-type', type); await p.fill('#ev-date', date); await p.click('#ev-add'); await p.waitForFunction(() => /已记下/.test(document.getElementById('toast').textContent), null, { timeout: 5000 }); return p.innerText('#toast'); };
     await setStatus('hsp'); await go('#reminders');
+    await p.waitForSelector('#rem a[href*="nyuukokukanri10_00014"]', { timeout: 5000 });
     assert.equal(await p.locator('#rem a[href*="nyuukokukanri10_00015"]').count(), 1, '契约机关届出的页面');
     assert.equal(await p.locator('#rem a[href*="nyuukokukanri10_00014"]').count(), 1, '高度专门职还应当带活动机关届出的页面');
     await setStatus('short'); await p.evaluate(() => { document.getElementById('toast').textContent = ''; });
@@ -160,19 +184,19 @@ async function step(name, fn) {
     assert.equal((await provInq(provB)).length, 0, '没选的服务商不应当收到');
   });
 
-  // 之后的助手请求都换成固定内容；chat 是当前这一轮要返回的东西
+  // 之后的助手请求（发送）都换成固定内容；chat 是当前这一轮要返回的东西。读取和清空对话记录（GET、DELETE）照常打到服务器
   const chatReqs = []; let chat = null;
   await p.route('**/api/users/*/chat', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
     const body = JSON.parse(route.request().postData()); chatReqs.push(body);
     const r = chat(body); await route.fulfill({ status: r.status || 200, contentType: 'application/json', body: JSON.stringify(r.body) });
   });
   const ask = async (q) => { await p.evaluate((x) => ask(x), q); await p.waitForFunction(() => busy === false, null, { timeout: 8000 }); };
   const lastAns = () => p.evaluate(() => [...document.querySelectorAll('#chat .msg.a .body')].pop().textContent);
-  const turn = (body, text) => body.history.concat([{ role: 'user', content: body.message }, { role: 'assistant', content: text }]);
 
   await step('助手的咨询草稿：显示成卡片，同意的勾默认不勾，用户点了发送才发出去', async () => {
     const summary = '想请行政书士看一下在留期间更新的材料。\n在留期满日：2027-11-20。<b>不是标签</b>';
-    chat = (body) => ({ body: { text: '草稿准备好了，请在下面核对，同意后由你点发送。', category: null, toolCalls: [{ name: 'create_inquiry', ok: true }], history: turn(body, '草稿准备好了'),
+    chat = (body) => ({ body: { text: '草稿准备好了，请在下面核对，同意后由你点发送。', category: null, toolCalls: [{ name: 'create_inquiry', ok: true }],
       draft: { category: 'gyosei', nodeId: '4-1', summary, providerIds: [provA.id, provB.id], providers: [{ id: provA.id, name: NAME_A }, { id: provB.id, name: NAME_B }] } } });
     const before = (await json(`/api/users/${acct.id}/inquiries`, { headers: h })).length;
     await p.evaluate(() => openDrawer()); await ask('帮我问问行政书士');
@@ -203,7 +227,7 @@ async function step(name, fn) {
   });
 
   await step('助手的咨询草稿：非士业的服务商在卡片上标“含推广”', async () => {
-    chat = (body) => ({ body: { text: '草稿准备好了。', category: null, toolCalls: [{ name: 'create_inquiry', ok: true }], history: turn(body, '草稿准备好了'),
+    chat = (body) => ({ body: { text: '草稿准备好了。', category: null, toolCalls: [{ name: 'create_inquiry', ok: true }],
       draft: { category: 'edu', nodeId: null, summary: '想了解在职读硕士的课程。', providerIds: ['00000000-0000-4000-8000-000000000001'], providers: [{ id: '00000000-0000-4000-8000-000000000001', name: '某学校<i>x</i>' }] } } });
     await p.evaluate(() => openDrawer()); await ask('帮我问问学校');
     const card = p.locator('#chat .draft:not(.sent)');
@@ -215,37 +239,45 @@ async function step(name, fn) {
     await p.evaluate(() => closeDrawer());
   });
 
-  await step('助手对话：服务器返回的历史原样带回，连续35轮都不在中间截断；历史被拒时清空重试；敏感号码的拒绝原因显示给用户', async () => {
-    // 模拟服务器：每一轮（含一次工具调用）加 4 条，超过 20 条就按整轮裁掉最早的
-    let expect = null;
-    chat = (body) => {
-      let hst = body.history.concat([{ role: 'user', content: body.message }, { role: 'assistant', content: [{ type: 'tool_use', id: 't' + chatReqs.length, name: 'get_plan', input: {} }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't' + chatReqs.length, content: '{}' }] }, { role: 'assistant', content: '好的' }]);
-      while (hst.length > 20) hst = hst.slice(4);
-      expect = hst; return { body: { text: '好的', category: null, toolCalls: [], draft: null, history: hst } };
-    };
-    await ask('第 0 轮');
-    for (let i = 1; i <= 35; i++) {
-      const want = expect; await ask('第 ' + i + ' 轮');
-      assert.deepEqual(chatReqs[chatReqs.length - 1].history, want, '第 ' + i + ' 轮带回的历史应当和上一轮服务器返回的一模一样');
-      assert.equal(await lastAns(), '好的', '第 ' + i + ' 轮应当成功');
-    }
-    // 历史被服务器拒绝：清空后自动重试一次
-    const n0 = chatReqs.length; let first = true;
-    chat = (body) => { if (first) { first = false; return { status: 422, body: { error: 'history 无效（第 1 条须为用户的文字消息）' } }; } return { body: { text: '重新开始了', category: null, toolCalls: [], draft: null, history: turn(body, '重新开始了') } }; };
-    await ask('再问一次');
-    assert.equal(chatReqs.length, n0 + 2, '应当重试一次'); assert.deepEqual(chatReqs[n0 + 1].history, [], '重试时历史应当清空');
-    assert.equal(await lastAns(), '重新开始了');
-    // 消息里有敏感号码：把服务器的说明显示出来，历史保留
+  await step('助手对话：页面只发新的一句（不带历史）；被拒、限流、上一条还在回答的说明显示给用户，原话放回输入框；对话记录从服务器读回；清空要先确认', async () => {
+    await p.evaluate(() => openDrawer());
+    chat = () => ({ body: { text: '好的', category: 'A', toolCalls: [], draft: null } });
+    const n0 = chatReqs.length;
+    for (let i = 1; i <= 3; i++) { await ask('第 ' + i + ' 轮'); assert.equal(await lastAns(), '好的'); }
+    for (const r of chatReqs.slice(n0)) assert.deepEqual(Object.keys(r), ['message'], '只发新的一句，没有 history');
+    assert.match(chatReqs[chatReqs.length - 1].message, /第 3 轮$/);
+    // 消息里有敏感号码：把服务器的说明显示出来，原话放回输入框
     chat = () => ({ status: 422, body: { error: '消息里疑似含有护照号。为了保护你，这里不接收这类号码，请删掉后再发' } });
     await ask('我的护照号是 E12345678');
     assert.match(await lastAns(), /疑似含有护照号.*请删掉后再发/, '应当显示被拒的原因');
-    // 太频繁：显示服务器的说明，历史不清空
+    assert.equal(await p.inputValue('#ask-t'), '我的护照号是 E12345678', '原话放回输入框');
+    await p.fill('#ask-t', '');
     chat = () => ({ status: 429, body: { error: '提问太频繁，请在30秒后再试' } });
-    await ask('再问'); assert.match(await lastAns(), /提问太频繁/);
-    chat = (body) => ({ body: { text: '还记得', category: null, toolCalls: [], draft: null, history: turn(body, '还记得') } });
-    await ask('还记得吗'); assert.equal(chatReqs[chatReqs.length - 1].history.length, 2, '被拒和限流都不应当清空历史');
+    await ask('再问'); assert.match(await lastAns(), /提问太频繁/); await p.fill('#ask-t', '');
+    chat = () => ({ status: 409, body: { error: '上一条还在回答，请等它答完再问' } });
+    await ask('又问'); assert.match(await lastAns(), /上一条还在回答/); await p.fill('#ask-t', '');
+    // 503 有两种：助手忙（显示服务器的说明，原话放回）；助手没配置（不显示内部的配置名，说明可以先做什么）
+    chat = () => ({ status: 503, body: { error: '助手现在忙不过来，请过一会儿再试' } });
+    await ask('忙吗'); assert.match(await lastAns(), /忙不过来.*放回输入框/); assert.equal(await p.inputValue('#ask-t'), '忙吗'); await p.fill('#ask-t', '');
+    chat = () => ({ status: 503, body: { error: '助手还没有配置（缺少 ANTHROPIC_API_KEY）' } });
+    await ask('配了吗'); assert.match(await lastAns(), /还没有开通.*找人帮忙/); assert.doesNotMatch(await lastAns(), /API_KEY/);
+    // 刷新页面：对话记录从服务器读回来（这里用固定内容代替服务器上存的）
+    await p.route('**/api/users/*/chat', (route) => route.request().method() === 'GET' ? route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ messages: [{ role: 'user', text: '住民登记要带什么？' }, { role: 'assistant', text: '带在留卡和护照。<b>不是标签</b>', category: 'A' }] }) }) : route.fallback());
+    await p.reload(); await apiReady(p);
+    const shown = await p.evaluate(() => [...document.querySelectorAll('#chat .msg')].map((m) => m.textContent));
+    assert.ok(shown.some((t) => t === '住民登记要带什么？'), '用户说过的话'); assert.ok(shown.some((t) => t.includes('流程说明') && t.includes('带在留卡和护照。<b>不是标签</b>')), '助手的回答和类别，标签原样显示');
+    assert.equal(await p.locator('#chat b').count(), 0);
+    await p.unroute('**/api/users/*/chat');
+    // 清空对话记录：先确认，确认后服务器上的记录删掉，对话区只剩开头的招呼
+    await p.evaluate(() => openDrawer());
+    dialogs = []; acceptDialog = false; await p.click('#d-clear'); acceptDialog = true;
+    assert.equal(dialogs.length, 1, '清空之前先确认'); assert.ok((await p.locator('#chat .msg').count()) > 1, '取消时不清空');
+    await p.click('#d-clear');
+    await p.waitForFunction(() => document.querySelectorAll('#chat .msg').length === 1, null, { timeout: 5000 });
+    assert.deepEqual(await json(`/api/users/${acct.id}/chat`, { headers: h }), { messages: [] });
+    await p.evaluate(() => closeDrawer());
   });
-  await p.unroute('**/api/users/*/chat');
+  await p.unroute('**/api/users/*/chat').catch(() => {});
 
   await step('助手没配置时，页面给出明确提示', async () => {
     await ask('住民登记要带什么？');
@@ -307,6 +339,39 @@ async function step(name, fn) {
     await p2.goto(base + '/'); await apiReady(p2);
     assert.equal(await p2.evaluate(() => P.status), 'work'); assert.equal(await p2.evaluate(() => !!DONE['1-1']), true);
     await ctx2.close();
+  });
+
+  await step('两台设备同时修改：改不同的项，两边的修改都留下；改同一项，以后存的那台为准并提示', async () => {
+    const ctx2 = await b.newContext(); const p2 = await ctx2.newPage(); p2.on('pageerror', (e) => errs.push(e.message));
+    await p2.addInitScript((a) => localStorage.setItem('zairyu-account', JSON.stringify(a)), acct);
+    await p2.goto(base + '/'); await apiReady(p2);
+    const before = await get();
+    const saved = async (page) => { await page.waitForFunction(() => document.getElementById('sync-state').hidden && !localStorage.getItem('zairyu-unsaved'), null, { timeout: 8000 }); };
+    // 这台改在留期满日；另一台（读到的还是旧版本）勾“以永驻为目标”
+    await go('#route'); await p.evaluate(() => { document.getElementById('prof').open = true; });
+    await p.fill('#f-exp', '2027-11-20'); await p.dispatchEvent('#f-exp', 'change'); await saved(p);
+    await p2.evaluate(() => { document.getElementById('prof').open = true; });
+    await p2.setChecked('#f-pr', !before.profile.pr); await saved(p2);
+    let u = await get();
+    assert.equal(u.profile.exp, '2027-11-20', '先存的那台改的还在'); assert.equal(u.profile.pr, !before.profile.pr, '后存的那台改的也存上了');
+    assert.equal(u.version, before.version + 2);
+    assert.equal(await p2.inputValue('#f-exp'), '2027-11-20', '后存的那台合并后显示了另一台改的');
+    // 同一项：另一台先把身份改成留学，这台（版本已经过时）改成永住者的配偶
+    await p2.selectOption('#f-status', 'student'); await saved(p2);
+    await p.evaluate(() => { document.getElementById('toast').textContent = ''; });
+    await p.selectOption('#f-status', 'spouse'); await saved(p);
+    u = await get();
+    assert.equal(u.profile.status, 'spouse', '后存的那台刚改的为准');
+    assert.equal(u.profile.pr, !before.profile.pr, '另一台改的别的项没被盖掉');
+    await p.waitForFunction(() => /另一台设备也改了同样的项（当前身份）/.test(document.getElementById('toast').textContent), null, { timeout: 5000 });
+    // 另一台刷新后看到合并的结果
+    await p2.reload(); await apiReady(p2);
+    assert.equal(await p2.evaluate(() => P.status), 'spouse');
+    await ctx2.close();
+    // 恢复原样，后面的步骤接着用
+    await p.evaluate((x) => { P.status = x.status; P.exp = x.exp; P.pr = x.pr; save(); bind(); }, before.profile); await saved(p);
+    u = await get();
+    assert.deepEqual([u.profile.status, u.profile.exp, u.profile.pr], [before.profile.status, before.profile.exp, before.profile.pr]);
   });
 
   await step('打开页面时服务器出错（500）：账号留着，显示重试，重试后读回原来的内容', async () => {
@@ -460,7 +525,7 @@ async function step(name, fn) {
     assert.equal(await p.isChecked('#rm-mail-on'), false, '默认是关的');
     assert.match(await p.innerText('#rm-mail'), /期限前 7 天、前 1 天和当天各发一封/);
     assert.match(await p.innerText('#rm-mail-state'), /还没有打开。绑定的邮箱是 e\*\*\*@example\.com/);
-    assert.equal(await p.isVisible('#au-push-row'), false, '连着服务器时不显示演示用的“邮件提醒”');
+    assert.equal(await p.locator('#au-push-row, #au-mail, #au-cal').count(), 0, '没有演示用的“授权”和“邮件提醒”的勾');
     assert.equal((await json(E, { headers: h })).remindOptIn, false);
     // 没打开时跑定时任务：不发
     const run = async () => (await fetch(base + '/api/admin/reminders/run', { method: 'POST', headers: adm })).json();
@@ -758,6 +823,175 @@ async function step(name, fn) {
     await pad.close(); await pw.close(); await cu.close();
   });
 
+  // 无障碍和手机布局：e2e/a11y.js 在浏览器里查（不加依赖）。每个页面、每种状态在手机（390×844）和电脑（1280×800）、浅色和深色下各查一遍，
+  // 有问题就列出来（哪个元素、量到多少、要求多少）。截图放在 /tmp/e2e-a11y-*.png。
+  await step('无障碍和手机布局：所有页面在手机和电脑、浅色和深色下都没有横向滚动；点按目标、字号、标签、对比度（WCAG AA）、标题顺序和对话框都合格', async () => {
+    const { audit } = require('./a11y');
+    // 工作台要有一条咨询（才有回复框）：用接口建一个账号发给 provA
+    const terms = await json('/api/terms');
+    const u = await json('/api/users', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ accept: terms.version }) });
+    const uh = { authorization: 'Bearer ' + u.token, 'content-type': 'application/json' };
+    const sent = await fetch(`${base}/api/users/${u.id}/inquiries`, { method: 'POST', headers: uh, body: JSON.stringify({ consent: true, category: 'gyosei', providerIds: [provA.id], summary: '想咨询在留期间更新。' }) });
+    assert.equal(sent.status, 201, '建咨询');
+    const problems = [];
+    for (const [w, hgt, scheme] of [[390, 844, 'light'], [1280, 800, 'light'], [390, 844, 'dark'], [1280, 800, 'dark']]) {
+      const mobile = w < 500, tag = scheme + '-' + w;
+      const c = await b.newContext({ viewport: { width: w, height: hgt }, colorScheme: scheme });
+      const x = await c.newPage(); x.on('pageerror', (e) => errs.push(e.message)); x.on('dialog', (d) => d.accept());
+      await x.route('**/api/users/*/chat', (r) => r.request().method() !== 'POST' ? r.continue() : r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ text: '草稿准备好了，请核对。', category: null, toolCalls: [], draft: { category: 'gyosei', summary: '想咨询在留期间更新。', providerIds: [provA.id], providers: [{ id: provA.id, name: NAME_A }] } }) }));
+      const check = async (name, shot) => {
+        const r = await audit(x, { mobile });
+        r.forEach((t) => problems.push(tag + ' ' + name + '：' + t));
+        if (shot) await x.screenshot({ path: '/tmp/e2e-a11y-' + tag + '-' + name + '.png', fullPage: true });
+      };
+      await x.goto(base + '/'); await x.waitForSelector('#consent-ok', { timeout: 5000 });
+      await check('consent', true);
+      await x.click('#recover-open'); await check('consent-recover');
+      await x.click('#consent-ok'); await apiReady(x);
+      await x.evaluate(() => { P.status = 'work'; P.entry = '2026-11-18'; P.addr = '2026-11-20'; P.trips = [['2026-01-02', '2026-01-10']]; save(); bind(); renderAll(); });
+      await x.waitForFunction(() => VIEW && VIEW.done === 0 && document.querySelectorAll('.node').length > 5, null, { timeout: 5000 });
+      for (const v of ['route', 'plans', 'city', 'docs', 'reminders', 'pr-check', 'providers']) {
+        await x.evaluate((h) => { location.hash = h; }, '#' + v);
+        if (v === 'route') { await x.evaluate(() => { document.getElementById('prof').open = true; document.querySelector('#detail details').open = true; }); await x.waitForSelector('#em-addr', { timeout: 5000 }); }
+        if (v === 'plans') await x.waitForFunction(() => document.querySelectorAll('#pl-list .card').length > 2, null, { timeout: 5000 });
+        if (v === 'docs') { await x.evaluate(() => routeSheet()); }
+        if (v === 'reminders') await x.waitForSelector('#ev-add', { timeout: 5000 });
+        if (v === 'providers') { await x.selectOption('#pv-cat', 'gyosei'); await x.waitForFunction(() => document.querySelectorAll('#pv-list input[type=checkbox]').length > 0, null, { timeout: 5000 }); await x.locator('#pv-list input[type=checkbox]').first().check(); }
+        await check(v, v === 'route' || v === 'providers');
+      }
+      await x.evaluate(() => openDrawer()); await x.fill('#ask-t', '帮我准备咨询'); await x.click('#ask-b');
+      await x.waitForSelector('#chat .draft', { timeout: 5000 });
+      await check('drawer', true);
+      for (const pg of ['terms', 'privacy', 'provider-terms', 'provider-apply']) { await x.goto(base + '/' + pg + '.html'); await x.waitForLoadState('load'); await check(pg, pg === 'provider-apply'); }
+      await x.goto(base + '/provider.html'); await x.click('#claim-box summary'); await check('provider-login');
+      await x.fill('#tok', provA.token); await x.click('#go'); await x.waitForSelector('#list textarea', { timeout: 5000 });
+      await check('provider', true);
+      await x.goto(base + '/admin.html'); await check('admin-login');
+      await x.fill('#adm-token', REVIEWER); await x.click('#adm-go'); await x.waitForSelector('#app:not([hidden])', { timeout: 5000 });
+      await x.selectOption('#app-status', ''); await x.waitForSelector('#apps .card', { timeout: 5000 });
+      await check('admin-apps', true);
+      await x.click('#tab-providers'); await x.waitForSelector('#providers .card', { timeout: 5000 }); await check('admin-providers');
+      await x.click('#tab-invoices'); await x.selectOption('#inv-status', ''); await x.waitForTimeout(300); await check('admin-invoices');
+      await c.close();
+    }
+    assert.deepEqual(problems, [], '无障碍和手机布局的问题：\n' + problems.join('\n'));
+  });
+
+  await step('只用键盘：同意对话框里焦点出不去、看得见；建账号、看任务、标记办完、问助手、发咨询都能只用键盘做完；读屏能听到异步的结果', async () => {
+    const { tabWalk } = require('./a11y');
+    const c = await b.newContext({ viewport: { width: 1280, height: 800 } });
+    const x = await c.newPage(); x.on('pageerror', (e) => errs.push(e.message));
+    await x.route('**/api/users/*/chat', (r) => r.request().method() !== 'POST' ? r.continue() : r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ text: '住民登记带在留卡和护照去区役所。', category: 'A', toolCalls: [], draft: null }) }));
+    const focused = () => x.evaluate(() => { const e = document.activeElement; return e ? (e.id || e.getAttribute('data-k') || e.tagName.toLowerCase()) : null; });
+    // 按 Tab 直到焦点落到 sel 上（最多按 max 次）
+    const tabTo = async (sel, max) => {
+      for (let i = 0; i < (max || 150); i++) { if (await x.evaluate((q) => !!document.activeElement && document.activeElement.matches(q), sel)) return; await x.keyboard.press('Tab'); }
+      throw new Error('按 Tab 到不了 ' + sel + '，焦点停在 ' + (await focused()));
+    };
+    await x.goto(base + '/'); await x.waitForSelector('#consent-ok', { timeout: 5000 });
+    // 对话框：一打开焦点就在里面，背后的页面 inert，有名字和说明
+    assert.equal(await focused(), 'consent-ok', '焦点应当在“同意并开始”上');
+    const dlg = await x.evaluate(() => { const d = document.getElementById('consent'); return { modal: d.getAttribute('aria-modal'), name: document.getElementById(d.getAttribute('aria-labelledby')).textContent, desc: !!document.getElementById(d.getAttribute('aria-describedby')), inert: ['main', 'header', '#fab', '#drawer'].every((q) => document.querySelector(q).inert) }; });
+    assert.deepEqual(dlg, { modal: 'true', name: '开始之前', desc: true, inert: true });
+    await x.click('#recover-open'); // 找回的表单展开后对话框里能拿到焦点的东西更多
+    for (const shift of [false, true]) {
+      const wk = await tabWalk(x, 14, { shift });
+      assert.ok(wk.seen.every((e) => e && e.dialog === 'consent'), (shift ? 'Shift+Tab' : 'Tab') + ' 不应当离开对话框：' + JSON.stringify(wk.seen));
+      assert.deepEqual(wk.noRing, [], '每个拿到焦点的元素都要有看得见的焦点框');
+    }
+    await tabTo('#consent-ok'); await x.keyboard.press('Enter'); await apiReady(x);
+    assert.equal(await x.evaluate(() => document.querySelector('main').inert), false, '同意之后页面恢复可用');
+    const acc = await x.evaluate(() => JSON.parse(localStorage.getItem('zairyu-account')));
+    const ah = { authorization: 'Bearer ' + acc.token };
+    // 页面上 Tab 走一遍：焦点框都看得见
+    await x.evaluate(() => document.activeElement && document.activeElement.blur());
+    const walk = await tabWalk(x, 30);
+    assert.deepEqual(walk.noRing, [], '焦点框看不见：' + walk.noRing.join('、'));
+    // “看怎么办”：焦点移到任务详情的标题；“办完了”之后焦点还在详情里的按钮上，服务器上记下了
+    await tabTo('#next button.act'); await x.keyboard.press('Enter');
+    assert.equal(await x.evaluate(() => document.activeElement === document.querySelector('#detail h2')), true, '焦点应当移到任务详情的标题');
+    const nextId = await x.evaluate(() => VIEW.next);
+    await tabTo('[data-k="done-toggle"]'); await x.keyboard.press('Enter');
+    await x.waitForFunction((id) => DONE[id] && !document.querySelector('#sync-state:not([hidden])'), nextId, { timeout: 5000 });
+    await x.waitForTimeout(800);
+    assert.ok((await json(`/api/users/${acc.id}`, { headers: ah })).done[nextId], '办完的任务存到了服务器');
+    assert.notEqual(await focused(), 'body', '重画之后焦点不应当掉到页面开头');
+    // 关卡里的任务按钮：Enter 之后焦点还在同一个按钮上
+    await tabTo('.node.todo'); const k = await focused(); await x.keyboard.press('Enter');
+    assert.equal(await focused(), k, '选任务之后焦点留在原来的按钮上');
+    // 助手：Enter 打开，输入后按 Enter 发送，回答进 role="log" 的对话区；Esc 收起，焦点回到“问助手”
+    await tabTo('#fab'); await x.keyboard.press('Enter');
+    assert.equal(await focused(), 'ask-t');
+    await x.keyboard.type('住民登记要带什么？'); await x.keyboard.press('Enter');
+    await x.waitForFunction(() => /区役所/.test(document.getElementById('chat').textContent), null, { timeout: 5000 });
+    assert.equal(await x.getAttribute('#chat', 'role'), 'log');
+    await x.keyboard.press('Escape');
+    assert.equal(await x.isVisible('#drawer'), false); assert.equal(await focused(), 'fab', '收起后焦点回到“问助手”');
+    // 发咨询：导航 → 类别（方向键）→ 勾选服务商（空格）→ 写内容 → 勾同意 → 提交
+    await tabTo('#nav a[href="#providers"]'); await x.keyboard.press('Enter');
+    await tabTo('#pv-cat');
+    for (let i = 0; i < 10 && (await x.inputValue('#pv-cat')) !== 'gyosei'; i++) await x.keyboard.press('ArrowDown');
+    assert.equal(await x.inputValue('#pv-cat'), 'gyosei', '方向键能换类别');
+    await x.waitForFunction(() => document.querySelectorAll('#pv-list input[type=checkbox]').length > 0, null, { timeout: 5000 });
+    await tabTo('#pv-list input[type=checkbox]'); await x.keyboard.press('Space');
+    await tabTo('#pv-msg'); await x.keyboard.type('想咨询在留期间更新，用键盘发的。');
+    await tabTo('#pv-ok'); await x.keyboard.press('Space');
+    await tabTo('#pv-send'); await x.keyboard.press('Enter');
+    await x.waitForFunction(() => /已发出/.test(document.getElementById('toast').textContent), null, { timeout: 5000 });
+    assert.equal((await json(`/api/users/${acc.id}/inquiries`, { headers: ah })).length, 1, '咨询发出去了');
+    // 异步的结果读屏听得到：保存状态、提示、咨询表的说明、助手的说明都在 role="status" 或 aria-live 的区域里
+    const live = await x.evaluate(() => ['sync-state', 'toast', 'sr-status', 'pv-note', 'dv-note', 'ask-state', 'chat'].filter((id) => { const e = document.getElementById(id); return !(e && (e.getAttribute('role') === 'status' || e.getAttribute('role') === 'log' || e.getAttribute('aria-live'))); }));
+    assert.deepEqual(live, [], '这些区域应当是 live region');
+    await c.close();
+  });
+
+  // 页面大小和可交互的时间：在本机量（模拟慢 4G：延迟 150ms、下行 1.6Mbps），打出来看；预算卡住明显的退步。
+  // 首页的“可交互”算到读完账号和路线（window.ZAIRYU_API），别的页面算到 load。
+  await step('页面大小和可交互时间：首页在慢 4G 下 6 秒内可用；压缩后首页合计不超过 160KB、其余页面不超过 20KB；<head> 里没有挡住首次绘制的脚本', async () => {
+    const rows = [];
+    for (const [path, budget] of [['/', 160], ['/terms.html', 20], ['/privacy.html', 20], ['/provider-terms.html', 20], ['/provider-apply.html', 20], ['/provider.html', 20], ['/admin.html', 20]]) {
+      const c = await b.newContext({ viewport: { width: 390, height: 844 } }); const x = await c.newPage(); x.on('pageerror', (e) => errs.push(e.message));
+      const cdp = await c.newCDPSession(x); await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 150, downloadThroughput: 1.6e6 / 8, uploadThroughput: 750e3 / 8 });
+      const t0 = Date.now();
+      await x.goto(base + path);
+      if (path === '/') { await x.waitForSelector('#consent-ok', { timeout: 15000 }); await x.click('#consent-ok'); await x.waitForFunction(() => window.ZAIRYU_API === true, null, { timeout: 20000 }); } else await x.waitForLoadState('load');
+      const m = await x.evaluate(() => {
+        const n = performance.getEntriesByType('navigation')[0], all = [n].concat(performance.getEntriesByType('resource')), fcp = performance.getEntriesByName('first-contentful-paint')[0];
+        const head = [...document.head.querySelectorAll('script')].filter((s) => !s.defer && !s.async && s.type !== 'module').length;
+        return { files: all.length, kb: Math.round(all.reduce((a, r) => a + (r.encodedBodySize || 0), 0) / 1024), rawKb: Math.round(all.reduce((a, r) => a + (r.decodedBodySize || 0), 0) / 1024), fcp: fcp ? Math.round(fcp.startTime) : null, dcl: Math.round(n.domContentLoadedEventEnd), head, css: document.querySelectorAll('link[rel=stylesheet]').length };
+      });
+      m.ready = Date.now() - t0; rows.push(path + '：' + m.files + ' 个请求，压缩后 ' + m.kb + 'KB（原文 ' + m.rawKb + 'KB），首次绘制 ' + m.fcp + 'ms，DOMContentLoaded ' + m.dcl + 'ms，可交互 ' + m.ready + 'ms');
+      assert.ok(m.kb <= budget, path + ' 压缩后 ' + m.kb + 'KB，超过 ' + budget + 'KB');
+      assert.equal(m.head, 0, path + ' 的 <head> 里有同步脚本'); assert.ok(m.css <= 1, path + ' 不应当有多个样式表');
+      if (path === '/') assert.ok(m.ready < 6000, '首页在慢 4G 下 ' + m.ready + 'ms 才可用');
+      await c.close();
+    }
+    console.log('  ' + rows.join('\n  '));
+  });
+
+  await step('每个页面都能打开、样式和脚本都加载了，没有违反内容安全策略（CSP）', async () => {
+    const pc = await b.newContext({ viewport: { width: 390, height: 844 } });
+    for (const [path, ready] of [['/', '#consent-ok'], ['/terms.html', 'main'], ['/privacy.html', 'main'], ['/provider-terms.html', 'main'], ['/provider-apply.html', 'main'], ['/provider.html', 'main'], ['/admin.html', 'main']]) {
+      const x = await pc.newPage(); x.on('pageerror', (e) => errs.push(e.message));
+      const r = await x.goto(base + path); assert.equal(r.status(), 200, path);
+      assert.match(r.headers()['content-security-policy'] || '', /script-src 'self'/, path);
+      await x.waitForSelector(ready, { timeout: 5000 });
+      // 样式表生效了（不是浏览器默认的白底、8px 外边距）
+      const look = await x.evaluate(() => ({ margin: getComputedStyle(document.body).margin, sheets: document.styleSheets.length }));
+      assert.ok(look.sheets >= 1 && look.margin !== '8px', path + ' 的样式没有加载：' + JSON.stringify(look));
+      await x.close();
+    }
+    // 检查本身管用：往页面里塞一段内联脚本，CSP 会拦下来，这里要能看到
+    const x = await pc.newPage(); await x.goto(base + '/terms.html');
+    const before = cspErrs.length;
+    const ran = await x.evaluate(() => { const sc = document.createElement('script'); sc.textContent = 'window.__inline = 1'; document.body.appendChild(sc); return window.__inline === 1; });
+    await x.waitForTimeout(300);
+    assert.equal(ran, false, '内联脚本应当被 CSP 拦下'); assert.ok(cspErrs.length > before, '应当收到 CSP 的报错');
+    cspErrs.splice(before);
+    await pc.close();
+    assert.deepEqual(cspErrs, [], '页面不应当违反 CSP');
+  });
   await step('页面没有脚本错误', async () => { assert.deepEqual(errs, [], '页面不应有脚本错误'); });
   await b.close();
   if (failed.length) { console.error('端到端失败 ' + failed.length + ' 步：\n- ' + failed.join('\n- ')); process.exit(1); }

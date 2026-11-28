@@ -516,7 +516,9 @@ test('解除邮箱、删除账号之后，库文件的字节里找不到邮箱�
     assert.equal((await s.bind(u, 'first-addr@example.com', { remindOptIn: true })).status, 200);
     assert.equal((await s.call('POST', `/api/users/${u.id}/events`, { type: 'move', date: '2026-11-25', note: '搬到练马区的备注XYZZY' }, u.token)).status, 201);
     s.app.remind(); await s.app.deliver();
-    assert.ok(has('first-addr@example.com') && has(u.id) && has('搬到练马区的备注XYZZY') && has('住民登记：定下住所后14天内到区役所办理'), '删除之前都在文件里');
+    // 存在服务器上的助手对话记录
+    s.app.store.saveChat(u.id, [{ role: 'user', content: '助手对话里的话QWXZ' }, { role: 'assistant', content: '助手的回答QWXZ' }]);
+    assert.ok(has('first-addr@example.com') && has(u.id) && has('搬到练马区的备注XYZZY') && has('住民登记：定下住所后14天内到区役所办理') && has('助手对话里的话QWXZ'), '删除之前都在文件里');
     // 解除邮箱：地址立即从文件里消失（最后一封告知发出之后）
     assert.equal((await s.unbind(u)).status, 204);
     await s.app.deliver();
@@ -525,13 +527,14 @@ test('解除邮箱、删除账号之后，库文件的字节里找不到邮箱�
     assert.equal((await s.bind(u, 'second-addr@example.com')).status, 200);
     assert.equal((await s.call('DELETE', `/api/users/${u.id}`, null, u.token)).status, 204);
     assert.equal(has('second-addr@example.com'), false); assert.equal(has(u.id), false, '账号编号'); assert.equal(has('搬到练马区的备注XYZZY'), false, '事件备注');
+    assert.equal(has('助手对话里的话QWXZ') || has('助手的回答QWXZ'), false, '助手的对话记录');
     assert.ok(has('keep-me@example.com'), '别人的数据还在');
   } finally { await s.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 // ---- 说明文字和实际一致 ----
 test('隐私政策和页面上的说明：官方页面的链接是“有的才带”；列出了全部几种邮件；写明提醒邮件不写在留资格的类型', () => {
-  const read = (f) => fs.readFileSync(path.join(__dirname, '..', 'web', f), 'utf8');
+  const read = (f) => require('./web-source').pageSource(f);
   const privacy = read('privacy.html'), index = read('index.html');
   assert.match(index, /REMIND_TEXT="[^"]*有官方页面的会带上链接/); assert.doesNotMatch(index, /REMIND_TEXT="[^"]*并带官方页面和退订的链接/);
   assert.doesNotMatch(privacy, /并带官方页面的链接、打开应用的链接和退订链接/);

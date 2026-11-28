@@ -273,10 +273,9 @@ test('提示词：只提到服务器上真有的工具；不再说服务商是�
   assert.doesNotMatch(sys, /save_document/); assert.doesNotMatch(createEngine({}).SYS, /我的资料/);
   assert.doesNotMatch(sys, /示例占位/);
   assert.match(sys, /9\. 用户请你整理清单[^\n]*直接写在回答里。递交给官方的申请书、届出书、理由书等文书不制作。/);
-  // 网页本地演示里的 save_document 规则只在演示自己的补充规则里，不在和引擎共用的提示词里
-  const html = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'web', 'index.html'), 'utf8');
-  assert.match(html, /var DEMO_RULES="[^"]*save_document/); assert.match(html, /\{name:"save_document"/);
-  assert.match(html, /SYS\+kb\(\)\+DEMO_RULES/);
+  // 网页不再有本地演示（不内嵌提示词和工具，助手只走服务器）
+  const html = require('./web-source').pageSource('index.html');
+  assert.doesNotMatch(html, /DEMO_RULES|save_document|var SYS=|function kb\(/);
 });
 
 // get_options 的 params 说明要和引擎实际读的条件一致：N9、N10 曾因为工具说明没写 card、visa，模型没法传条件

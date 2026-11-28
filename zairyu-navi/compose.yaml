@@ -1,0 +1,64 @@
+# 单台虚拟机上的部署：应用（app）+ 反向代理（caddy，负责 HTTPS）。
+# 用法（详见 docs/ops.md）：
+#   cp deploy/env.example deploy/.env && chmod 600 deploy/.env   # 填好
+#   docker compose up -d --build
+#   docker compose exec app node tools/backup.js                 # 备份（主机的 cron 每天跑）
+services:
+  app:
+    build: .
+    image: zairyu-navi:${APP_VERSION:-latest}
+    restart: unless-stopped
+    env_file: deploy/.env
+    environment:
+      # 这几项由部署方式决定，不放进 .env
+      PORT: "8787"
+      DB_FILE: /data/zairyu.db
+      BACKUP_DIR: /backups
+      TRUST_PROXY: "1"          # 前面只有一层 Caddy；来源地址取 X-Forwarded-For 的最后一段
+      SHUTDOWN_TIMEOUT_MS: "25000"
+    # 根目录只读；SQLite 的临时文件和 Node 的临时文件写 /tmp
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - appdata:/data
+      - backups:/backups
+    # 只给 Caddy 连，不对外开端口
+    expose:
+      - "8787"
+    # docker stop 先发 SIGTERM，等这么久还没退出才强制结束；要比 SHUTDOWN_TIMEOUT_MS 长
+    stop_grace_period: 35s
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  caddy:
+    image: caddy:2.11.9-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:?在 deploy/.env 里设 SITE_DOMAIN，并用 --env-file deploy/.env 启动}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  appdata:
+  backups:
+  caddy_data:
+  caddy_config:

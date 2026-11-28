@@ -31,10 +31,14 @@ function createStore(file, opts) {
   // 这两项要在建表之前设好。
   // busy_timeout：定时提醒可以由另一个进程跑（npm run remind），对方正在写的时候等一等，不直接报“数据库忙”（建表那一步也要读库，同样会撞上）。
   // secure_delete：删掉的行（邮箱、备注、邮件正文）在文件里用零盖掉，不留在空闲页里。备份文件不归这里管，要按同样的期限清理。
-  db.exec('PRAGMA busy_timeout = 10000');
+  // opts.busyTimeoutMs 只给测试用（库被别的连接占着时，就绪检查不用等满 10 秒）
+  db.exec('PRAGMA busy_timeout = ' + (opts && Number.isInteger(opts.busyTimeoutMs) ? opts.busyTimeoutMs : 10000));
   db.exec('PRAGMA secure_delete = ON');
-  db.exec(`
+  // 建表的语句留在一个变量里：就绪检查（readiness）按它核对每张表和索引都在
+  const schemaSql = `
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at TEXT NOT NULL, consent_version TEXT NOT NULL, consent_at TEXT NOT NULL, profile TEXT NOT NULL, done TEXT NOT NULL, plan TEXT NOT NULL, auth TEXT NOT NULL);
+    -- 助手的对话历史：每个账号一行，存服务器按整轮裁剪后的最近几轮（assistant.trimHistory 的条数和字节上限），网页端不再保存、不再带回
+    CREATE TABLE IF NOT EXISTS chat_history (user_id TEXT PRIMARY KEY, messages TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL, date TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL, area TEXT, langs TEXT, fee_note TEXT, license_no TEXT, fee_model TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS inquiries (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider_id TEXT NOT NULL, node_id TEXT, category TEXT NOT NULL, summary TEXT NOT NULL, consent_at TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -79,13 +83,18 @@ function createStore(file, opts) {
     CREATE TABLE IF NOT EXISTS invoice_reminders (invoice_id TEXT NOT NULL, stage TEXT NOT NULL, outbox_id TEXT, created_at TEXT NOT NULL, PRIMARY KEY (invoice_id, stage));
     -- provider_notices：新咨询通知。pending_since：还没通知的第一条新咨询的时间；win_start、win_end：排进发件箱的那一封统计的时间段。
     CREATE TABLE IF NOT EXISTS provider_notices (provider_id TEXT PRIMARY KEY, pending_since TEXT, last_sent_at TEXT, outbox_id TEXT, win_start TEXT, win_end TEXT);
-  `);
+  `;
+  db.exec(schemaSql);
+  const SCHEMA_NAMES = [...schemaSql.matchAll(/CREATE (?:UNIQUE )?(?:TABLE|INDEX) IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+  // 多台设备同时修改：users.version 每保存一次加一，网页端带着它保存，过时了服务器返回 409 和最新的内容。
+  // 旧的库文件没有这一列，打开时补上（旧账号从 0 起）。
+  if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'version')) db.exec('ALTER TABLE users ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
   const now = () => new Date(clock()).toISOString();
   const isoOf = (ms) => new Date(ms).toISOString();
   const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
   const newToken = () => crypto.randomBytes(32).toString('base64url');
   const same = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
-  const row = (u) => u && { id: u.id, createdAt: u.created_at, consentVersion: u.consent_version, profile: JSON.parse(u.profile), done: JSON.parse(u.done), plan: JSON.parse(u.plan), auth: JSON.parse(u.auth) };
+  const row = (u) => u && { id: u.id, createdAt: u.created_at, consentVersion: u.consent_version, profile: JSON.parse(u.profile), done: JSON.parse(u.done), plan: JSON.parse(u.plan), auth: JSON.parse(u.auth), version: u.version || 0 };
   // 宽限天数（展示规则用），由 configureListing 设
   const listing = { graceDays: 7 };
   // 审核看到的版本：申请里会公开或会核对的内容加上状态和修改时间的哈希。批准、拒绝、要求修改都要带上它，
@@ -114,7 +123,7 @@ function createStore(file, opts) {
     // ---- 用户 ----
     createUser(consentVersion) {
       const id = crypto.randomUUID(), token = newToken(); // 令牌只在创建时返回一次，库里只存它的哈希
-      db.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?)').run(id, hash(token), now(), consentVersion || 'test', now(), JSON.stringify(EMPTY_PROFILE), '{}', '{}', JSON.stringify({ mail: false, cal: false, push: false }));
+      db.prepare('INSERT INTO users (id,token_hash,created_at,consent_version,consent_at,profile,done,plan,auth) VALUES (?,?,?,?,?,?,?,?,?)').run(id, hash(token), now(), consentVersion || 'test', now(), JSON.stringify(EMPTY_PROFILE), '{}', '{}', JSON.stringify({ mail: false, cal: false, push: false }));
       log(id, 'user.create', { consentVersion: consentVersion || 'test' });
       return Object.assign(this.getUser(id), { token });
     },
@@ -136,10 +145,29 @@ function createStore(file, opts) {
       db.prepare('UPDATE users SET consent_version=?, consent_at=? WHERE id=?').run(version, now(), id);
       log(id, 'consent.renew', { consentVersion: version });
     },
-    saveUser(u, action, detail) {
-      db.prepare('UPDATE users SET profile=?, done=?, plan=?, auth=? WHERE id=?').run(JSON.stringify(u.profile), JSON.stringify(u.done), JSON.stringify(u.plan), JSON.stringify(u.auth), u.id);
+    // 保存概况、进度等，version 加一，返回新的 version。
+    // expected 是调用方读到的 version：传了就只在库里还是这个 version 时才保存（比较和保存是同一条语句），对不上返回 null、什么都不改。
+    saveUser(u, action, detail, expected) {
+      const vals = [JSON.stringify(u.profile), JSON.stringify(u.done), JSON.stringify(u.plan), JSON.stringify(u.auth), u.id];
+      const r = expected == null ? db.prepare('UPDATE users SET profile=?, done=?, plan=?, auth=?, version=version+1 WHERE id=?').run(...vals)
+        : db.prepare('UPDATE users SET profile=?, done=?, plan=?, auth=?, version=version+1 WHERE id=? AND version=?').run(...vals, expected);
+      if (r.changes !== 1) return null;
+      u.version = db.prepare('SELECT version FROM users WHERE id=?').get(u.id).version;
       log(u.id, action, detail);
+      return u.version;
     },
+    // ---- 助手的对话历史 ----
+    // 内容不进留痕；删除账号时一并删掉（deleteUser）。存进来的已经按整轮裁剪过。
+    getChat(userId) {
+      const r = db.prepare('SELECT messages FROM chat_history WHERE user_id=?').get(userId);
+      if (!r) return [];
+      try { const m = JSON.parse(r.messages); return Array.isArray(m) ? m : []; } catch (e) { return []; }
+    },
+    saveChat(userId, messages) {
+      if (!messages || !messages.length) { db.prepare('DELETE FROM chat_history WHERE user_id=?').run(userId); return; }
+      db.prepare('INSERT INTO chat_history (user_id, messages, updated_at) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET messages=excluded.messages, updated_at=excluded.updated_at').run(userId, JSON.stringify(messages), now());
+    },
+    clearChat(userId) { return db.prepare('DELETE FROM chat_history WHERE user_id=?').run(userId).changes > 0; },
     // 删除账号：一个事务里删掉全部数据，并把留痕表里这个用户的痕迹抹掉。
     // 留痕只保留“什么时候发生过什么动作”，用户 id 和细节（改了哪些字段、发给了哪家服务商、咨询 id）都清空。
     deleteUser(id) {
@@ -152,6 +180,7 @@ function createStore(file, opts) {
         }
         db.prepare('DELETE FROM inquiries WHERE user_id=?').run(id);
         db.prepare('DELETE FROM events WHERE user_id=?').run(id);
+        db.prepare('DELETE FROM chat_history WHERE user_id=?').run(id);
         // 邮箱、验证码、别的设备的登录、发给这个邮箱的邮件、按这个邮箱和账号记的限流次数，全部删掉
         const em = db.prepare('SELECT email FROM user_emails WHERE user_id=?').get(id);
         const addr = em ? em.email : '';
@@ -821,6 +850,24 @@ function createStore(file, opts) {
     // 留痕记录（测试和运维排查用，不经接口对外）
     auditRows() { return db.prepare('SELECT at, user_id AS userId, action, detail FROM audit ORDER BY id').all(); },
     auditCount() { return db.prepare('SELECT COUNT(*) AS n FROM audit').get().n; },
+    // 就绪检查（GET /api/ready）：readable 读得了表结构；migrations 建表和补列都做过了（每张表、每个索引都在，users 有 version 列）；writable 库能写
+    // （开一个写事务、写一行再回滚，库文件或所在目录只读、磁盘挂成只读、被别的进程一直占着写锁时都不过）。什么都不留下。
+    readiness() {
+      const failed = [];
+      try {
+        const have = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index')").all().map((r) => r.name));
+        if (!SCHEMA_NAMES.every((n) => have.has(n)) || !db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'version')) failed.push('migrations');
+      } catch (e) { failed.push('readable'); } // 读不了（库坏了、被别的进程排他地锁着），不算没迁移
+      if (!db.isTransaction) {
+        try {
+          db.exec('BEGIN IMMEDIATE');
+          try { db.prepare('INSERT INTO rate_events (bucket, at) VALUES (?, ?)').run('ready-probe', 0); } finally { db.exec('ROLLBACK'); }
+        } catch (e) { failed.push('writable'); }
+      }
+      return { ok: !failed.length, failed };
+    },
+    // 建表语句里的全部表和索引的名字（备份的核对用：备份里应当一个不少）
+    schemaNames() { return SCHEMA_NAMES.slice(); },
     close() { db.close(); }
   };
 }

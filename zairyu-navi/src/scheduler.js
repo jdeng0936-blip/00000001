@@ -108,9 +108,12 @@ function createScheduler(opts) {
 function startReminderTimer(cfg, run, deps) {
   deps = deps || {};
   const now = deps.now || (() => Date.now()), st = deps.setTimeout || setTimeout, si = deps.setInterval || setInterval;
-  const unref = (h) => { if (h && typeof h.unref === 'function') h.unref(); return h; };
-  let waiting = false;
+  // 建过的定时器都记下来，stop() 一起清掉（停机时用）；停了之后 tick 不再跑
+  const handles = [], ct = deps.clearTimeout || clearTimeout;
+  const unref = (h) => { handles.push(h); if (h && typeof h.unref === 'function') h.unref(); return h; };
+  let waiting = false, stopped = false;
   const tick = () => {
+    if (stopped) return;
     const t = now();
     if (jstHour(t) < cfg.hour) {
       if (!waiting) { waiting = true; unref(st(() => { waiting = false; tick(); }, jstDayMs(t) + cfg.hour * 60 * 60 * 1000 - (t + 9 * 60 * 60 * 1000) + 1000)); }
@@ -120,7 +123,7 @@ function startReminderTimer(cfg, run, deps) {
   };
   unref(st(tick, 5000));
   unref(si(tick, cfg.intervalMin * 60 * 1000));
-  return { tick };
+  return { tick, stop() { stopped = true; handles.forEach((h) => ct(h)); } };
 }
 
 module.exports = { createScheduler, startReminderTimer, STAGES, jstHour };

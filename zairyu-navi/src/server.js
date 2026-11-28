@@ -8,6 +8,7 @@ const { createStore, CODE_TTL_MS, PROOF_TTL_MS } = require('./store');
 const { validateProfilePatch, validateInquiry, validateApplication, assertNoClaims, checkLicense, assertListingText, feeModelOf, LICENSE_RULES, isDate, assertNoSensitive, sensitiveLabel, normalizeEmail, maskEmail, HttpError } = require('./validate');
 const assistant = require('./assistant');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const { createSender, deliverOutbox, TEXTS, scrub } = require('./mailer');
 const { createScheduler, startReminderTimer } = require('./scheduler');
 const { createBilling, billingConfig, prepareFor, CHECK_METHODS, FREE } = require('./billing');
@@ -43,8 +44,11 @@ const EMAIL_COOLDOWN_MS = 24 * HOUR;
 
 // 退订页面：不用登录、不带脚本的一小页。文字都是固定的，令牌只出现在表单的地址里（已限定为字母、数字、横线、下划线）。
 const UNSUB_TOKEN = /^[A-Za-z0-9_-]{20,100}$/;
+// 样式是固定的一段，CSP 里按它的哈希放行（不用 'unsafe-inline'）。
+const PAGE_CSS = 'body{font:16px/1.7 system-ui,sans-serif;max-width:32em;margin:12vh auto;padding:0 20px;color:#1c2733}h1{font-size:20px}button{font:inherit;padding:10px 22px;border:0;border-radius:8px;background:#1f6feb;color:#fff;cursor:pointer}p.s{color:#5b6775;font-size:14px}';
+const PAGE_CSP = "default-src 'none'; style-src '" + 'sha256-' + crypto.createHash('sha256').update(PAGE_CSS).digest('base64') + "'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const page = (title, inner) => '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>' + title + ' - 在留导航</title>' +
-  '<style>body{font:16px/1.7 system-ui,sans-serif;max-width:32em;margin:12vh auto;padding:0 20px;color:#1c2733}button{font:inherit;padding:10px 22px;border:0;border-radius:8px;background:#1f6feb;color:#fff;cursor:pointer}p.s{color:#5b6775;font-size:14px}</style></head><body><h1 style="font-size:20px">' + title + '</h1>' + inner + '</body></html>';
+  '<style>' + PAGE_CSS + '</style></head><body><h1>' + title + '</h1>' + inner + '</body></html>';
 const UNSUB_ASK = (t) => page('退订提醒邮件', '<p>点下面的按钮后，在留导航不再向这个邮箱发期限提醒邮件。账号、已填的内容和用邮箱找回账号的功能都不受影响。</p>' +
   (t ? '<form method="post" action="/api/unsubscribe?t=' + t + '"><button type="submit" id="unsub-go">退订</button></form>' : '<p>这个退订链接不完整，请从邮件里重新打开。</p>') +
   '<p class="s">以后想再收到提醒，在应用的“账号和邮箱”里重新打开“邮件提醒”。</p>');
@@ -70,6 +74,16 @@ const PUNSUB_DONE = page('已关闭通知', '<p id="punsub-done">已关闭。在
 
 // 管理员令牌。ADMIN_TOKENS 写成“名字:令牌,名字:令牌”（也可以传 { 名字: 令牌 } 对象），名字记进留痕和审核记录（谁批准、谁核对、谁确认入账）。
 // 名字是 1 至 32 个小写字母、数字、横线、下划线，令牌至少 24 个字符。写错了就抛错，不启动。ADMIN_TOKEN 继续可用，名字记为 admin。
+// 运维相关的设置（npm start 读）：LOG_REQUESTS（1 或 0，默认 1）写请求日志；SHUTDOWN_TIMEOUT_MS（1000 至 120000，默认 25000）停机时最多等手上的请求多久。
+// compose.yaml 的 stop_grace_period 要比它长，不然没等完就被强制结束。
+function opsConfig(env) {
+  env = env || {};
+  if (env.LOG_REQUESTS != null && !['', '0', '1'].includes(env.LOG_REQUESTS)) throw new Error('LOG_REQUESTS 须是 1 或 0');
+  let t = 25000;
+  if (env.SHUTDOWN_TIMEOUT_MS != null && env.SHUTDOWN_TIMEOUT_MS !== '') { t = Number(env.SHUTDOWN_TIMEOUT_MS); if (!Number.isInteger(t) || t < 1000 || t > 120000) throw new Error('SHUTDOWN_TIMEOUT_MS 须是 1000 到 120000 的整数（毫秒）'); }
+  return { logRequests: env.LOG_REQUESTS !== '0', shutdownTimeoutMs: t };
+}
+
 function adminTokens(v) {
   if (v == null || v === '') return [];
   const pairs = typeof v === 'string' ? v.split(',').map((x) => x.trim()).filter(Boolean).map((x) => { const i = x.indexOf(':'); return i < 0 ? [x, ''] : [x.slice(0, i), x.slice(i + 1)]; }) : Object.entries(v);
@@ -84,6 +98,59 @@ function adminTokens(v) {
 }
 
 class Html { constructor(text) { this.text = text; } }
+
+// ---- 安全相关的响应头（每个响应都带） ----
+// 网页：脚本和样式只从本站的文件加载（web/*.js、web/*.css），不允许内联脚本、内联样式和 on…= 属性，不连别的站点，不允许被嵌进别的页面。
+// 接口返回的 JSON 也带同一套（浏览器直接打开接口地址时一样受限）。退订页（不带脚本的小页面）用自己的一条，按样式的哈希放行。
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; manifest-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'";
+const SECURITY_HEADERS = {
+  'content-security-policy': CSP,
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer', // 退订链接、服务商工作台的地址里有令牌，跳到官方页面时一律不带来源
+  'x-frame-options': 'DENY', // 老浏览器不认 frame-ancestors
+  'permissions-policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+  'cross-origin-opener-policy': 'same-origin',
+  'cross-origin-resource-policy': 'same-origin'
+};
+// HSTS：只在 TRUST_PROXY=1 且反向代理说这次是 HTTPS（X-Forwarded-Proto 的最后一段是 https）时发。直接用 http 访问时发了也没有用。
+const HSTS = 'max-age=31536000';
+// 静态文件：文件名没有带内容的哈希，所以不让浏览器直接用缓存，每次带着 ETag 问一下（没变就是 304，不重新下载），发布新版本后马上生效。
+const STATIC_CACHE = 'no-cache';
+// 静态文件放在内存里：同一个版本（ETag 不变）只读一次盘；文字类的文件（HTML、JS、CSS、JSON、SVG）1KB 以上再存一份 gzip，
+// 浏览器的 Accept-Encoding 里有 gzip（q 不为 0）时发压缩的（首页的 index.js 约 80KB，压缩后约 29KB）。大于 STATIC_MEM_MAX 的文件照旧按流发、不压缩。
+const STATIC_MEM_MAX = 2 * 1024 * 1024;
+const COMPRESSIBLE = new Set(['.html', '.js', '.css', '.json', '.svg']);
+function acceptsGzip(h) {
+  return String(h || '').split(',').some((part) => {
+    const [name, ...params] = part.trim().toLowerCase().split(';').map((x) => x.trim());
+    if (name !== 'gzip' && name !== '*') return false;
+    const q = params.find((x) => x.startsWith('q='));
+    return !q || Number(q.slice(2)) > 0;
+  });
+}
+
+// ---- 请求日志 ----
+// 一行一个 JSON：时间、请求编号、方法、路由的模板（/api/users/:id/plan，不是真实地址）、状态码、耗时。
+// 不写请求体、查询参数（退订链接的令牌在查询参数里）、令牌、邮箱；来源地址只在 TRUST_PROXY=1 时写，并且截短（IPv4 去掉最后一段，IPv6 只留前 3 段）。
+// 路由模板：已知的固定段原样写，其余（账号编号、节点编号、申请编号等）按前一段换成参数名，所以日志里不会出现用户能随意写进去的内容。
+const ROUTE_WORDS = new Set(['admin', 'reject', 'old', 'verify', 'reminders', 'run', 'me', 'invoices', 'inquiries', 'code', 'providers', 'done', 'void', 'status', 'request-changes', 'reply', 'paid', 'approve', 'active', 'notify', 'webhook', 'recover', 'outbox', 'open', 'categories', 'billing', 'applications', 'users', 'unsubscribe', 'terms', 'provider-unsubscribe', 'provider-terms', 'provider-claim', 'provider-apply', 'provider', 'options', 'nodes', 'links', 'health', 'ready', 'event-types', 'auth', 'consent', 'email', 'sessions', 'events', 'state', 'profile', 'tasks', 'plan', 'advice', 'pr-check', 'city', 'chat']);
+const ROUTE_PARAM = { users: ':id', tasks: ':nodeId', events: ':eid', options: ':topic', nodes: ':id', inquiries: ':id', providers: ':id', applications: ':id', invoices: ':id', 'provider-apply': ':ref', webhook: ':method' };
+function routeOf(pathname, webFiles) {
+  if (!pathname.startsWith('/api/')) return pathname === '/' ? '/' : webFiles.has(pathname.slice(1)) ? pathname : '/*';
+  const seg = pathname.split('/').filter(Boolean);
+  if (seg.length > 7) return '/api/*';
+  return '/' + seg.map((x, i) => i === 0 || ROUTE_WORDS.has(x) ? x : ROUTE_PARAM[seg[i - 1]] || ':param').join('/');
+}
+// 截短的来源地址：203.0.113.45 → 203.0.113.0，2001:db8:1:2::5 → 2001:db8:1::
+function truncateIp(ip) {
+  ip = String(ip || '').replace(/^::ffff:(?=\d+\.)/, '');
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(ip);
+  if (v4) return v4[1] + '.' + v4[2] + '.' + v4[3] + '.0';
+  if (ip.includes(':')) return (ip.split('::')[0] ? ip.split('::')[0].split(':').slice(0, 3).join(':') : '') + '::';
+  return '';
+}
+// 请求编号：TRUST_PROXY=1 时沿用反向代理给的 X-Request-Id（只收字母、数字和 . _ : -，8 至 128 个字符），否则自己生成。响应头里带回去。
+const REQ_ID = /^[A-Za-z0-9._:-]{8,128}$/;
 
 function createApp(opts) {
   opts = opts || {};
@@ -196,20 +263,44 @@ function createApp(opts) {
     return { method: lc.method, checkedOn: lc.checkedOn, note: lc.note ? lc.note.trim() : '' };
   };
 
+  // 选方案：引擎的结果加上人民币汇率（网页的说明里写折算用的汇率和日期）
+  const optionsOf = (eng, topic, url) => {
+    const params = Object.fromEntries(url.searchParams);
+    let r; try { r = eng.options(topic, params); } catch (e) { throw new HttpError(404, e.message); }
+    return Object.assign(r, { rate: { value: eng.RATE, on: eng.RATE_ON } });
+  };
+  // 状态有版本：带着过时的 version 保存时返回 409 和服务器上现在的内容（current），网页端逐项合并后重试
+  const conflict = (u) => [409, { error: '另一台设备刚改过你的情况，服务器上的内容比这台设备的新。合并后再保存', current: store.getUser(u.id) }];
+  const versionOf = (b) => {
+    if (b == null || b.version == null) return null;
+    if (!Number.isInteger(b.version) || b.version < 0) throw new HttpError(422, 'version 须为非负整数');
+    return b.version;
+  };
+  // 助手的对话一个账号同一时间只答一条（历史存在服务器上，两条一起答会互相覆盖）
+  const chatting = new Set();
   async function route(req, url, body) {
     const seg = url.pathname.split('/').filter(Boolean); // ['api', ...]
     const m = req.method;
     if (seg[0] !== 'api') return null;
-    if (seg[1] === 'health' && m === 'GET') return { ok: true, nodes: ref.NODES.length };
+    // 存活检查（liveness）：进程还能回答就是 200，不碰数据库。容器的 HEALTHCHECK 用它；停机收尾的时候也照样 200。
+    if (seg[1] === 'health' && !seg[2] && m === 'GET') return { ok: true, nodes: ref.NODES.length };
+    // 就绪检查（readiness）：能不能接新的流量。库的表和补列都在、库能写，并且没有在停机收尾，才是 200；否则 503 和没过的几项（不带细节）。
+    if (seg[1] === 'ready' && !seg[2] && m === 'GET') {
+      const r = draining ? { ok: false, failed: ['shutting-down'] } : store.readiness();
+      return [r.ok ? 200 : 503, r];
+    }
     if (seg[1] === 'nodes' && m === 'GET') {
-      if (!seg[2]) return ref.NODES.map((n) => ({ id: n.id, stage: n.s, title: n.t, summary: n.sum }));
+      const full = (n) => Object.assign({}, n, { rows: n.rows.map((r) => ({ key: r[0], value: r[1], verified: !!r[2] })), links: ref.linksOf(n.id).map((l) => ({ category: l[1], what: l[2], bring: l[3] })) });
+      // ?full=1：全部节点的完整资料（网页打开时读一次）
+      if (!seg[2]) return url.searchParams.get('full') === '1' ? ref.NODES.map(full) : ref.NODES.map((n) => ({ id: n.id, stage: n.s, title: n.t, summary: n.sum }));
       const n = ref.NODES.find((x) => x.id === seg[2]); if (!n) throw new HttpError(404, '没有这个节点');
-      return Object.assign({}, n, { rows: n.rows.map((r) => ({ key: r[0], value: r[1], verified: !!r[2] })), links: ref.linksOf(n.id).map((l) => ({ category: l[1], what: l[2], bring: l[3] })) });
+      return full(n);
     }
-    if (seg[1] === 'options' && m === 'GET' && seg[2]) {
-      const params = Object.fromEntries(url.searchParams);
-      try { return ref.options(seg[2], params); } catch (e) { throw new HttpError(404, e.message); }
-    }
+    if (seg[1] === 'options' && m === 'GET' && seg[2]) return optionsOf(ref, seg[2], url);
+    // 每个环节可以找哪类服务商（网页“找人帮忙”的对照表）
+    if (seg[1] === 'links' && !seg[2] && m === 'GET') return ref.LINKS.map((l) => ({ nodeId: l[0], title: ref.linkTitle(l[0]), category: l[1], categoryName: (ref.CATS.find((c) => c[0] === l[1]) || [])[1] || l[1], what: l[2], bring: l[3] }));
+    // 会产生期限的事件有哪几种
+    if (seg[1] === 'event-types' && !seg[2] && m === 'GET') return Object.keys(ref.EVRULES).map((k) => ({ type: k, label: ref.EVRULES[k][0] }));
     if (seg[1] === 'terms' && m === 'GET') return { version: termsVersion, changes: TERMS_CHANGES, terms: '/terms.html', privacy: '/privacy.html' };
     // 发件箱：本地开发和测试从这里读验证码邮件，运维用它看有没有发不出去的邮件。没配 ADMIN_TOKEN 时是 503。
     // 正文和完整的收件地址只在本地发件方式（outbox、console）下返回；接了真实发信之后只返回状态，地址打码。
@@ -536,7 +627,8 @@ function createApp(opts) {
       // 同意的还是旧版本：只能读取自己的数据、删除账号、重新同意（上面三个），其余一律先拦下。
       // 例外是“收回”类的操作：查看绑定的邮箱、关掉邮件提醒、解除邮箱（连同解除之前验证原来的邮箱）。不同意新条款的人也要能让我们不再给他发邮件、不再留着他的邮箱。
       // 解除邮箱要先验证原来的邮箱，所以“验证原邮箱以便解除”（action: 'remove'）的两步也算在收回里。
-      const withdraw = sub === 'email' && ((!seg[4] && (m === 'GET' || m === 'DELETE')) || (seg[4] === 'reminders' && !seg[5] && m === 'PUT' && !!body && body.on === false) ||
+      // 清空助手的对话记录也算收回
+      const withdraw = (sub === 'chat' && !seg[4] && m === 'DELETE') || sub === 'email' && ((!seg[4] && (m === 'GET' || m === 'DELETE')) || (seg[4] === 'reminders' && !seg[5] && m === 'PUT' && !!body && body.on === false) ||
         (seg[4] === 'old' && (!seg[5] || (seg[5] === 'verify' && !seg[6])) && m === 'POST' && !!body && body.action === 'remove'));
       if (u.consentVersion !== termsVersion && !withdraw) throw new HttpError(409, '使用条款和隐私政策已更新（版本 ' + termsVersion + '）。请刷新页面，重新确认后继续使用');
       // ---- 邮箱：绑定、查看、解除 ----
@@ -645,24 +737,33 @@ function createApp(opts) {
           if (!isDate(b.date)) throw new HttpError(422, 'date 须为 YYYY-MM-DD，且是真实存在的日期');
           if (b.note != null && (typeof b.note !== 'string' || b.note.length > 200)) throw new HttpError(422, 'note 须为200字以内');
           assertNoSensitive(b.note, '备注');
-          return [201, { id: store.addEvent(u.id, { type: b.type, date: b.date, note: b.note }) }];
+          // deadlines：按现在的身份，这件事产生几条期限（0 时网页说明“这里没有登记到对应的期限”，不说没有法定期限）
+          return [201, { id: store.addEvent(u.id, { type: b.type, date: b.date, note: b.note }), deadlines: engineFor(u).eventDeadlines({ type: b.type, date: b.date }).length }];
         }
         if (m === 'DELETE' && seg[4]) { if (!store.deleteEvent(u.id, seg[4])) throw new HttpError(404, '没有这个事件'); return [204, null]; }
       }
       if (sub === 'state' && m === 'PUT') {
-        // 网页端整体同步：概况和已完成的任务一起存。
+        // 网页端整体同步：概况和已完成的任务一起存。带 version 时只在服务器上还是这个版本时才存，否则 409 并返回现在的内容。
         const b = body || {};
+        const expected = versionOf(b);
         const profile = validateProfilePatch(b.profile || {});
         const done = {};
         for (const k of Object.keys(b.done || {})) { if (!nodeIds.has(k)) throw new HttpError(422, '节点无效：' + k); if (b.done[k]) done[k] = true; }
+        if (expected != null && expected !== u.version) return conflict(u);
         Object.assign(u.profile, profile); u.done = done;
-        store.saveUser(u, 'state.sync');
-        return { ok: true };
+        const v = store.saveUser(u, 'state.sync', null, expected);
+        if (v == null) return conflict(u);
+        return { ok: true, version: v };
       }
       if (sub === 'profile' && m === 'PATCH') {
-        Object.assign(u.profile, validateProfilePatch(body || {}));
-        store.saveUser(u, 'profile.update', { keys: Object.keys(body || {}) });
-        return u.profile;
+        // 只改传了的字段。body 里可以带 version（同上）；新的版本号在响应头 x-state-version 里
+        const b = Object.assign({}, body || {}), expected = versionOf(b); delete b.version;
+        const patch = validateProfilePatch(b);
+        if (expected != null && expected !== u.version) return conflict(u);
+        Object.assign(u.profile, patch);
+        const v = store.saveUser(u, 'profile.update', { keys: Object.keys(b) }, expected);
+        if (v == null) return conflict(u);
+        return [200, u.profile, { 'x-state-version': String(v) }];
       }
       if (sub === 'tasks' && seg[4] && seg[5] === 'done' && m === 'PUT') {
         if (!nodeIds.has(seg[4])) throw new HttpError(404, '没有这个节点');
@@ -675,44 +776,65 @@ function createApp(opts) {
         store.saveUser(u, 'task.done', { id: seg[4], on });
         return engineFor(u).plan();
       }
-      if (sub === 'plan' && m === 'GET') return engineFor(u).plan();
-      // date 是日本时间的日历日（YYYY-MM-DD 的文字，不是时刻）；src 是事件期限的依据（法条、官方页面），没有则为 null
-      if (sub === 'reminders' && m === 'GET') return engineFor(u).reminders().map((r) => ({ date: r.date, text: r.txt, tag: r.tag, src: r.src || null }));
-      if (sub === 'advice' && m === 'GET') return engineFor(u).advice().map((a) => ({ title: a[0], text: a[1] }));
-      if (sub === 'pr-check' && m === 'GET') return engineFor(u).prCheck();
-      if (sub === 'chat' && m === 'POST') {
+      // view：网页“闯关”页用的进度和每个任务的状态、期限（get_plan 工具的结果不带它）
+      if (sub === 'plan' && m === 'GET') { const e = engineFor(u); return Object.assign(e.plan(), { view: e.routeView() }); }
+      // date 是日本时间的日历日（YYYY-MM-DD 的文字，不是时刻）；src 是事件期限的依据（法条、官方页面），没有则为 null；
+      // dateText 是写成“2026年12月1日”的同一天，days 是离今天（日本时间）几天，过了是负数
+      if (sub === 'reminders' && m === 'GET') { const e = engineFor(u), t = e.today(); return e.reminders().map((r) => ({ date: r.date, text: r.txt, tag: r.tag, src: r.src || null, dateText: e.fmt(r.d), days: e.days(t, r.d) })); }
+      // href、action：网页上那一条后面的链接（去哪一页、链接文字）
+      if (sub === 'advice' && m === 'GET') return engineFor(u).advice().map((a) => ({ title: a[0], text: a[1], href: a[2], action: a[3] }));
+      // whenText：when 写成“2027年4月1日”；reached：今天（日本时间）已经到了 when
+      if (sub === 'pr-check' && m === 'GET') { const e = engineFor(u), r = e.prCheck(); return Object.assign(r, { whenText: r.when ? e.fmt(r.when) : '', reached: !!r.when && r.when <= e.today() }); }
+      // 带上这个人的情况算的选方案（驾照那一题要看有没有中国驾照）
+      if (sub === 'options' && seg[4] && !seg[5] && m === 'GET') return optionsOf(engineFor(u), seg[4], url);
+      // 同城的示例信息；招聘按这个人的在留资格标出能不能做
+      if (sub === 'city' && !seg[4] && m === 'GET') {
+        const e = engineFor(u), row = (x) => ({ title: x[0], sub: x[1], place: x[2] });
+        return { jobs: e.JOBS.map((j) => { const f = e.jobFit(j[1], j[2]); return { title: j[0], type: j[1], place: j[3], fit: f[0], fitText: f[1] }; }), house: e.CITY.house.map(row), used: e.CITY.used.map(row), life: e.CITY.life.map(row) };
+      }
+      // 助手的对话记录存在服务器上（每个账号一行，按整轮裁剪到最近几轮）。网页端只发新的一句，不再保存和带回历史，
+      // 所以没法伪造助手说过的话或工具的结果。GET 返回能显示的文字（用户的话和助手的回答），DELETE 清空。
+      if (sub === 'chat' && !seg[4] && m === 'GET') return { messages: assistant.displayHistory(store.getChat(u.id)) };
+      if (sub === 'chat' && !seg[4] && m === 'DELETE') { if (store.clearChat(u.id)) store.audit('chat.clear'); return [204, null]; }
+      if (sub === 'chat' && !seg[4] && m === 'POST') {
         // 有人在等：每次请求的时限和重试次数都比 eval 短得多（assistant.CHAT_LLM_OPTS），整轮另有总时限
         const llm = opts.llm || (process.env.ANTHROPIC_API_KEY ? assistant.anthropicLLM(process.env.ANTHROPIC_API_KEY, null, assistant.CHAT_LLM_OPTS) : null);
         if (!llm) throw new HttpError(503, '助手还没有配置（缺少 ANTHROPIC_API_KEY）');
         const b = body || {};
+        // 旧的网页会带 history：空的照常收（旧页面清空历史后重试时就是空的），有内容的拒绝，说明以 history 开头，旧页面据此清空后重试
+        if (b.history != null && !(Array.isArray(b.history) && b.history.length === 0)) throw new HttpError(422, 'history 不再接受：对话记录已经存在服务器上，只发新的一句即可');
+        for (const k of Object.keys(b)) if (k !== 'message' && k !== 'history') throw new HttpError(422, '未知字段：' + k);
         if (typeof b.message !== 'string' || !b.message.trim() || b.message.length > 2000) throw new HttpError(422, 'message 须为1至2000字');
         // 对话内容会转给模型服务商，敏感号码在这里拦下
         assertNoSensitive(b.message, '消息');
-        // 历史是网页端带回来的，逐条校验形状和大小；不合规则返回 422，网页端清空历史后重试
-        const history = assistant.validateHistory(b.history);
-        // 历史里的每一段文字都会转给模型：用户说的话、助手的话、工具调用的参数、工具结果，全部过一遍。
-        // 说明以 history 开头，网页端据此清空历史后重试（不然每一轮都会被同一条历史挡住）。
-        for (const t of assistant.historyTexts(history)) {
-          const label = sensitiveLabel(t);
-          if (label) throw new HttpError(422, 'history 无效（对话历史里疑似含有' + label + '）。请清空对话历史后重试');
-        }
         const wait = chatShort(u.id) || chatDaily(u.id);
         if (wait) throw tooMany(wait, '提问太频繁');
-        let r;
-        // 整轮的总时限：到了就中断正在发的请求，不再发新的、不再执行工具（不替已经没人等的请求改数据）
-        const ac = new AbortController(), deadline = setTimeout(() => ac.abort(assistant.abortError('deadline')), opts.chatDeadlineMs || assistant.CHAT_DEADLINE_MS);
-        // 模型接口忙（429、529 overloaded、5xx）或连不上、超时、超过总时限，anthropicLLM 已经退避重试过：告诉用户稍后再试（503），不当成服务器内部错误。
-        // retry-after：接口要求等的秒数（比重试时肯等的还长时 anthropicLLM 直接抛出），没有就是 30 秒
-        try { r = await assistant.chat({ user: u, store, now: nowOf() }, history, b.message, { llm, signal: ac.signal }); } catch (e) {
-          if (e && typeof e.status === 'number' && (e.status === 0 || e.status === 429 || e.status >= 500)) {
-            console.error('助手：模型接口 ' + (e.status || e.type));
-            const after = e.wait > 0 ? Math.min(3600, Math.ceil(e.wait / 1000)) : 30;
-            throw new HttpError(503, '助手现在忙不过来，请过一会儿再试', { 'retry-after': String(after) });
-          }
-          throw e;
-        } finally { clearTimeout(deadline); }
-        // draft：助手准备的咨询草稿（没有则为 null）。草稿没有发送，网页端显示给用户核对，用户同意后调 POST /inquiries。
-        return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => ({ name: t.name, ok: t.ok })), draft: r.draft, history: r.messages };
+        if (chatting.has(u.id)) throw new HttpError(409, '上一条还在回答，请等它答完再问');
+        chatting.add(u.id);
+        try {
+          // 存着的历史再查一遍再用：形状不对（旧版本存的、库被改过）或者里面有疑似敏感号码（例如模型复述了号码）时整段丢掉重新开始，
+          // 不把它转给模型。每一段文字都查：用户的话、助手的话、工具调用的参数、工具结果。
+          let history;
+          try { history = assistant.validateHistory(store.getChat(u.id)); } catch (e) { history = []; }
+          if (assistant.historyTexts(history).some((t) => sensitiveLabel(t))) history = [];
+          let r;
+          // 整轮的总时限：到了就中断正在发的请求，不再发新的、不再执行工具（不替已经没人等的请求改数据）
+          const ac = new AbortController(), deadline = setTimeout(() => ac.abort(assistant.abortError('deadline')), opts.chatDeadlineMs || assistant.CHAT_DEADLINE_MS);
+          // 模型接口忙（429、529 overloaded、5xx）或连不上、超时、超过总时限，anthropicLLM 已经退避重试过：告诉用户稍后再试（503），不当成服务器内部错误。
+          // retry-after：接口要求等的秒数（比重试时肯等的还长时 anthropicLLM 直接抛出），没有就是 30 秒
+          try { r = await assistant.chat({ user: u, store, now: nowOf() }, history, b.message, { llm, signal: ac.signal }); } catch (e) {
+            if (e && typeof e.status === 'number' && (e.status === 0 || e.status === 429 || e.status >= 500)) {
+              console.error('助手：模型接口 ' + (e.status || e.type));
+              const after = e.wait > 0 ? Math.min(3600, Math.ceil(e.wait / 1000)) : 30;
+              throw new HttpError(503, '助手现在忙不过来，请过一会儿再试', { 'retry-after': String(after) });
+            }
+            throw e;
+          } finally { clearTimeout(deadline); }
+          // r.messages 已按整轮裁剪（条数、字节和 trimHistory 一样）。账号在这一轮里被删掉了就不再写回
+          if (store.getUser(u.id)) store.saveChat(u.id, assistant.trimHistory(r.messages));
+          // draft：助手准备的咨询草稿（没有则为 null）。草稿没有发送，网页端显示给用户核对，用户同意后调 POST /inquiries。
+          return { text: r.text, category: r.category, toolCalls: r.toolCalls.map((t) => ({ name: t.name, ok: t.ok })), draft: r.draft };
+        } finally { chatting.delete(u.id); }
       }
       if (sub === 'inquiries' && m === 'GET') return store.listInquiries(u.id);
       if (sub === 'inquiries' && m === 'POST') {
@@ -726,6 +848,7 @@ function createApp(opts) {
   }
 
   const webDir = opts.webDir || path.join(__dirname, '..', 'web');
+  const staticFiles = new Map(); // 文件路径 → { etag, body, gz }（见 STATIC_MEM_MAX）
   const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
   async function handle(req, res, send) {
     try {
@@ -736,10 +859,28 @@ function createApp(opts) {
         if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, '不支持这个方法');
         const f = path.join(webDir, url.pathname === '/' ? 'index.html' : path.normalize(url.pathname).replace(/^([/\\]|\.\.)+/, ''));
         if (f.includes('\0') || !(f === webDir || f.startsWith(webDir + path.sep)) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) return send(404, { error: '没有这个页面' });
+        // 带 ETag 和 Last-Modified；浏览器带着 If-None-Match 来问、文件没变时回 304，不重新下载
+        const st = fs.statSync(f), etag = 'W/"' + st.size.toString(16) + '-' + Math.floor(st.mtimeMs).toString(16) + '"';
+        const ext = path.extname(f), meta = { 'content-type': TYPES[ext] || 'application/octet-stream', 'cache-control': STATIC_CACHE, etag, 'last-modified': st.mtime.toUTCString() };
+        if (COMPRESSIBLE.has(ext)) meta.vary = 'accept-encoding';
+        if (String(req.headers['if-none-match'] || '').split(',').map((x) => x.trim()).includes(etag)) { res.writeHead(304, meta); return res.end(); }
+        if (st.size <= STATIC_MEM_MAX) {
+          let c = staticFiles.get(f);
+          if (!c || c.etag !== etag) {
+            const body = fs.readFileSync(f);
+            c = { etag, body, gz: COMPRESSIBLE.has(ext) && body.length >= 1024 ? zlib.gzipSync(body, { level: 9 }) : null };
+            staticFiles.set(f, c);
+          }
+          const gz = !!c.gz && acceptsGzip(req.headers['accept-encoding']), out = gz ? c.gz : c.body;
+          if (gz) meta['content-encoding'] = 'gzip';
+          meta['content-length'] = out.length;
+          res.writeHead(200, meta);
+          return res.end(req.method === 'HEAD' ? undefined : out);
+        }
         const stream = fs.createReadStream(f);
         // 文件读到一半出错（被删、磁盘错误）不能变成未处理的 error 事件
         stream.on('error', (e) => { console.error(e); if (!res.headersSent) send(500, { error: '服务器内部错误' }); else res.destroy(); });
-        stream.once('open', () => { res.writeHead(200, { 'content-type': TYPES[path.extname(f)] || 'application/octet-stream' }); if (req.method === 'HEAD') { stream.destroy(); res.end(); } else stream.pipe(res); });
+        stream.once('open', () => { res.writeHead(200, meta); if (req.method === 'HEAD') { stream.destroy(); res.end(); } else stream.pipe(res); });
         res.on('close', () => stream.destroy());
         return;
       }
@@ -753,21 +894,57 @@ function createApp(opts) {
         if (body !== null && (typeof body !== 'object' || Array.isArray(body))) throw new HttpError(400, '请求体须为 JSON 对象');
       }
       const r = await route(req, url, body);
-      if (r instanceof Html) return send(200, r, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff' });
-      if (Array.isArray(r) && typeof r[0] === 'number') return send(r[0], r[1]);
+      if (r instanceof Html) return send(200, r, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': PAGE_CSP });
+      if (Array.isArray(r) && typeof r[0] === 'number') return send(r[0], r[1], r[2]);
       send(200, r);
     } catch (e) {
       if (e instanceof HttpError) return send(e.status, { error: e.message }, e.headers);
       console.error(e); send(500, { error: '服务器内部错误' });
     }
   }
+  // 请求日志：opts.log 是收一个对象的函数（npm start 传写一行 JSON 的函数；测试里收集起来看）；不传就不记
+  const logReq = typeof opts.log === 'function' ? opts.log : null;
+  const webFiles = new Set(fs.existsSync(webDir) ? fs.readdirSync(webDir) : []);
+  // 正在处理的请求数，停机收尾时等它变成 0
+  let inflight = 0, draining = false, drained = null;
   const server = http.createServer((req, res) => {
+    const t0 = process.hrtime.bigint();
+    const given = trustProxy ? String(req.headers['x-request-id'] || '') : '';
+    const rid = REQ_ID.test(given) ? given : crypto.randomUUID();
+    inflight++;
+    res.on('close', () => {
+      inflight--;
+      let route = '/*'; try { route = routeOf(new URL(req.url, 'http://localhost').pathname, webFiles); } catch (e) { /* 解析不了的地址 */ }
+      // 存活和就绪检查（容器每 30 秒、Caddy 每 10 秒各一次）成功时不记，免得淹没别的请求；失败的照记
+      if (logReq && !((route === '/api/health' || route === '/api/ready') && res.statusCode === 200)) {
+        const o = { t: new Date().toISOString(), msg: 'request', rid, method: String(req.method).slice(0, 10), route, status: res.statusCode, ms: Math.round(Number(process.hrtime.bigint() - t0) / 1e4) / 100 };
+        if (!res.writableFinished) o.aborted = true; // 响应没发完连接就断了
+        if (trustProxy) o.ip = truncateIp(clientIp(req));
+        try { logReq(o); } catch (e) { /* 日志写不出去不影响请求 */ }
+      }
+      if (draining && inflight === 0 && drained) drained();
+    });
+    // 安全相关的头（每个响应都带）；HSTS 只在反向代理说是 HTTPS 时带
+    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
+    if (trustProxy && String(req.headers['x-forwarded-proto'] || '').split(',').pop().trim() === 'https') res.setHeader('strict-transport-security', HSTS);
+    res.setHeader('x-request-id', rid);
+    // 停机收尾时：手上的请求照常回答，回答完关掉连接（不再保持长连接）。在写响应头的那一刻看（请求可能是收尾之前进来的）
+    const writeHead = res.writeHead;
+    res.writeHead = function () { if (draining && !this.headersSent) this.setHeader('connection', 'close'); return writeHead.apply(this, arguments); };
     // send 自己不会抛错：响应已经发出或连接已断时什么都不做
     const send = (status, obj, headers) => {
       try {
         if (res.headersSent || res.destroyed) { if (!res.writableEnded) res.destroy(); return; }
-        res.writeHead(status, Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, headers || {}));
-        res.end(obj == null ? '' : obj instanceof Html ? obj.text : JSON.stringify(obj));
+        const h = Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, headers || {});
+        let body = obj == null ? '' : obj instanceof Html ? obj.text : JSON.stringify(obj);
+        // 读接口（GET 的 200）1KB 以上的 JSON 按 Accept-Encoding 压缩（/api/nodes?full=1 约 60KB，压缩后约 21KB）。
+        // 只压 GET：令牌只出现在 POST 的返回里，不和用户能控制的内容一起压缩（BREACH 一类的攻击要靠这个）
+        if (status === 200 && req.method === 'GET' && !(obj instanceof Html) && Buffer.byteLength(body) >= 1024) {
+          h.vary = 'accept-encoding';
+          if (acceptsGzip(req.headers['accept-encoding'])) { body = zlib.gzipSync(body); h['content-encoding'] = 'gzip'; }
+        }
+        res.writeHead(status, h);
+        res.end(body);
       } catch (e) { console.error(e); try { res.destroy(); } catch (e2) { /* 连接已经没了 */ } }
     };
     req.on('error', () => {}); res.on('error', () => {});
@@ -775,13 +952,38 @@ function createApp(opts) {
     handle(req, res, send).catch((e) => { console.error(e); send(500, { error: '服务器内部错误' }); });
   });
   server.on('close', () => { closed = true; });
+  // 停机收尾（SIGTERM）：不再接新连接，就绪检查变成 503；手上的请求在 timeoutMs 之内照常回答完（之后强制断开）；
+  // 等正在发的那一轮邮件发完（同样有时限），再关数据库。定时器由启动的地方（文件末尾的 main）先停掉。多次调用返回同一个 Promise。
+  let shutting = null;
+  const shutdown = (o) => {
+    if (shutting) return shutting;
+    const timeoutMs = (o && o.timeoutMs) || 25000;
+    draining = true;
+    const wait = (p, ms) => Promise.race([p, new Promise((ok) => { const t = setTimeout(ok, ms); t.unref(); })]);
+    shutting = (async () => {
+      const closedP = new Promise((ok) => { if (!server.listening) return ok(); server.close(() => ok()); });
+      server.closeIdleConnections();
+      const idle = inflight === 0 ? Promise.resolve() : new Promise((ok) => { drained = ok; });
+      const t1 = Date.now();
+      await wait(idle, timeoutMs);
+      const forced = inflight;
+      if (inflight) server.closeAllConnections();
+      await wait(closedP, 1000);
+      await wait(delivering, Math.max(1000, timeoutMs - (Date.now() - t1)));
+      closed = true;
+      try { store.close(); } catch (e) { /* 已经关了 */ }
+      return { forced };
+    })();
+    return shutting;
+  };
   // deliver：现在就把发件箱里到时间的邮件发一轮（定时重试和测试用）；purge：清理过期的验证码等
   // remind(at)：跑一轮提醒（at 可以把“现在”定在某个时刻，测试用），只排进发件箱；发出去还要调 deliver()
   // billing、notifier：展示费和新咨询通知；providerTick：每分钟由 npm start 调（通知每次都看，展示费最多每小时一轮）
-  return { server, store, sender, deliver, purge: () => store.purgeExpired(), termsVersion, scheduler, remind: (at) => scheduler.runOnce(at), billing, notifier, providerTick };
+  // shutdown：停机收尾（见上）；isDraining：是不是正在收尾
+  return { server, store, sender, deliver, shutdown, isDraining: () => draining, purge: () => store.purgeExpired(), termsVersion, scheduler, remind: (at) => scheduler.runOnce(at), billing, notifier, providerTick };
 }
 
-module.exports = { createApp, validateProfilePatch, TERMS_VERSION, PROVIDER_TERMS_VERSION, reminderConfig, adminTokens, EMAIL_LIMITS };
+module.exports = { createApp, validateProfilePatch, TERMS_VERSION, PROVIDER_TERMS_VERSION, reminderConfig, adminTokens, opsConfig, routeOf, truncateIp, EMAIL_LIMITS, SECURITY_HEADERS };
 
 if (require.main === module) {
   const port = +process.env.PORT || 8787;
@@ -791,19 +993,40 @@ if (require.main === module) {
   try { bc = billingConfig(process.env, sender); nc = notifyConfig(process.env); adminTokens(process.env.ADMIN_TOKENS); } catch (e) { console.error('服务商相关的设置不对，没有启动：' + e.message); process.exit(1); }
   // 助手的模型、EFFORT、MAX_TOKENS 写错就不启动
   try { assistant.llmConfig(process.env); } catch (e) { console.error('助手的设置不对，没有启动：' + e.message); process.exit(1); }
-  app = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db'), sender, appUrl: rem.appUrl, billing: bc, notify: nc });
+  // 运维相关：请求日志（默认开，LOG_REQUESTS=0 关）、停机收尾最多等几秒（SHUTDOWN_TIMEOUT_MS）。写错了不启动
+  let ops;
+  try { ops = opsConfig(process.env); } catch (e) { console.error('运维设置不对，没有启动：' + e.message); process.exit(1); }
+  // 库文件（有邮箱等个人信息）只给运行服务器的用户读写
+  process.umask(0o077);
+  app = createApp({ dbFile: process.env.DB_FILE || path.join(__dirname, '..', 'zairyu.db'), sender, appUrl: rem.appUrl, billing: bc, notify: nc, log: ops.logRequests ? (o) => process.stdout.write(JSON.stringify(o) + '\n') : null });
   app.server.listen(port, () => console.log('在留导航 后端已启动： http://localhost:' + port + ' （邮件：' + sender.name + '；提醒邮件：' + (rem.enabled ? '每 ' + rem.intervalMin + ' 分钟检查一次，日本时间 ' + rem.hour + ' 点以后发' : '定时任务没开') + '）'));
   // 每分钟：重试没发出去的邮件，清理过期的验证码和限流记录
   // 服务商：新咨询通知每分钟看一次，展示费（开账单、付款提醒、过了宽限期不再展示）每小时一轮；日志只有数量和错误说明
   const providers = () => { try { const r = app.providerTick(); if (r.billing && (r.billing.issued || r.billing.reminders || r.billing.hidden)) console.log('展示费：开出 ' + r.billing.issued + ' 张账单，' + r.billing.reminders + ' 封付款提醒，' + r.billing.hidden + ' 封不再展示的告知'); } catch (e) { console.error('服务商定时任务出错：' + scrub(e).slice(0, 200)); } };
-  setTimeout(providers, 5000).unref();
-  setInterval(() => { providers(); app.deliver(); try { app.purge(); } catch (e) { console.error(e); } }, 60 * 1000).unref();
+  const timers = [setTimeout(providers, 5000), setInterval(() => { providers(); app.deliver(); try { app.purge(); } catch (e) { console.error(e); } }, 60 * 1000)];
+  timers.forEach((t) => t.unref());
+  let remTimer = null;
   // 提醒邮件（REMINDERS_ENABLED=1 才开）：启动后先看一次，之后每隔 REMINDER_INTERVAL_MIN 分钟看一次；日本时间 REMINDER_HOUR 点之前不发，到点补跑一次。
   // 一天里看多少次都只发一次（去重在 reminder_sends 表）。日志只有数量。
   if (rem.enabled) {
     // 轮到的时候还没到 REMINDER_HOUR 点，定时器会另外等到那个点再跑一次（src/scheduler.js 的 startReminderTimer）
-    startReminderTimer(rem, () => {
+    remTimer = startReminderTimer(rem, () => {
       try { const r = app.remind(); if (r.mails || r.errors) console.log('提醒邮件：新排了 ' + r.mails + ' 封（' + r.items + ' 条）' + (r.errors ? '，' + r.errors + ' 个账号处理出错' : '')); app.deliver(); } catch (e) { console.error('提醒邮件：这一轮出错：' + scrub(e).slice(0, 200)); }
     });
   }
+  // 停机（SIGTERM：docker stop、compose 重新部署；SIGINT：终端里按 Ctrl+C）：先停定时器，不再接新连接，
+  // 手上的请求和正在发的邮件在 SHUTDOWN_TIMEOUT_MS 之内做完，关数据库后以 0 退出。再收到一次信号就不等了。
+  let stopping = false;
+  const stop = (sig) => {
+    if (stopping) { console.error('又收到 ' + sig + '，不等了'); process.exit(1); }
+    stopping = true;
+    console.log(JSON.stringify({ t: new Date().toISOString(), msg: 'shutdown', signal: sig }));
+    timers.forEach((t) => clearTimeout(t)); if (remTimer) remTimer.stop();
+    app.shutdown({ timeoutMs: ops.shutdownTimeoutMs }).then((r) => {
+      console.log(JSON.stringify({ t: new Date().toISOString(), msg: 'stopped', forced: r.forced }));
+      process.exit(0);
+    }, (e) => { console.error('停机时出错：' + scrub(e).slice(0, 200)); process.exit(1); });
+  };
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  process.on('SIGINT', () => stop('SIGINT'));
 }

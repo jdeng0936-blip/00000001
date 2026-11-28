@@ -47,13 +47,17 @@ test('解析不了的请求地址返回 400，进程不退出', async () => {
 });
 
 test('静态文件读到一半出错时不退出', async () => {
-  // 让 createReadStream 返回一个马上出错的流（相当于文件在检查之后被删掉、或磁盘读错误）
+  // 网页文件先整个读进内存（readFileSync）再发；读的时候出错（文件在检查之后被删掉、或磁盘读错误）返回 500，不带错误细节。
+  // 大于 2MB 的文件按流发（createReadStream），流出错时连接直接断开。两种都模拟。
   const s = await startChild(`
     const fs = require('node:fs'); const { Readable } = require('node:stream');
+    const rf = fs.readFileSync;
+    fs.readFileSync = function (p) { if (/privacy\\.html$/.test(String(p))) throw new Error('EIO: 模拟读取失败'); return rf.apply(fs, arguments); };
     fs.createReadStream = () => { const r = new Readable({ read() { this.destroy(new Error('EIO: 模拟读取失败')); } }); process.nextTick(() => r.emit('open')); return r; };`);
   try {
     const out = await raw(s.port, 'GET /privacy.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
-    assert.ok(!/模拟读取失败/.test(out), '错误细节不能发给客户端'); // 响应头已经发出，连接直接断开
+    assert.match(out, /^HTTP\/1\.1 500/);
+    assert.ok(!/模拟读取失败/.test(out), '错误细节不能发给客户端');
     await alive(s);
     await raw(s.port, 'GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
     await alive(s);

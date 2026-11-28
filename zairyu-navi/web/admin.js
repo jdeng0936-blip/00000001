@@ -1,0 +1,57 @@
+// 页面上所有来自服务器的文字都用 textContent 放进去，不拼 HTML。令牌只在内存里。
+var T=null,CATS={},STATUS={pending:"审核中",approved:"已批准",rejected:"未通过",changes_requested:"需要修改",withdrawn:"已撤回"},INV={issued:"待付款",paid:"已付款",void:"已作废"};
+var METHODS=[["","请选择核对方式"],["association_search","所属会的公开检索"],["certificate","登录证或会员证的原件／复印件"],["phone_association","打电话向所属会确认"]];
+function $(i){return document.getElementById(i)}
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+function api(m,p,b){return fetch("/api"+p,{method:m,headers:{"content-type":"application/json",authorization:"Bearer "+T},body:b?JSON.stringify(b):undefined}).then(function(r){return r.json().catch(function(){return {}}).then(function(j){if(!r.ok){var e=new Error(r.status===401?"令牌不对，请核对后重新填。":j&&typeof j.error==="string"?j.error:"服务器出了点问题（"+r.status+"）");e.status=r.status;throw e}return j})},function(){var e=new Error("连不上服务器");e.status=0;throw e})}
+function today(){return new Date(Date.now()+9*3600*1000).toISOString().slice(0,10)} // 日本时间的今天
+function btn(t,cls,fn){var b=el("button",cls||null,t);b.type="button";b.onclick=fn;return b}
+// 标签和输入框用 for / id 连起来（读屏软件念得出这是哪一栏，点标签也能进到输入框）
+var fieldN=0;
+function field(lab,input){var w=el("div");var l=el("label",null,lab);if(!input.id)input.id="f"+(++fieldN);l.htmlFor=input.id;w.appendChild(l);w.appendChild(input);return w}
+function note(){var s=el("span","err");s.setAttribute("role","status");return s}
+function tab(name){["apps","providers","invoices"].forEach(function(k){$("sec-"+k).hidden=k!==name;$("tab-"+k).className=k===name?"":"ghost";$("tab-"+k).setAttribute("aria-pressed",String(k===name))});return ({apps:loadApps,providers:loadProviders,invoices:loadInvoices})[name]()}
+function appCard(a){
+  var c=el("div","card");c.dataset.ref=a.ref;
+  c.appendChild(el("b",null,a.name));c.appendChild(document.createTextNode("　"));c.appendChild(el("span","tag",CATS[a.category]||a.category));c.appendChild(el("span","tag",STATUS[a.status]||a.status));
+  [["申请编号",a.ref],["事务所地址",a.address],["登录番号",a.licenseNo||"（无）"],["所属会",a.licenseBody||"（无）"],["收费说明",a.feeNote],["区域",a.area],["语言",a.langs],["联系邮箱",a.email],["收费方式",a.feeModel==="fixed_listing"?"固定展示费":"含推广（非士业）"],["提交时间",String(a.createdAt).slice(0,16).replace("T"," ")]].forEach(function(r){c.appendChild(el("p",null,r[0]+"："+r[1]))});
+  if(a.checkWhere)c.appendChild(el("p","muted","去哪里核对："+a.checkWhere));
+  if(a.reviewMsg)c.appendChild(el("p","muted","审核说明："+a.reviewMsg));
+  if(a.licenseCheck)c.appendChild(el("p","muted","核对记录："+a.licenseCheck.method+"，"+a.licenseCheck.checkedOn+"，核对人 "+a.licenseCheck.checkedBy+(a.licenseCheck.note?"，"+a.licenseCheck.note:"")));
+  if(a.decidedBy)c.appendChild(el("p","muted","处理人："+a.decidedBy+"　"+String(a.decidedAt||"").slice(0,16).replace("T"," ")));
+  if(a.status!=="pending"){return c}
+  var g=el("div","grid"),sel=el("select","chk-method");METHODS.forEach(function(m){var o=el("option",null,m[1]);o.value=m[0];sel.appendChild(o)});
+  var d=el("input","chk-date");d.type="date";d.value=today();var n=el("input","chk-note");n.maxLength=200;
+  g.appendChild(field("核对方式",sel));g.appendChild(field("核对日期",d));g.appendChild(field("核对备注（选填）",n));c.appendChild(g);
+  var ns=note(),row=el("p");
+  row.appendChild(btn("批准","approve",function(){ns.textContent="";var lc=sel.value||a.regulated||a.checkWhere?{method:sel.value,checkedOn:d.value,note:n.value}:undefined;
+    api("POST","/admin/applications/"+a.id+"/approve",lc?{licenseCheck:lc,reviewKey:a.reviewKey}:{reviewKey:a.reviewKey}).then(function(r){ns.className="muted";ns.textContent="已批准。免费期到 "+r.freeUntil+"（批准日 + 30 天；服务商领取令牌后上名单），之后的第一期从第二天起收费（第二天不是 1 日时按天折算），账单按时自动开出。";return loadApps()},function(e){ns.className="err";ns.textContent=e.message})}));
+  c.appendChild(row);
+  var msg=el("textarea","review-msg");msg.rows=2;msg.maxLength=500;c.appendChild(field("拒绝的理由或要修改的地方（会写进发给申请人的邮件，5 至 500 字）",msg));
+  var row2=el("p");
+  row2.appendChild(btn("要求修改","ghost changes",function(){ns.textContent="";api("POST","/admin/applications/"+a.id+"/request-changes",{message:msg.value,reviewKey:a.reviewKey}).then(loadApps,function(e){ns.className="err";ns.textContent=e.message})}));row2.appendChild(document.createTextNode(" "));
+  row2.appendChild(btn("拒绝","ghost reject",function(){if(!confirm("确定拒绝这份申请吗？"))return;ns.textContent="";api("POST","/admin/applications/"+a.id+"/reject",{reason:msg.value,reviewKey:a.reviewKey}).then(loadApps,function(e){ns.className="err";ns.textContent=e.message})}));
+  row2.appendChild(ns);c.appendChild(row2);
+  return c;
+}
+function loadApps(){var st=$("app-status").value;return api("GET","/admin/applications"+(st?"?status="+encodeURIComponent(st):"")).then(function(l){var box=$("apps");box.textContent="";if(!l.length)box.appendChild(el("p","muted","没有这个状态的申请。"));l.forEach(function(a){box.appendChild(appCard(a))})},function(e){$("apps").textContent=e.message})}
+function loadProviders(){return api("GET","/admin/providers").then(function(l){var box=$("providers");box.textContent="";if(!l.length)box.appendChild(el("p","muted","还没有服务商。"));
+  l.forEach(function(p){var c=el("div","card");c.dataset.id=p.id;c.appendChild(el("b",null,p.name));c.appendChild(document.createTextNode("　"));c.appendChild(el("span","tag",CATS[p.category]||p.category));
+    c.appendChild(el("span","tag",!p.active?"已下架":p.source==="legacy-hold"?"不展示（老服务商，资料没过检查，要走入驻申请）":p.listed?"展示中":"不展示（未付款）"));
+    c.appendChild(el("p",null,"展示到："+(p.listedUntil||(p.listed?"不收费":"—"))+"　联系邮箱："+(p.contact||"（无）")+"　令牌："+(p.claimed?"已领取":"未领取")+"　新咨询通知："+(p.notify?"开":"关")));
+    if(p.latestInvoice)c.appendChild(el("p","muted","最近的账单："+p.latestInvoice.refCode+"　"+p.latestInvoice.period+"　"+(INV[p.latestInvoice.status]||p.latestInvoice.status)+"　期限 "+p.latestInvoice.dueDate));
+    var ns=note(),row=el("p");row.appendChild(btn(p.active?"下架":"重新上架",p.active?"ghost deactivate":"activate",function(){if(p.active&&!confirm("下架后令牌立即失效，重新上架后要重新领取。确定吗？"))return;api("PUT","/admin/providers/"+p.id+"/active",{active:!p.active}).then(loadProviders,function(e){ns.textContent=e.message})}));row.appendChild(ns);c.appendChild(row);
+    box.appendChild(c)})},function(e){$("providers").textContent=e.message})}
+function loadInvoices(){var st=$("inv-status").value;return api("GET","/admin/invoices"+(st?"?status="+encodeURIComponent(st):"")).then(function(l){var box=$("invoices");box.textContent="";if(!l.length)box.appendChild(el("p","muted","没有这个状态的账单。"));
+  l.forEach(function(i){var c=el("div","card");c.dataset.ref=i.refCode;c.appendChild(el("b",null,i.refCode));c.appendChild(document.createTextNode("　"+i.providerName+"　"));c.appendChild(el("span","tag",INV[i.status]||i.status));
+    c.appendChild(el("p",null,"期间 "+i.periodStart+" 至 "+i.periodEnd+(i.method==="first_month_free"?"（免费期）":i.periodStart.slice(8)!=="01"?"（按天折算）":"")+"　金额 "+i.amountYen+" 日元（含税）　期限 "+i.dueDate+(i.paidOn?"　入账日 "+i.paidOn+"（"+i.paidBy+"）":"")+(i.voidReason?"　作废理由："+i.voidReason:"")));
+    if(i.status==="issued"){var g=el("div","grid"),d=el("input","paid-date");d.type="date";d.value=today();var n=el("input","paid-note");n.maxLength=200;var r=el("input","void-reason");r.maxLength=200;
+      g.appendChild(field("入账日",d));g.appendChild(field("入账备注（选填）",n));g.appendChild(field("作废理由（作废时填）",r));c.appendChild(g);
+      var ns=note(),row=el("p");row.appendChild(btn("标记已付款","mark-paid",function(){ns.textContent="";api("POST","/admin/invoices/"+i.id+"/paid",{paidOn:d.value,note:n.value}).then(loadInvoices,function(e){ns.textContent=e.message})}));row.appendChild(document.createTextNode(" "));
+      row.appendChild(btn("作废","ghost void",function(){if(!confirm("确定作废这张账单吗？"))return;ns.textContent="";api("POST","/admin/invoices/"+i.id+"/void",{reason:r.value}).then(loadInvoices,function(e){ns.textContent=e.message})}));row.appendChild(ns);c.appendChild(row)}
+    box.appendChild(c)})},function(e){$("invoices").textContent=e.message})}
+$("tab-apps").onclick=function(){tab("apps")};$("tab-providers").onclick=function(){tab("providers")};$("tab-invoices").onclick=function(){tab("invoices")};
+$("app-status").onchange=loadApps;$("inv-status").onchange=loadInvoices;
+$("run-now").onclick=function(){var m=$("run-msg");m.textContent="";api("POST","/admin/billing/run").then(function(r){m.textContent="开出 "+r.issued+" 张账单，"+r.reminders+" 封付款提醒，"+r.hidden+" 封不再展示的告知，"+r.notices+" 封新咨询通知；发出 "+r.sent+" 封。"},function(e){m.textContent=e.message})};
+$("adm-go").onclick=function(){T=$("adm-token").value.trim();if(!T){$("adm-msg").textContent="请先填令牌。";return}
+  api("GET","/admin/applications?status=pending").then(function(){$("login").hidden=true;$("app").hidden=false;$("adm-token").value="";return api("GET","/providers/categories")}).then(function(cs){cs.forEach(function(c){CATS[c.key]=c.name});return tab("apps")}).catch(function(e){$("adm-msg").textContent=e.message;T=null})};
